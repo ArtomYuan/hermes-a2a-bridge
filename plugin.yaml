@@ -1,0 +1,7 @@
+name: hermes-a2a-bridge
+version: "0.1.0"
+description: "Hermes-side bridge to the dsh A2A server: patches the A2A client toolset and consumes events streamed back from dsh"
+kind: standalone
+hooks:
+  - pre_tool_call
+  - post_tool_call

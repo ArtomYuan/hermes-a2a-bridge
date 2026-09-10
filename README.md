@@ -77,24 +77,28 @@ TODO(P2c)：如改为 pip 包，补充 `pyproject.toml` + entry point 安装说�
 session ↔ 一个 dsh 会话」的连续性，还需 dsh 侧部署 A2A server，并把 Hermes 的 A2A
 client 指向它。
 
-### dsh 侧 a2a_agents 配置示例
+### Hermes 侧 a2a_agents 配置
 
-在 dsh 侧把可被 A2A 调用的 agent 暴露为 A2A agent（示例，具体字段以 dsh-a2a-server
-库为准）：
+Hermes 作为 A2A client，在 `~/.hermes/config.yaml` 把 dsh-a2a-server 配为 peer：
 
 ```yaml
-a2a:
-  enabled: true
-  # 监听地址 / 端口
-  host: 0.0.0.0
-  port: 8091
-  agents:
-    # key = Hermes 侧 a2a_call(agent=...) / a2a_orchestrate 的 agent 名
-    dsh:
-      display_name: dsh-agent
-      description: "Hermes 侧的 dsh 任务投递入口"
-      # 更多能力描述 / 入口映射 ...
+a2a_agents:
+  dsh:
+    url: http://127.0.0.1:8092
+    auth:
+      type: bearer
+      token: <与 dsh 侧 A2A_SERVER_TOKEN 同一把>
+    timeout: 300
+    capabilities: [coding, terminal, research, web_search]
 ```
+
+### dsh 侧 dsh-a2a-server 配置
+
+dsh 侧由 `dsh-a2a-server` 库（`ArtomYuan/dsh-a2a-server`）暴露 A2A server，其
+`Config`（cordis.yml 插件 `config`）字段：`port`（缺省探测 8092/8093/8094 首个空闲）、
+`host`（默认 `127.0.0.1`）、`authToken`（Bearer，也可从环境 `A2A_SERVER_TOKEN` 读）、
+`provider` / `model` / `preset` / `cwd` / `contextMapPath` / `contextMapTtlDays`。
+两端 `token` 必须一致。
 
 ### contextId 会话复用链路
 

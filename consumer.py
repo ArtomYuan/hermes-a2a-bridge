@@ -23,7 +23,6 @@ wire 格式（dsh-a2a-server, @a2a-js/sdk v1.1.0）
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -370,47 +369,52 @@ def _target(platform: str, chat_id: str, thread_id: str) -> str:
 def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any]]:
     """返回 ``send(platform, chat_id, thread_id, text) -> dict``。
 
-    发送前必做 redact；发送通路两级：优先 ``ctx.dispatch_tool("send_message", …)``
-    （``ctx`` 为 None 时跳过），兜底直取 gateway adapter（``_gateway_runner_ref`` +
-    ``Platform`` + ``asyncio.run(adapter.send(...))``，在独立线程起新 loop）。两级都
-    不可用（无 gateway）→ 记录 ``{"ok": False, "error": "no_gateway", ...}`` 返回
-    （standalone 验证时 mock 拦截点）。返回结构化 dict，永不抛异常进上层。
+    发送前必做 redact。发送只走一条通路：从 gateway 主 loop 上的 adapter 发——用
+    ``_gateway_runner_ref`` 弱引用拿到 runner，取 ``runner._gateway_loop``（gateway
+    boot 时写入的 ``asyncio.get_running_loop()``），再用
+    ``agent.async_utils.safe_schedule_threadsafe`` 把 ``adapter.send(...)`` 协程跨线程
+    调度到主 loop 执行。这样 feishu / QQ adapter 的 aiohttp / websocket 绑定仍挂在主
+    loop 上，不会在 daemon 线程里起新 loop 导致跨线程失败。
+
+    为什么不再走 ``ctx.dispatch_tool("send_message", ...)``：dispatch_tool 不抛异常，
+    失败也只返回 JSON 结果字符串（含失败 JSON），把「不抛异常」当成功会吞掉内部失败。
+    ``ctx`` 参数保留仅为兼容 ``__init__.py`` 的 ``make_sender(_CTX)`` 调用签名，实际不
+    参与发送。返回结构化 dict，永不抛异常进上层。
     """
 
     def send(platform: str, chat_id: str, thread_id: str, text: str) -> Dict[str, Any]:
         text = _redact(text)
         target = _target(platform, chat_id, thread_id)
-
-        # 一级：经插件 ctx dispatch send_message 工具。
-        if ctx is not None:
-            try:
-                ctx.dispatch_tool("send_message", {"target": target, "message": text})
-                return {"ok": True, "via": "dispatch_tool", "target": target, "text": text}
-            except Exception as exc:  # dispatch 失败回落二级
-                logger.warning(
-                    "hermes-a2a-bridge: dispatch_tool send failed: %s", exc
-                )
-
-        # 二级：直取 gateway adapter。
         try:
             from gateway.run import _gateway_runner_ref
             from gateway.config import Platform
+            from agent.async_utils import safe_schedule_threadsafe
 
             runner = _gateway_runner_ref()
-            adapter = None
-            if runner is not None:
-                try:
-                    adapter = runner.adapters.get(Platform(platform))
-                except Exception:
-                    adapter = None
+            if runner is None:
+                return {"ok": False, "error": "no_gateway", "text": text, "target": target}
+            loop = getattr(runner, "_gateway_loop", None)
+            if loop is None:
+                return {"ok": False, "error": "no_loop", "text": text, "target": target}
+            try:
+                adapter = runner.adapters.get(Platform(platform))
+            except Exception:
+                adapter = None
             if adapter is None:
-                # 两级都不可用（无 gateway / 无该平台 adapter）→ 记录并返回。
-                error = "no_gateway" if runner is None else "no_adapter"
-                return {"ok": False, "error": error, "text": text, "target": target}
+                return {"ok": False, "error": "no_adapter", "text": text, "target": target}
             metadata = {"thread_id": thread_id} if thread_id else None
-            asyncio.run(adapter.send(chat_id=chat_id, content=text, metadata=metadata))
-            return {"ok": True, "via": "adapter", "target": target, "text": text}
-        except Exception as exc:  # gateway import 失败 / send 失败
+            fut = safe_schedule_threadsafe(
+                adapter.send(chat_id=chat_id, content=text, metadata=metadata), loop
+            )
+            if fut is None:
+                return {"ok": False, "error": "schedule_failed", "text": text, "target": target}
+            result = fut.result(timeout=60)
+            if getattr(result, "success", False):
+                return {"ok": True, "via": "adapter", "target": target, "text": text}
+            return {"ok": False, "error": "send_failed",
+                    "detail": str(getattr(result, "error", "") or ""),
+                    "text": text, "target": target}
+        except Exception as exc:
             logger.warning("hermes-a2a-bridge: adapter send failed: %s", exc)
             return {"ok": False, "error": "send_failed", "text": text, "target": target}
 
@@ -487,8 +491,13 @@ def consume_stream(
                     stats["final_text"] = event.get("text") or ""
                 line = render_line(event)
                 for text in throttler.feed(event, line):
-                    sender(platform, chat_id, thread_id, text)
-                    stats["messages_sent"] += 1
+                    res = sender(platform, chat_id, thread_id, text)
+                    if isinstance(res, dict) and not res.get("ok"):
+                        logger.warning(
+                            "hermes-a2a-bridge: send not delivered: %s", res.get("error")
+                        )
+                    else:
+                        stats["messages_sent"] += 1
             except Exception as exc:  # 单事件失败不影响整体
                 logger.warning(
                     "hermes-a2a-bridge: event %r failed: %s", event, exc

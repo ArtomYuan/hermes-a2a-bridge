@@ -14,6 +14,8 @@
 ``consumer.iter_sse_data`` 验证。
 """
 
+import asyncio
+import concurrent.futures
 import importlib.util
 import io
 import json
@@ -36,6 +38,7 @@ _PREEXISTING = {
     for name in (
         "agent",
         "agent.redact",
+        "agent.async_utils",
         "gateway",
         "gateway.run",
         "gateway.config",
@@ -45,7 +48,14 @@ _PREEXISTING = {
 
 def _restore_modules():
     """卸载测试注入的 agent / gateway 模块，恢复加载前的状态。"""
-    for name in ("agent", "agent.redact", "gateway", "gateway.run", "gateway.config"):
+    for name in (
+        "agent",
+        "agent.redact",
+        "agent.async_utils",
+        "gateway",
+        "gateway.run",
+        "gateway.config",
+    ):
         prev = _PREEXISTING[name]
         if prev is None:
             sys.modules.pop(name, None)
@@ -71,6 +81,24 @@ def _install_fake_agent_redact():
     return calls
 
 
+class _FakePlatform:
+    """假 ``gateway.config.Platform`` 枚举值：按 value 判等 / 哈希（模拟枚举语义）。"""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        if isinstance(other, _FakePlatform):
+            return self.value == other.value
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        return f"Platform({self.value!r})"
+
+
 def _install_fake_gateway(runner_factory):
     """注入假 gateway（runner 由 ``runner_factory`` 提供，None 表示无 gateway）。"""
     pkg = types.ModuleType("gateway")
@@ -78,17 +106,70 @@ def _install_fake_gateway(runner_factory):
     run_mod = types.ModuleType("gateway.run")
     run_mod._gateway_runner_ref = runner_factory
     config_mod = types.ModuleType("gateway.config")
-
-    class _FakePlatform:
-        def __init__(self, value):
-            self.value = value
-
     config_mod.Platform = _FakePlatform
     sys.modules["gateway"] = pkg
     sys.modules["gateway.run"] = run_mod
     sys.modules["gateway.config"] = config_mod
     pkg.run = run_mod
     pkg.config = config_mod
+
+
+class _FakeAdapter:
+    """记录调用参数的假 adapter；``send`` 返回带 success/message_id/error 的 SendResult。"""
+
+    def __init__(self, success=True, error="boom"):
+        self.success = success
+        self.error = error
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return types.SimpleNamespace(
+            success=self.success,
+            message_id="m1" if self.success else None,
+            error=None if self.success else self.error,
+        )
+
+
+class _FakeRunner:
+    """带 ``_gateway_loop``（假 loop）与 ``adapters`` 映射的假 runner。"""
+
+    def __init__(self, adapters, loop=None):
+        self.adapters = adapters
+        # 假 loop 只需能被 fake safe_schedule_threadsafe 接受（本测试不真正用其调度）。
+        self._gateway_loop = loop if loop is not None else types.SimpleNamespace()
+
+
+def _install_fake_async_utils(return_none=False):
+    """注入假 ``agent.async_utils``；返回 (calls, safe_schedule_threadsafe)。
+
+    ``safe_schedule_threadsafe(coro, loop)`` 捕获 (coro, loop)，同步 ``asyncio.run``
+    该协程并返回已完成的 ``concurrent.futures.Future``（验证「协程被调度到主 loop」）。
+    ``return_none=True`` 时模拟调度失败返回 None（并关闭协程防告警）。
+    """
+    calls = []
+    pkg = sys.modules.get("agent")
+    if pkg is None:
+        pkg = types.ModuleType("agent")
+        pkg.__path__ = []
+        sys.modules["agent"] = pkg
+
+    def safe_schedule_threadsafe(coro, loop):
+        calls.append((coro, loop))
+        if return_none:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return None
+        result = asyncio.run(coro)
+        fut = concurrent.futures.Future()
+        fut.set_result(result)
+        return fut
+
+    mod = types.ModuleType("agent.async_utils")
+    mod.safe_schedule_threadsafe = safe_schedule_threadsafe
+    sys.modules["agent.async_utils"] = mod
+    pkg.async_utils = mod
+    return calls, safe_schedule_threadsafe
 
 
 # ---------------------------------------------------------------------------
@@ -332,36 +413,37 @@ class SenderTest(unittest.TestCase):
     def tearDown(self):
         _restore_modules()
 
-    def test_dispatch_tool_level_one(self):
-        calls = []
+    def test_send_success_via_adapter(self):
+        adapter = _FakeAdapter(success=True)
+        loop = types.SimpleNamespace()
+        runner = _FakeRunner({_FakePlatform("feishu"): adapter}, loop=loop)
+        _install_fake_gateway(lambda: runner)
+        schedule_calls, _ = _install_fake_async_utils()
+        send = consumer.make_sender(None)
+        res = send("feishu", "oc_x", "omt_y", "hello")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "adapter")
+        # adapter 收到 content 与含 thread_id 的 metadata。
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(adapter.calls[0]["chat_id"], "oc_x")
+        self.assertEqual(adapter.calls[0]["content"], "hello")
+        self.assertEqual(adapter.calls[0]["metadata"], {"thread_id": "omt_y"})
+        # 协程被调度到主 loop（fake runner 的 _gateway_loop）。
+        self.assertEqual(len(schedule_calls), 1)
+        self.assertIs(schedule_calls[0][1], loop)
 
-        class FakeCtx:
-            def dispatch_tool(self, tool_name, args):
-                calls.append((tool_name, args))
-                return "ok"
-
-        send = consumer.make_sender(FakeCtx())
+    def test_send_metadata_none_without_thread_id(self):
+        adapter = _FakeAdapter(success=True)
+        _install_fake_gateway(lambda: _FakeRunner({_FakePlatform("feishu"): adapter}))
+        _install_fake_async_utils()
+        send = consumer.make_sender(None)
         res = send("feishu", "oc_x", "", "hello")
         self.assertTrue(res["ok"])
-        self.assertEqual(res["via"], "dispatch_tool")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "send_message")
-        self.assertEqual(calls[0][1], {"target": "feishu:oc_x", "message": "hello"})
+        self.assertEqual(adapter.calls[0]["metadata"], None)
 
-    def test_dispatch_tool_with_thread_id(self):
-        calls = []
-
-        class FakeCtx:
-            def dispatch_tool(self, tool_name, args):
-                calls.append(args)
-                return "ok"
-
-        send = consumer.make_sender(FakeCtx())
-        send("feishu", "oc_x", "omt_y", "hi")
-        self.assertEqual(calls[0]["target"], "feishu:oc_x:omt_y")
-
-    def test_no_gateway_fallback(self):
+    def test_no_gateway(self):
         _install_fake_gateway(lambda: None)
+        _install_fake_async_utils()
         send = consumer.make_sender(None)
         res = send("feishu", "oc_x", "", "hello")
         self.assertFalse(res["ok"])
@@ -369,31 +451,87 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(res["text"], "hello")
         self.assertEqual(res["target"], "feishu:oc_x")
 
+    def test_no_loop(self):
+        runner = _FakeRunner({_FakePlatform("feishu"): _FakeAdapter()})
+        runner._gateway_loop = None
+        _install_fake_gateway(lambda: runner)
+        _install_fake_async_utils()
+        send = consumer.make_sender(None)
+        res = send("feishu", "oc_x", "", "hello")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "no_loop")
+
+    def test_no_adapter(self):
+        _install_fake_gateway(lambda: _FakeRunner({}))  # 无 feishu adapter
+        _install_fake_async_utils()
+        send = consumer.make_sender(None)
+        res = send("feishu", "oc_x", "", "hello")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "no_adapter")
+
+    def test_schedule_failed(self):
+        _install_fake_gateway(lambda: _FakeRunner({_FakePlatform("feishu"): _FakeAdapter()}))
+        _install_fake_async_utils(return_none=True)
+        send = consumer.make_sender(None)
+        res = send("feishu", "oc_x", "", "hello")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "schedule_failed")
+
+    def test_send_failed_with_detail(self):
+        _install_fake_gateway(
+            lambda: _FakeRunner({_FakePlatform("feishu"): _FakeAdapter(success=False, error="rate limited")})
+        )
+        _install_fake_async_utils()
+        send = consumer.make_sender(None)
+        res = send("feishu", "oc_x", "", "hello")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "send_failed")
+        self.assertEqual(res["detail"], "rate limited")
+
     def test_no_gateway_without_any_gateway_module(self):
         _restore_modules()
         send = consumer.make_sender(None)
         res = send("feishu", "oc_x", "", "hello")
         self.assertFalse(res["ok"])
-        # 无 gateway 模块 → level 2 import 失败 → send_failed（仍结构化、不抛异常）。
+        # 无 gateway 模块 → import 失败被外层 except 捕获 → send_failed（仍结构化、不抛异常）。
         self.assertEqual(res["error"], "send_failed")
 
+    def test_dispatch_tool_not_used(self):
+        # ctx 存在时也不再走 dispatch_tool，发送始终经 adapter 通路。
+        calls = []
+
+        class FakeCtx:
+            def dispatch_tool(self, tool_name, args):
+                calls.append((tool_name, args))
+                return "ok"
+
+        _install_fake_gateway(lambda: _FakeRunner({_FakePlatform("feishu"): _FakeAdapter(success=True)}))
+        _install_fake_async_utils()
+        send = consumer.make_sender(FakeCtx())
+        res = send("feishu", "oc_x", "", "hello")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "adapter")
+        self.assertEqual(calls, [])
+
     def test_redact_called_before_send(self):
-        calls = _install_fake_agent_redact()
-        _install_fake_gateway(lambda: None)
+        redact_calls = _install_fake_agent_redact()
+        _install_fake_gateway(lambda: _FakeRunner({_FakePlatform("feishu"): _FakeAdapter(success=True)}))
+        _install_fake_async_utils()
         send = consumer.make_sender(None)
         res = send("feishu", "oc_x", "", "hello sk-secret")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "hello sk-secret")
-        self.assertEqual(calls[0][1].get("force"), True)
+        self.assertEqual(len(redact_calls), 1)
+        self.assertEqual(redact_calls[0][0], "hello sk-secret")
+        self.assertEqual(redact_calls[0][1].get("force"), True)
         self.assertEqual(res["text"], "[REDACTED]hello sk-secret")
 
     def test_redact_unavailable_passes_through(self):
         _restore_modules()  # 确保无 agent.redact
+        _install_fake_gateway(lambda: _FakeRunner({_FakePlatform("feishu"): _FakeAdapter(success=True)}))
+        _install_fake_async_utils()
         send = consumer.make_sender(None)
-        # redact import 失败 → 原文返回；无 gateway → no_gateway 结构化返回。
-        _install_fake_gateway(lambda: None)
         res = send("feishu", "oc_x", "", "plain text")
         self.assertEqual(res["text"], "plain text")
+        self.assertTrue(res["ok"])
 
 
 class ConsumeStreamTest(unittest.TestCase):
@@ -452,6 +590,28 @@ class ConsumeStreamTest(unittest.TestCase):
         self.assertEqual(stats["states"], ["submitted", "completed"])
         # unknown_kind 事件被跳过，不产生发送。
         self.assertEqual(sent, ["✅ 完成"])
+
+    def test_consume_stream_send_failure_not_counted(self):
+        # sender 返回 {"ok": False} 时只记 warning、不累计 messages_sent。
+        results = [
+            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+        ]
+        consumer._orig_iter_sse_data = consumer.iter_sse_data
+        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        sent = []
+
+        def sender(platform, chat_id, thread_id, text):
+            sent.append(text)
+            return {"ok": False, "error": "send_failed"}
+
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+            min_interval=0.0,
+        )
+        self.assertEqual(sent, ["✅ 完成"])
+        self.assertEqual(stats["messages_sent"], 0)
 
 
 def _print_event_render_table():

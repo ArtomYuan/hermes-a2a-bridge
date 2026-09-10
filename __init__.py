@@ -70,7 +70,8 @@ _TARGET_TOOLS = frozenset(
 )
 
 # P2c 直播消费者门控状态：register() 读 ``collector.enabled``（默认关）后写入；
-# ``_CTX`` 保存插件 ctx 引用供后台发送线程用（``make_sender(ctx)`` 的一级通路）。
+# ``_CTX`` 保存插件 ctx 引用传给 ``make_sender(_CTX)``（仅为签名兼容，实际发送不再走
+# dispatch_tool，而经 gateway 主 loop 调度 adapter）。
 _COLLECTOR_ENABLED = False
 _CTX: Optional[Any] = None
 # consumer 模块缓存（惰性 import，见 _import_consumer）。

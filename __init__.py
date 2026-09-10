@@ -34,11 +34,26 @@ Hermes 内置 A2A 插件（``~/.hermes/hermes-agent/plugins/platforms/a2a/``）�
 - 默认关：本插件不在 ``plugins.enabled`` 白名单时不会被加载，故「未启用即无副作用」。
   启用方式见 README.md。
 
-本阶段（P2b）只做 origin → contextId 注入；流式消费者（post_tool_call / 事件）是
-后续 P2c，本文件仅保留占位，不消费 dsh A2A 事件流。
+P2c 直播消费者（collector.enabled 门控，默认关）
+------------------------------------------------
+除 P2b 的 origin → contextId 注入外，本阶段新增「直播消费者」触发：当
+``collector.enabled`` 为真且 ``a2a_call`` / ``a2a_orchestrate`` 目标是 dsh 时，在
+注入 context_id 的同时，启动一个 daemon 后台线程 ``_spawn_consumer``，向同一 dsh
+A2A server 再发一条 ``SendStreamingMessage``（同一 contextId），把流式中间事件
+（思考 / 工具 / 状态 / 文本）经 ``consumer.py`` 渲染 + redact 后推回飞书 / QQ 消息面。
+
+已知取舍（double execution）
+----------------------------
+本触发方案在同步 ``a2a_call``（``SendMessage``）之外，再发一条 ``SendStreamingMessage``
+到同一 contextId，dsh 会把任务再执行一次（同一会话 followup 两次）；这是 P2c「先跑通
+直播通道」的简化。正确修法是 override ``a2a_call`` 为单一流式 handler（结果回 agent +
+事件推对话，避免重复执行），需 gateway 重启 + ``plugins.entries.hermes-a2a-bridge.
+allow_tool_override: true`` + 加载顺序验证，留待窗口期定稿。``collector.enabled``
+默认关，不启用即零副作用。
 """
 
 import logging
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +68,23 @@ _TARGET_TOOLS = frozenset(
         "a2a_orchestrate",
     }
 )
+
+# P2c 直播消费者门控状态：register() 读 ``collector.enabled``（默认关）后写入；
+# ``_CTX`` 保存插件 ctx 引用供后台发送线程用（``make_sender(ctx)`` 的一级通路）。
+_COLLECTOR_ENABLED = False
+_CTX: Optional[Any] = None
+# consumer 模块缓存（惰性 import，见 _import_consumer）。
+_CONSUMER_MODULE: Optional[Any] = None
+
+
+def _to_bool(value: Any) -> bool:
+    """把 YAML 布尔 / 字符串布尔稳健转为 bool（``"false"`` / ``"0"`` 视为关）。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on", "enabled"}
 
 
 def _clean_segment(seg: str) -> str:
@@ -93,12 +125,156 @@ def _build_origin() -> str:
     return "/".join(parts)
 
 
+def _get_session_env_safe(name: str) -> str:
+    """读会话上下文变量，import 失败 / 异常时返回 ""（故障放行）。"""
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env(name, "") or "").strip()
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: get_session_env(%s) failed: %s", name, exc)
+        return ""
+
+
+def _dsh_peer() -> Optional[Dict[str, Any]]:
+    """读 ``a2a_agents.dsh`` 配置条目（url / auth / capabilities）；未配置返回 None。"""
+    try:
+        from hermes_cli.config import load_config
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: hermes_cli.config unavailable: %s", exc)
+        return None
+    try:
+        cfg = load_config() or {}
+        peers = cfg.get("a2a_agents") or {}
+        entry = peers.get("dsh")
+        return entry if isinstance(entry, dict) else None
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: failed to read a2a_agents.dsh: %s", exc)
+        return None
+
+
+def _is_dsh_target(tool_name: str, args: Dict[str, Any]) -> bool:
+    """判断本次调用是否以 dsh 为目标（决定是否触发直播消费者）。"""
+    if tool_name == "a2a_call":
+        agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+        if not agent:
+            return False
+        if agent.lower() == "dsh":
+            return True
+        peer = _dsh_peer()
+        if peer:
+            url = str(peer.get("url") or "").rstrip("/")
+            if url and agent.rstrip("/") == url:
+                return True
+        return False
+    if tool_name == "a2a_orchestrate":
+        # orchestrate 按 capability 扇出、无单一路由 agent；仅当 dsh 配置存在且
+        # 声明的 capability 覆盖本次 capability（或 "*"）时判定 dsh 为被投递方。
+        capability = str(args.get("capability") or "").strip()
+        if not capability:
+            return False
+        if capability == "*":
+            return _dsh_peer() is not None
+        peer = _dsh_peer()
+        if not peer:
+            return False
+        caps = peer.get("capabilities") or []
+        return capability in caps
+    return False
+
+
+def _import_consumer():
+    """惰性 import ``consumer`` 模块（优先包内相对导入，直接文件加载时回退绝对路径）。"""
+    global _CONSUMER_MODULE
+    if _CONSUMER_MODULE is not None:
+        return _CONSUMER_MODULE
+    try:
+        from . import consumer as _consumer
+    except (ImportError, ValueError) as exc:
+        logger.debug("hermes-a2a-bridge: relative consumer import failed: %s", exc)
+        import importlib.util
+        import os
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consumer.py")
+        spec = importlib.util.spec_from_file_location(
+            "hermes_a2a_bridge.consumer", path
+        )
+        _consumer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_consumer)
+    _CONSUMER_MODULE = _consumer
+    return _consumer
+
+
+def _spawn_consumer(
+    message: str,
+    context_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+) -> None:
+    """后台线程体：读 dsh 配置 → 建 sender → ``consume_stream`` 推流式事件。
+
+    全程 try/except，任何异常只 logging.warning，绝不阻断同步 a2a_call。
+    context_id 由调用方（钩子内、同步上下文）用 ``_build_origin()`` 算好传入；
+    platform / chat_id / thread_id 同样在钩子内读取（ContextVar 是 task-local，
+    不随 daemon 线程传播，故在同步上下文取好再传参）。
+    """
+    try:
+        peer = _dsh_peer()
+        if not peer:
+            logger.warning(
+                "hermes-a2a-bridge: a2a_agents.dsh not configured; skip live-stream consumer"
+            )
+            return
+        url = str(peer.get("url") or "").strip()
+        auth = peer.get("auth") or {}
+        token = str(auth.get("token") or "") if isinstance(auth, dict) else ""
+        if not url:
+            logger.warning("hermes-a2a-bridge: a2a_agents.dsh.url empty; skip consumer")
+            return
+
+        consumer = _import_consumer()
+        sender = consumer.make_sender(_CTX)
+        consumer.consume_stream(
+            url=url,
+            token=token,
+            message=message,
+            context_id=context_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            sender=sender,
+        )
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: live-stream consumer thread failed: %s", exc)
+
+
+def _start_consumer(args: Dict[str, Any], origin: str) -> None:
+    """在同步钩子上下文取路由信息并启动 daemon 消费线程（不阻断工具调用）。"""
+    try:
+        message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
+        if not message:
+            return
+        platform = _get_session_env_safe("HERMES_SESSION_PLATFORM")
+        chat_id = _get_session_env_safe("HERMES_SESSION_CHAT_ID")
+        thread_id = _get_session_env_safe("HERMES_SESSION_THREAD_ID")
+        if not platform or not chat_id:
+            return
+        threading.Thread(
+            target=_spawn_consumer,
+            args=(message, origin, platform, chat_id, thread_id),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: failed to start consumer thread: %s", exc)
+
+
 def _on_pre_tool_call(
     tool_name: str = "",
     args: Any = None,
     **_: Any,
 ) -> Optional[Dict[str, Any]]:
-    """pre_tool_call 钩子：仅对 a2a_call/a2a_orchestrate 注入 context_id。"""
+    """pre_tool_call 钩子：对 a2a_call/a2a_orchestrate 注入 context_id；P2c 可选触发直播消费者。"""
     if tool_name not in _TARGET_TOOLS:
         return None
 
@@ -113,6 +289,10 @@ def _on_pre_tool_call(
     if not origin:
         return None
 
+    # P2c：collector 开启且目标是 dsh 时，注入 context_id 的同时启动直播消费线程。
+    if _COLLECTOR_ENABLED and _is_dsh_target(tool_name, args):
+        _start_consumer(args, origin)
+
     # 浅合并加 context_id 键；框架侧 dict(original_args).update(partial)，不会丢既有参数。
     return {"action": "modify", "args": {"context_id": origin}}
 
@@ -123,18 +303,22 @@ def _on_post_tool_call(
     result: Any = None,
     **_: Any,
 ) -> None:
-    """post_tool_call 钩子占位：P2c 在此消费 / 回投 dsh 侧流式事件。
+    """post_tool_call 钩子：P2c 直播消费已改在 pre_tool_call 触发，此钩子仅放行。
 
-    本阶段（P2b）不实现，仅保留占位；未来在此订阅 dsh A2A 事件流
-    （思考 / 工具 / 状态 / 文本），经 ctx.emit 回投 Hermes 路由到消息面。
+    直播通道在 ``_on_pre_tool_call`` 命中时即启动后台线程（与同步 a2a_call 并行），
+    无需在此二次消费；本钩子保留占位、return None 放行。
     """
-    # TODO(P2c): 消费 dsh A2A 事件流并回投 Hermes。
     return None
 
 
 def register(ctx) -> None:
-    """插件入口：注册 pre_tool_call 与 post_tool_call 钩子（参数名无关紧要，框架按位置传入 PluginContext）。"""
+    """插件入口：读 collector 门控、注册 pre_tool_call / post_tool_call 钩子。"""
+    global _COLLECTOR_ENABLED, _CTX
+    _CTX = ctx
+    try:
+        _COLLECTOR_ENABLED = _to_bool(ctx.get_config("collector.enabled", False))
+    except Exception as exc:  # 读配置失败按默认关处理，绝不阻断插件加载
+        logger.warning("hermes-a2a-bridge: read collector.enabled failed: %s", exc)
+        _COLLECTOR_ENABLED = False
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
-    # TODO(P2c): 启动事件消费者 —— 后台任务 / SSE/WS 客户端订阅 dsh A2A server
-    # 的事件，经 ctx.emit("event", payload) 回投 Hermes。

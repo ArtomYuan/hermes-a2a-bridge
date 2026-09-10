@@ -28,6 +28,7 @@ import json
 import logging
 import time
 import urllib.request
+import uuid
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -198,18 +199,15 @@ def normalize_events(results: Iterable[Dict[str, Any]]) -> Iterator[Dict[str, An
             for part in parts:
                 if not isinstance(part, dict):
                     continue
-                content = part.get("content") or {}
-                if not isinstance(content, dict):
-                    continue
-                case = content.get("$case")
-                if case == "text":
+                # A2A v1.0 Part 的 JSON 序列化用判别字段名（text / data），非 content.$case。
+                if "text" in part:
                     yield {
                         "type": "text",
-                        "text": content.get("value", ""),
+                        "text": part.get("text", ""),
                         "final": last_chunk,
                     }
-                elif case == "data":
-                    ev = _normalize_data_part(content.get("value") or {}, last_chunk)
+                elif "data" in part:
+                    ev = _normalize_data_part(part.get("data") or {}, last_chunk)
                     if ev is not None:
                         yield ev
                 # 其它 part 类型：跳过
@@ -424,20 +422,23 @@ def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any
 # --------------------------------------------------------------------------
 
 def _streaming_message_body(message: str, context_id: str) -> Dict[str, Any]:
-    """构造 SendStreamingMessage 的 params（user message + contextId）。"""
+    """构造 SendStreamingMessage 的 params（user message + contextId）。
+
+    A2A v1.0 Part 的 JSON 序列化用判别字段名（text / data，非 ``content.$case``）；
+    Role 枚举 JSON 值为 ``ROLE_USER``；SDK 校验 ``SendStreamingMessage`` 要求
+    ``message.messageId`` 非空。
+    """
     return {
         "jsonrpc": "2.0",
         "id": _new_request_id(),
         "method": "SendStreamingMessage",
         "params": {
             "message": {
-                "role": "user",
+                "role": "ROLE_USER",
                 "parts": [
-                    {
-                        "content": {"$case": "text", "value": message},
-                        "mediaType": "text/plain",
-                    }
+                    {"text": message, "mediaType": "text/plain"},
                 ],
+                "messageId": uuid.uuid4().hex,
                 "contextId": context_id,
             }
         },

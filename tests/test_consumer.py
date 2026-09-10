@@ -105,11 +105,11 @@ def _sse(*results):
 
 
 def _text_part(value):
-    return {"content": {"$case": "text", "value": value}, "mediaType": "text/plain"}
+    return {"text": value, "mediaType": "text/plain"}
 
 
 def _data_part(value):
-    return {"content": {"$case": "data", "value": value}, "mediaType": "application/json"}
+    return {"data": value, "mediaType": "application/json"}
 
 
 def _artifact_update(parts, *, last_chunk, artifact_id="stream-text", name="StreamEvent", append=False):
@@ -432,7 +432,7 @@ class ConsumeStreamTest(unittest.TestCase):
     def test_consume_stream_bad_event_does_not_crash(self):
         results = [
             {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
-            {"artifactUpdate": {"artifact": {"parts": [{"content": {"$case": "data", "value": {"kind": "unknown_kind"}}}]}}},
+            {"artifactUpdate": {"artifact": {"parts": [{"data": {"kind": "unknown_kind"}}]}}},
             {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
         ]
         consumer._orig_iter_sse_data = consumer.iter_sse_data

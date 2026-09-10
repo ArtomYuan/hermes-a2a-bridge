@@ -201,11 +201,15 @@ class OriginInjectionTest(unittest.TestCase):
     # 9. gateway.session_context import 失败 → None（故障放行）
     def test_import_failure_returns_none(self):
         _remove_fake_gateway()
-        # 确保 gateway / gateway.session_context 均不在 sys.modules。
-        self.assertNotIn("gateway.session_context", sys.modules)
-        self.assertIsNone(
-            _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
-        )
+        # 强制 import 抛错：sys.modules 里置 None 使 `from gateway.session_context import ...`
+        # 必然 raise ImportError，即使真实 gateway 包在 sys.path 上也不会被导入。
+        sys.modules["gateway.session_context"] = None
+        try:
+            self.assertIsNone(
+                _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
+            )
+        finally:
+            sys.modules.pop("gateway.session_context", None)
 
     # 10. args 为 None/非 dict → 不抛异常、按空 args 处理（messaging 面下正常注入）
     def test_non_dict_args_treated_as_empty(self):

@@ -146,7 +146,11 @@ class _FakeConsumer:
 
     def make_sender(self, ctx):
         self.make_sender_calls.append(ctx)
-        return lambda p, c, t, text: {"ok": True}
+        # 返回可识别的真 sender（区别于 noop 的 {"ok": True}），供用例断言 consume_stream
+        # 收到的 sender 是真实 sender 而非 noop。
+        sender = lambda p, c, t, text: {"ok": True, "via": "make_sender"}
+        self.last_sender = sender
+        return sender
 
     def consume_stream(self, **kw):
         self.consume_stream_calls.append(kw)
@@ -203,29 +207,33 @@ class OverrideTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], {"agent": "ivan", "message": "hi"})
 
-    # 2. dsh 目标 + 正常流式 → 返回格式化结果，consume_stream 收到 url/token/context_id。
-    def test_dsh_streaming_returns_formatted_result(self):
+    # 2. dsh 目标 + collector 开 → 路由从 context_id(origin) 派生，sender 为真 sender。
+    def test_dsh_streaming_derives_routing_from_context_id(self):
         _install_fake_hermes_cli(_CONFIG)
-        _install_fake_gateway(
-            True,
-            {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"},
-        )
+        # 不装 fake gateway：证明路由完全从 context_id 派生，而非再读 ContextVar。
         _MODULE._COLLECTOR_ENABLED = True
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
         _MODULE._ORIGINAL_A2A_CALL = lambda args, **kw: "SHOULD_NOT_CALL"
 
-        result = _MODULE._override_a2a_call({"agent": "dsh", "message": "hi"})
-        self.assertEqual(result, "[dsh · context feishu/oc_x · completed]\n收到")
+        result = _MODULE._override_a2a_call(
+            {"agent": "dsh", "message": "hi", "context_id": "feishu/oc_x/omt_y"}
+        )
+        self.assertEqual(result, "[dsh · context feishu/oc_x/omt_y · completed]\n收到")
 
         self.assertEqual(len(consumer.consume_stream_calls), 1)
         call = consumer.consume_stream_calls[0]
         self.assertEqual(call["url"], "http://127.0.0.1:8092")
         self.assertEqual(call["token"], "token-dsh")
-        self.assertEqual(call["context_id"], "feishu/oc_x")
+        self.assertEqual(call["context_id"], "feishu/oc_x/omt_y")
         self.assertEqual(call["message"], "hi")
-        # 直播发送：真 sender（make_sender 被调用一次）。
+        # 路由从 context_id(origin) 派生：platform/chat_id/thread_id 逐段还原。
+        self.assertEqual(call["platform"], "feishu")
+        self.assertEqual(call["chat_id"], "oc_x")
+        self.assertEqual(call["thread_id"], "omt_y")
+        # 直播发送：真 sender（make_sender 被调用一次，consume_stream 收到的是该真 sender）。
         self.assertEqual(len(consumer.make_sender_calls), 1)
+        self.assertIs(call["sender"], consumer.last_sender)
 
     # 3. dsh 目标 + consume_stream 抛异常 → 回退调用原 handler。
     def test_dsh_streaming_failure_falls_back(self):
@@ -326,6 +334,27 @@ class OverrideTest(unittest.TestCase):
         _MODULE._COLLECTOR_ENABLED = True
         result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
         self.assertEqual(result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}})
+
+    # 8. dsh 目标 + collector 开 + context_id 为空且 _build_origin 返回空 → sender noop。
+    def test_dsh_empty_origin_uses_noop_sender(self):
+        _install_fake_hermes_cli(_CONFIG)
+        _install_fake_gateway(False, {})  # 非 messaging 面 → _build_origin 返回 ""
+        _MODULE._COLLECTOR_ENABLED = True
+        consumer = _FakeConsumer()
+        _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._ORIGINAL_A2A_CALL = lambda args, **kw: "SHOULD_NOT_CALL"
+
+        result = _MODULE._override_a2a_call({"agent": "dsh", "message": "hi"})
+        self.assertEqual(result, "[dsh · context (auto) · completed]\n收到")
+        self.assertEqual(len(consumer.make_sender_calls), 0)
+        call = consumer.consume_stream_calls[0]
+        self.assertEqual(call["platform"], "")
+        self.assertEqual(call["chat_id"], "")
+        self.assertEqual(call["thread_id"], "")
+        sender = call["sender"]
+        self.assertTrue(callable(sender))
+        # noop sender：不真实发送，直接返回 ok。
+        self.assertEqual(sender("p", "c", "t", "text"), {"ok": True})
 
 
 if __name__ == "__main__":

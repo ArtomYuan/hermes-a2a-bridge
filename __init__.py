@@ -130,30 +130,6 @@ def _build_origin() -> str:
     return "/".join(parts)
 
 
-def _get_session_env_safe(name: str) -> str:
-    """读会话上下文变量，import 失败 / 异常时返回 ""（故障放行）。"""
-    try:
-        from gateway.session_context import get_session_env
-
-        return str(get_session_env(name, "") or "").strip()
-    except Exception as exc:
-        logger.warning("hermes-a2a-bridge: get_session_env(%s) failed: %s", name, exc)
-        return ""
-
-
-def _is_messaging_surface() -> bool:
-    """判定当前是否消息面（飞书/QQ 等）；import 失败 / 异常视为 False（故障放行）。"""
-    try:
-        from gateway.session_context import session_is_messaging_surface
-
-        return bool(session_is_messaging_surface())
-    except Exception as exc:
-        logger.warning(
-            "hermes-a2a-bridge: failed to import gateway.session_context: %s", exc
-        )
-        return False
-
-
 def _dsh_peer() -> Optional[Dict[str, Any]]:
     """读 ``a2a_agents.dsh`` 配置条目（url / auth / capabilities）；未配置返回 None。"""
     try:
@@ -272,19 +248,39 @@ def _override_a2a_call(args, **kw):
     if not context_id:
         context_id = _build_origin()
 
-    # 决定是否直播发送：collector 开 + messaging 面 → 真 sender；否则 noop（只收最终结果）。
+    # 路由信息从 context_id(origin) 派生，而不是在 handler 里再读 ContextVar。
+    # pre_tool_call 已在 messaging 面注入 context_id = {platform}/{chat_id}[/{thread_id}]；
+    # origin 各段已被 _clean_segment 清理过（无 "/"），直接 split("/") 还原。
+    _parts = context_id.split("/") if context_id else []
+    platform = _parts[0] if len(_parts) > 0 else ""
+    chat_id = _parts[1] if len(_parts) > 1 else ""
+    thread_id = _parts[2] if len(_parts) > 2 else ""
     sender = None
-    platform = chat_id = thread_id = ""
-    if _COLLECTOR_ENABLED and _is_messaging_surface():
-        platform = _get_session_env_safe("HERMES_SESSION_PLATFORM")
-        chat_id = _get_session_env_safe("HERMES_SESSION_CHAT_ID")
-        thread_id = _get_session_env_safe("HERMES_SESSION_THREAD_ID")
-        if platform and chat_id:
+    sender_is_real = False
+    if _COLLECTOR_ENABLED and platform and chat_id:
+        try:
             sender = _import_consumer().make_sender(_CTX)
+            sender_is_real = True
+        except Exception as exc:
+            logger.warning("hermes-a2a-bridge: make_sender failed: %s", exc)
+            sender = None
     if sender is None:
         sender = lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
+        sender_is_real = False
 
     consumer = _import_consumer()
+    logger.info(
+        "hermes-a2a-bridge: override a2a_call agent=%s msg_len=%d context_id=%r "
+        "platform=%s chat_id=%s thread_id=%s sender_real=%s collector_enabled=%s",
+        agent,
+        len(message),
+        context_id,
+        platform,
+        chat_id,
+        thread_id,
+        sender_is_real,
+        _COLLECTOR_ENABLED,
+    )
     try:
         stats = consumer.consume_stream(
             url=url,
@@ -296,6 +292,13 @@ def _override_a2a_call(args, **kw):
             thread_id=thread_id,
             sender=sender,
             min_interval=2.0,
+        )
+        logger.info(
+            "hermes-a2a-bridge: override a2a_call consumed events_seen=%s "
+            "messages_sent=%s final_text=%r",
+            stats.get("events_seen"),
+            stats.get("messages_sent"),
+            (stats.get("final_text") or "")[:80],
         )
     except Exception as exc:  # 网络 / 流式失败 → 回退同步原 handler，功能不丢
         logger.warning(

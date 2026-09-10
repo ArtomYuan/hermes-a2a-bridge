@@ -1,4 +1,4 @@
-"""hermes-a2a-bridge override a2a_call 单一流式 handler 单元测试（纯静态，不接 gateway）.
+"""hermes-a2a-bridge pre_tool_call hook 单执行分支单元测试（纯静态，不接 gateway）.
 
 运行方式
 --------
@@ -6,10 +6,10 @@
 
 仅用标准库 ``unittest``，不依赖 pytest。用 ``importlib.util.spec_from_file_location``
 加载 ``__init__.py``，通过 ``sys.modules`` 注入假的 ``gateway.session_context``、
-``hermes_cli.config``、``tools.registry``，并直接替换模块级 ``_CONSUMER_MODULE`` 为假
-consumer，以验证 ``_override_a2a_call`` 的「非 dsh 委托 / dsh 单一流式 / 流式失败回退 /
-collector 关时 noop sender / register 捕获原 handler 并 override」五条路径，以及
-「pre_tool_call 不再另起流式线程」的单次执行机理。
+``hermes_cli.config``，并 monkeypatch 模块级 ``_stream_dsh_call`` / ``_CONSUMER_MODULE``
+/ ``_COLLECTOR_ENABLED``，以验证 ``_on_pre_tool_call`` 的 dsh 单执行（block）分支、
+流式失败回退、显式 context_id 放行、非 dsh / collector 关 / a2a_orchestrate / 非消息面
+仅注入 origin，以及 ``_stream_dsh_call`` 的格式化结果与缺配置抛错。
 """
 
 import importlib.util
@@ -34,8 +34,6 @@ _PREEXISTING = {
         "gateway.session_context",
         "hermes_cli",
         "hermes_cli.config",
-        "tools",
-        "tools.registry",
     )
 }
 
@@ -56,14 +54,7 @@ _CONFIG = {
 
 def _restore_modules():
     """卸载测试注入的假模块，恢复加载插件前的状态。"""
-    for name in (
-        "gateway",
-        "gateway.session_context",
-        "hermes_cli",
-        "hermes_cli.config",
-        "tools",
-        "tools.registry",
-    ):
+    for name in ("gateway", "gateway.session_context", "hermes_cli", "hermes_cli.config"):
         prev = _PREEXISTING[name]
         if prev is None:
             sys.modules.pop(name, None)
@@ -74,7 +65,7 @@ def _restore_modules():
 def _install_fake_gateway(is_messaging, env_values):
     """注入假 ``gateway`` / ``gateway.session_context`` 模块。"""
     pkg = types.ModuleType("gateway")
-    pkg.__path__ = []  # 使其成为包，防 import 链失败
+    pkg.__path__ = []
     mod = types.ModuleType("gateway.session_context")
     mod.session_is_messaging_surface = lambda: is_messaging
     mod.get_session_env = lambda key, default="": env_values.get(key, default)
@@ -94,49 +85,12 @@ def _install_fake_hermes_cli(config_dict):
     pkg.config = mod
 
 
-class _FakeEntry:
-    """假 tools.registry 条目，带 .handler/.schema/.description/.emoji/.toolset。"""
-
-    def __init__(self, handler, schema=None, description=None, emoji=None, toolset="a2a"):
-        self.handler = handler
-        self.schema = schema
-        self.description = description
-        self.emoji = emoji
-        self.toolset = toolset
-
-
-class _FakeRegistry:
-    """假 registry，记录 get_entry 调用并返回固定 entry（可为 None）。"""
-
-    def __init__(self, entry):
-        self.entry = entry
-        self.get_entry_calls = []
-
-    def get_entry(self, name, scope=None):
-        self.get_entry_calls.append((name, scope))
-        return self.entry
-
-
-def _install_fake_registry(entry):
-    """注入假 ``tools`` / ``tools.registry`` 模块，返回可查调用记录的 registry。"""
-    pkg = types.ModuleType("tools")
-    pkg.__path__ = []
-    mod = types.ModuleType("tools.registry")
-    reg = _FakeRegistry(entry)
-    mod.registry = reg
-    sys.modules["tools"] = pkg
-    sys.modules["tools.registry"] = mod
-    pkg.registry = mod
-    return reg
-
-
 class _FakeConsumer:
-    """假 consumer 模块：记录 make_sender / consume_stream 调用，可注入 consume_stream 异常。"""
+    """假 consumer 模块：记录 make_sender / consume_stream 调用。"""
 
     def __init__(self):
         self.consume_stream_calls = []
         self.make_sender_calls = []
-        self.consume_stream_error = None
         self.stats = {
             "final_text": "收到",
             "events_seen": 5,
@@ -146,215 +100,165 @@ class _FakeConsumer:
 
     def make_sender(self, ctx):
         self.make_sender_calls.append(ctx)
-        # 返回可识别的真 sender（区别于 noop 的 {"ok": True}），供用例断言 consume_stream
-        # 收到的 sender 是真实 sender 而非 noop。
+        # 返回可识别的真 sender，供用例断言 consume_stream 收到的 sender 是真实 sender。
         sender = lambda p, c, t, text: {"ok": True, "via": "make_sender"}
         self.last_sender = sender
         return sender
 
     def consume_stream(self, **kw):
         self.consume_stream_calls.append(kw)
-        if self.consume_stream_error is not None:
-            raise self.consume_stream_error
         return dict(self.stats)
 
 
-class _FakeCtx:
-    """假插件 ctx：带 get_config / register_tool / register_hook / _manager.scope_key。"""
-
-    def __init__(self):
-        self._manager = types.SimpleNamespace(scope_key="scope_test")
-        self.register_tool_calls = []
-        self.hooks = []
-
-    def get_config(self, key, default=None):
-        return default
-
-    def register_tool(self, **kw):
-        self.register_tool_calls.append(kw)
-
-    def register_hook(self, name, fn):
-        self.hooks.append((name, fn))
-
-
-class OverrideTest(unittest.TestCase):
+class HookTest(unittest.TestCase):
     def setUp(self):
         _restore_modules()
+        self._orig_stream = _MODULE._stream_dsh_call
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
-        _MODULE._ORIGINAL_A2A_CALL = None
 
     def tearDown(self):
+        _MODULE._stream_dsh_call = self._orig_stream
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
-        _MODULE._ORIGINAL_A2A_CALL = None
 
-    # 1. 非 dsh 目标 → 委托原 handler（记录调用、返回原 handler 返回值）。
-    def test_non_dsh_delegates_to_original(self):
-        _install_fake_hermes_cli(_CONFIG)
+    # 1. 非目标工具 → None
+    def test_non_target_tool_returns_none(self):
+        self.assertIsNone(
+            _MODULE._on_pre_tool_call("a2a_history", {"context_id": "x"})
+        )
+
+    # 2. 显式 context_id 已给 → None（不拦截、不覆盖）
+    def test_explicit_context_id_not_intercepted(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = True
+        self.assertIsNone(
+            _MODULE._on_pre_tool_call(
+                "a2a_call", {"agent": "dsh", "message": "hi", "context_id": "custom"}
+            )
+        )
+
+    # 3. a2a_call + dsh + collector 开 + origin 非空 + message 非空 → block 最终文本。
+    def test_dsh_single_execution_blocks_with_final_text(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = True
         calls = []
 
-        def original(args, **kw):
-            calls.append((args, kw))
-            return "ORIGINAL_RESULT"
+        def fake_stream(message, context_id):
+            calls.append((message, context_id))
+            return "[dsh · context feishu/oc_x · completed]\n收到"
 
-        _MODULE._ORIGINAL_A2A_CALL = original
-        result = _MODULE._override_a2a_call({"agent": "ivan", "message": "hi"})
-        self.assertEqual(result, "ORIGINAL_RESULT")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], {"agent": "ivan", "message": "hi"})
+        _MODULE._stream_dsh_call = fake_stream
+        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
+        self.assertEqual(
+            result,
+            {"action": "block", "message": "[dsh · context feishu/oc_x · completed]\n收到"},
+        )
+        self.assertEqual(calls, [("hi", "feishu/oc_x")])
 
-    # 2. dsh 目标 + collector 开 → 路由从 context_id(origin) 派生，sender 为真 sender。
-    def test_dsh_streaming_derives_routing_from_context_id(self):
-        _install_fake_hermes_cli(_CONFIG)
-        # 不装 fake gateway：证明路由完全从 context_id 派生，而非再读 ContextVar。
+    # 4. _stream_dsh_call 抛异常 → 回退仅注入 origin（走同步 SendMessage）。
+    def test_dsh_stream_failure_falls_back_to_inject(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
         _MODULE._COLLECTOR_ENABLED = True
+
+        def boom(message, context_id):
+            raise RuntimeError("boom")
+
+        _MODULE._stream_dsh_call = boom
+        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
+        self.assertEqual(
+            result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
+        )
+
+    # 5. 非 dsh（agent="ivan"）→ 仅注入 origin，不 block。
+    def test_non_dsh_agent_inject_only(self):
+        _install_fake_hermes_cli(_CONFIG)
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = True
+        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "ivan", "message": "hi"})
+        self.assertEqual(
+            result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
+        )
+
+    # 6. collector 关 → 仅注入 origin（dsh 单执行不触发）。
+    def test_collector_off_inject_only(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = False
+        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
+        self.assertEqual(
+            result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
+        )
+
+    # 7. a2a_orchestrate → 仅注入 origin，不 block。
+    def test_orchestrate_inject_only(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = True
+        result = _MODULE._on_pre_tool_call(
+            "a2a_orchestrate", {"capability": "x", "message": "hi"}
+        )
+        self.assertEqual(
+            result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
+        )
+
+    # 8. 非 messaging 面 → origin 空 → None。
+    def test_non_messaging_origin_empty_returns_none(self):
+        _install_fake_gateway(False, {})
+        _MODULE._COLLECTOR_ENABLED = True
+        self.assertIsNone(
+            _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
+        )
+
+    # 9. dsh + collector 开 + origin 非空但 message 空 → 仅注入 origin。
+    def test_dsh_empty_message_inject_only(self):
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        _MODULE._COLLECTOR_ENABLED = True
+        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": ""})
+        self.assertEqual(
+            result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
+        )
+
+    # 10. _stream_dsh_call 缺 dsh 配置 → RuntimeError。
+    def test_stream_dsh_call_missing_config_raises(self):
+        _restore_modules()  # 无 hermes_cli → _dsh_peer 返回 None → 无 url
+        with self.assertRaises(RuntimeError):
+            _MODULE._stream_dsh_call("hi", "feishu/oc_x")
+
+    # 11. _stream_dsh_call 格式化结果 + 路由从 context_id 派生。
+    def test_stream_dsh_call_formats_result(self):
+        _install_fake_hermes_cli(_CONFIG)
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
-        _MODULE._ORIGINAL_A2A_CALL = lambda args, **kw: "SHOULD_NOT_CALL"
-
-        result = _MODULE._override_a2a_call(
-            {"agent": "dsh", "message": "hi", "context_id": "feishu/oc_x/omt_y"}
-        )
+        result = _MODULE._stream_dsh_call("hi", "feishu/oc_x/omt_y")
         self.assertEqual(result, "[dsh · context feishu/oc_x/omt_y · completed]\n收到")
-
         self.assertEqual(len(consumer.consume_stream_calls), 1)
         call = consumer.consume_stream_calls[0]
         self.assertEqual(call["url"], "http://127.0.0.1:8092")
         self.assertEqual(call["token"], "token-dsh")
-        self.assertEqual(call["context_id"], "feishu/oc_x/omt_y")
         self.assertEqual(call["message"], "hi")
-        # 路由从 context_id(origin) 派生：platform/chat_id/thread_id 逐段还原。
+        self.assertEqual(call["context_id"], "feishu/oc_x/omt_y")
         self.assertEqual(call["platform"], "feishu")
         self.assertEqual(call["chat_id"], "oc_x")
         self.assertEqual(call["thread_id"], "omt_y")
-        # 直播发送：真 sender（make_sender 被调用一次，consume_stream 收到的是该真 sender）。
+        # 消息面（platform/chat_id 非空）→ 真 sender。
         self.assertEqual(len(consumer.make_sender_calls), 1)
         self.assertIs(call["sender"], consumer.last_sender)
-
-    # 3. dsh 目标 + consume_stream 抛异常 → 回退调用原 handler。
-    def test_dsh_streaming_failure_falls_back(self):
-        _install_fake_hermes_cli(_CONFIG)
-        _install_fake_gateway(
-            True,
-            {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"},
-        )
-        _MODULE._COLLECTOR_ENABLED = True
-        consumer = _FakeConsumer()
-        consumer.consume_stream_error = RuntimeError("boom")
-        _MODULE._CONSUMER_MODULE = consumer
-        calls = []
-
-        def original(args, **kw):
-            calls.append(args)
-            return "FALLBACK"
-
-        _MODULE._ORIGINAL_A2A_CALL = original
-        result = _MODULE._override_a2a_call({"agent": "dsh", "message": "hi"})
-        self.assertEqual(result, "FALLBACK")
-        self.assertEqual(len(calls), 1)
-
-    # 4. dsh 目标 + collector 关 → sender 为 noop（不调 make_sender），仍返回最终文本。
-    def test_dsh_collector_off_uses_noop_sender(self):
-        _install_fake_hermes_cli(_CONFIG)
-        _MODULE._COLLECTOR_ENABLED = False
-        consumer = _FakeConsumer()
-        _MODULE._CONSUMER_MODULE = consumer
-        _MODULE._ORIGINAL_A2A_CALL = lambda args, **kw: "SHOULD_NOT_CALL"
-
-        result = _MODULE._override_a2a_call(
-            {"agent": "dsh", "message": "hi", "context_id": "explicit"}
-        )
-        self.assertEqual(result, "[dsh · context explicit · completed]\n收到")
-        self.assertEqual(len(consumer.make_sender_calls), 0)
-        call = consumer.consume_stream_calls[0]
-        sender = call["sender"]
-        self.assertTrue(callable(sender))
-        # noop sender：不真实发送，直接返回 ok。
-        self.assertEqual(sender("p", "c", "t", "text"), {"ok": True})
-
-    # 5a. register 捕获到原 a2a_call 时以 override=True 调 register_tool（handler 为 override）。
-    def test_register_overrides_when_original_found(self):
-        _install_fake_hermes_cli(_CONFIG)
-        original_handler = lambda args, **kw: "ORIG"
-        entry = _FakeEntry(
-            handler=original_handler,
-            schema={"type": "object"},
-            description="call a remote agent",
-            emoji="📞",
-            toolset="a2a",
-        )
-        _install_fake_registry(entry)
-        ctx = _FakeCtx()
-
-        _MODULE.register(ctx)
-
-        self.assertEqual(len(ctx.register_tool_calls), 1)
-        call = ctx.register_tool_calls[0]
-        self.assertTrue(call["override"])
-        self.assertIs(call["handler"], _MODULE._override_a2a_call)
-        self.assertEqual(call["name"], "a2a_call")
-        self.assertEqual(call["toolset"], "a2a")
-        self.assertEqual(call["schema"], {"type": "object"})
-        self.assertEqual(call["description"], "call a remote agent")
-        self.assertEqual(call["emoji"], "📞")
-        self.assertIs(_MODULE._ORIGINAL_A2A_CALL, original_handler)
-        self.assertEqual(
-            [name for name, _ in ctx.hooks], ["pre_tool_call", "post_tool_call"]
-        )
-
-    # 5b. register 捕获不到原 handler 时跳过 override、不崩。
-    def test_register_skips_override_when_original_missing(self):
-        _install_fake_hermes_cli(_CONFIG)
-        _install_fake_registry(None)  # get_entry 返回 None
-        ctx = _FakeCtx()
-
-        _MODULE.register(ctx)
-
-        self.assertEqual(len(ctx.register_tool_calls), 0)
-        self.assertIsNone(_MODULE._ORIGINAL_A2A_CALL)
-        self.assertEqual(
-            [name for name, _ in ctx.hooks], ["pre_tool_call", "post_tool_call"]
-        )
-
-    # 6. 单次执行机理：模块内已无 _start_consumer / _spawn_consumer 调用点。
-    def test_no_spawn_consumer_functions(self):
-        self.assertFalse(hasattr(_MODULE, "_start_consumer"))
-        self.assertFalse(hasattr(_MODULE, "_spawn_consumer"))
-
-    # 7. 即使 collector 开 + dsh 目标，pre_tool_call 也只注入 origin，不再 spawn。
-    def test_pre_tool_call_only_injects_origin(self):
-        _install_fake_gateway(
-            True,
-            {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"},
-        )
-        _MODULE._COLLECTOR_ENABLED = True
-        result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
-        self.assertEqual(result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}})
-
-    # 8. dsh 目标 + collector 开 + context_id 为空且 _build_origin 返回空 → sender noop。
-    def test_dsh_empty_origin_uses_noop_sender(self):
-        _install_fake_hermes_cli(_CONFIG)
-        _install_fake_gateway(False, {})  # 非 messaging 面 → _build_origin 返回 ""
-        _MODULE._COLLECTOR_ENABLED = True
-        consumer = _FakeConsumer()
-        _MODULE._CONSUMER_MODULE = consumer
-        _MODULE._ORIGINAL_A2A_CALL = lambda args, **kw: "SHOULD_NOT_CALL"
-
-        result = _MODULE._override_a2a_call({"agent": "dsh", "message": "hi"})
-        self.assertEqual(result, "[dsh · context (auto) · completed]\n收到")
-        self.assertEqual(len(consumer.make_sender_calls), 0)
-        call = consumer.consume_stream_calls[0]
-        self.assertEqual(call["platform"], "")
-        self.assertEqual(call["chat_id"], "")
-        self.assertEqual(call["thread_id"], "")
-        sender = call["sender"]
-        self.assertTrue(callable(sender))
-        # noop sender：不真实发送，直接返回 ok。
-        self.assertEqual(sender("p", "c", "t", "text"), {"ok": True})
 
 
 if __name__ == "__main__":

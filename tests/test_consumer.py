@@ -488,13 +488,16 @@ class SenderTest(unittest.TestCase):
         self.assertEqual(res["error"], "send_failed")
         self.assertEqual(res["detail"], "rate limited")
 
-    def test_no_gateway_without_any_gateway_module(self):
-        _restore_modules()
+    def test_no_gateway_runner_none(self):
+        # gateway 可 import 但 runner 为 None → no_gateway。旧断言 send_failed 依赖
+        # 「gateway 模块不存在」的假设，真实 hermes 环境下 gateway 可 import、
+        # _gateway_runner_ref() 返回 None，故应断言 no_gateway。
+        _install_fake_gateway(lambda: None)
+        _install_fake_async_utils()
         send = consumer.make_sender(None)
         res = send("feishu", "oc_x", "", "hello")
         self.assertFalse(res["ok"])
-        # 无 gateway 模块 → import 失败被外层 except 捕获 → send_failed（仍结构化、不抛异常）。
-        self.assertEqual(res["error"], "send_failed")
+        self.assertEqual(res["error"], "no_gateway")
 
     def test_dispatch_tool_not_used(self):
         # ctx 存在时也不再走 dispatch_tool，发送始终经 adapter 通路。

@@ -34,23 +34,28 @@ Hermes 内置 A2A 插件（``~/.hermes/hermes-agent/plugins/platforms/a2a/``）�
 - 默认关：本插件不在 ``plugins.enabled`` 白名单时不会被加载，故「未启用即无副作用」。
   启用方式见 README.md。
 
-P2c-fix 单一流式（override a2a_call，消除双执行）
-------------------------------------------------
-早期 P2c 在同步 ``a2a_call``（``SendMessage``，执行 1）之外另起后台线程发
-``SendStreamingMessage``（执行 2），dsh 把任务跑两遍。本阶段改为 override
-``a2a_call`` 为单一流式 handler：
+单执行（pre_tool_call hook，替代已弃用的 override）
+--------------------------------------------------
+早期方案用 ``register_tool(override=True)`` 覆写 ``a2a_call`` handler 为单一流式，但
+实证发现 override 注册机制在真实 gateway 里不可靠（a2a 平台 deferred load 二次
+register_tools 会把 override 覆写回原 handler，或 replacement_coordinator 生命周期
+回滚），真实 dispatch 仍走原 a2a_call handler。故弃用 override，改在 ``pre_tool_call``
+hook 里对 dsh 目标做**单执行**：
 
-- 对 dsh 目标：只发一条 ``SendStreamingMessage``，边消费 SSE 事件边渲染推回消息面
-  （直播，``collector.enabled`` 门控、默认关），同时把流末尾的最终文本格式化为与原
-  ``a2a_call`` 同构的文本结果返回。
-- 非 dsh 目标 / 缺 url 或 message / 流式失败：委托回原 handler（完整
-  security.audit / persist_message / metrics / redact 行为），功能不丢。
-- 授权要求：override 需 ``plugins.entries.hermes-a2a-bridge.allow_tool_override: true``
-  （legacy 键，``plugin_capability_granted(plugin_id, "tools.override")`` 认可）或
-  ``granted_capabilities: [tools.override]``；未授权时 ``register_tool(override=True)``
-  抛 ``PluginToolOverrideError``，本插件捕获后日志警告、不 override，退化为「无直播但
-  无双执行」（原 a2a_call 原样保留）。
-- 授权需 gateway 重启生效（插件发现是一次性、进程内缓存）。
+- 触发条件：``a2a_call`` + ``_is_dsh_agent(agent)`` + ``collector.enabled`` 开 +
+  消息面 origin 非空 + message 非空。
+- 单执行：hook 内同步调用 ``_stream_dsh_call(message, origin)`` 发一条
+  ``SendStreamingMessage``，边消费 SSE 事件边渲染推回消息面（直播，``collector.enabled``
+  门控），返回格式化最终文本；随后以 ``{"action": "block", "message": 结果}`` 阻止
+  原 ``a2a_call`` 执行（消除双执行）。
+- block 语义（已知取舍）：hook 返回 ``{"action":"block","message":M}`` 后，框架把
+  ``M`` 变成工具结果 ``{"error": M}``——模型能读到 ``error`` 字段里的完整最终文本，
+  只是结果被包在 error 字段而非普通文本字段。本方案接受该取舍，README/docstring 均已
+  注明。
+- 回退：``_stream_dsh_call`` 抛异常（缺 dsh 配置 / 流式失败）时，退化为注入 origin
+  让原 ``a2a_call`` 走同步 ``SendMessage``（功能不丢、无直播）。
+- 其余（``a2a_orchestrate`` / 非 dsh 目标 / collector 关 / 非消息面 / message 空）：
+  仅注入 origin，不 block。
 """
 
 import logging
@@ -76,10 +81,6 @@ _COLLECTOR_ENABLED = False
 _CTX: Optional[Any] = None
 # consumer 模块缓存（惰性 import，见 _import_consumer）。
 _CONSUMER_MODULE: Optional[Any] = None
-# 原 a2a_call handler（discovery 阶段注册，早于 standalone 插件加载），捕获后用于
-# 非 dsh 目标 / 流式失败时委托回原逻辑（保留 security.audit/persist_message/metrics/
-# redact）。None 表示未捕获（此时不 override，原 a2a_call 原样保留）。
-_ORIGINAL_A2A_CALL: Optional[Any] = None
 
 
 def _to_bool(value: Any) -> bool:
@@ -183,129 +184,65 @@ def _import_consumer():
     return _consumer
 
 
-def _capture_original_a2a_call(ctx) -> Optional[Any]:
-    """从 ``tools.registry`` 捕获 discovery 阶段注册的原 a2a_call 条目（含 handler）。
+def _stream_dsh_call(message: str, context_id: str) -> str:
+    """对 dsh 发一条 ``SendStreamingMessage``，边消费 SSE 边直播，返回格式化最终文本。
 
-    a2a 工具在 discovery 阶段注册（早于 standalone 插件加载），故 ``register(ctx)``
-    可在此读取。优先用 ``ctx._manager.scope_key`` 精确取条目；无 scope 或取不到时回退
-    无 scope 的 ``registry.get_entry("a2a_call")``。任何 import / 取条目失败返回 None。
+    仅在 collector 门控 + dsh 目标 + 消息面 origin 非空 + message 非空时由
+    ``_on_pre_tool_call`` 调用。缺 url 或 message 空时抛 ``RuntimeError``（调用方回退
+    注入 origin 走同步 SendMessage）。返回 ``[dsh · context {context_id} · {state}]
+    \\n{final_text}``。
     """
-    try:
-        from tools.registry import registry
-    except Exception as exc:
-        logger.warning("hermes-a2a-bridge: tools.registry unavailable: %s", exc)
-        return None
-
-    scope = getattr(getattr(ctx, "_manager", None), "scope_key", None)
-    original: Optional[Any] = None
-    if scope is not None:
-        try:
-            original = registry.get_entry("a2a_call", scope=scope)
-        except Exception as exc:
-            logger.warning(
-                "hermes-a2a-bridge: get_entry(a2a_call, scope=%r) failed: %s",
-                scope,
-                exc,
-            )
-    if original is None:
-        try:
-            original = registry.get_entry("a2a_call")
-        except Exception as exc:
-            logger.warning("hermes-a2a-bridge: get_entry(a2a_call) failed: %s", exc)
-    return original
-
-
-def _override_a2a_call(args, **kw):
-    """override 后的 a2a_call：dsh 目标走单一流式；否则委托原 handler。
-
-    单一流式：对 dsh 只发一条 ``SendStreamingMessage``，边消费 SSE 事件边渲染推回
-    消息面（直播，``collector.enabled`` 门控），同时把流末尾最终文本格式化返回
-    （与原 a2a_call 同构的文本结果）。非 dsh 目标、缺 url 或 message、或流式失败时
-    委托回原 handler（完整逻辑），功能不丢。
-    """
-    args = args if isinstance(args, dict) else {}
-    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
-    message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
-    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
-
-    # 非 dsh 目标 → 委托原 handler（完整 security.audit/persist_message/metrics/redact）。
-    if not _is_dsh_agent(agent):
-        return _ORIGINAL_A2A_CALL(args, **kw)
-
     peer = _dsh_peer()
-    if not peer:
-        logger.warning(
-            "hermes-a2a-bridge: a2a_agents.dsh not configured; delegate to original a2a_call"
-        )
-        return _ORIGINAL_A2A_CALL(args, **kw)
-    url = str(peer.get("url") or "").strip()
-    auth = peer.get("auth") or {}
-    token = str(auth.get("token") or "") if isinstance(auth, dict) else ""
+    if peer:
+        url = str(peer.get("url") or "").strip()
+        auth = peer.get("auth") or {}
+        token = str(auth.get("token") or "") if isinstance(auth, dict) else ""
+    else:
+        url = ""
+        token = ""
     if not url or not message:
-        return _ORIGINAL_A2A_CALL(args, **kw)
+        raise RuntimeError("a2a_agents.dsh not configured")
 
-    # messaging 面下 pre_tool_call 已注入 origin，通常非空；兜底再补一次。
-    if not context_id:
-        context_id = _build_origin()
-
-    # 路由信息从 context_id(origin) 派生，而不是在 handler 里再读 ContextVar。
-    # pre_tool_call 已在 messaging 面注入 context_id = {platform}/{chat_id}[/{thread_id}]；
-    # origin 各段已被 _clean_segment 清理过（无 "/"），直接 split("/") 还原。
-    _parts = context_id.split("/") if context_id else []
-    platform = _parts[0] if len(_parts) > 0 else ""
-    chat_id = _parts[1] if len(_parts) > 1 else ""
-    thread_id = _parts[2] if len(_parts) > 2 else ""
-    sender = None
-    sender_is_real = False
-    if _COLLECTOR_ENABLED and platform and chat_id:
-        try:
-            sender = _import_consumer().make_sender(_CTX)
-            sender_is_real = True
-        except Exception as exc:
-            logger.warning("hermes-a2a-bridge: make_sender failed: %s", exc)
-            sender = None
-    if sender is None:
-        sender = lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
-        sender_is_real = False
+    # 路由信息从 context_id(origin) 派生，而不是再读 ContextVar。origin 各段已被
+    # _clean_segment 清理过（无 "/"），直接 split("/") 还原。
+    parts = context_id.split("/") if context_id else []
+    platform = parts[0] if len(parts) > 0 else ""
+    chat_id = parts[1] if len(parts) > 1 else ""
+    thread_id = parts[2] if len(parts) > 2 else ""
 
     consumer = _import_consumer()
+    # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
+    sender = (
+        consumer.make_sender(_CTX)
+        if (platform and chat_id)
+        else lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
+    )
     logger.info(
-        "hermes-a2a-bridge: override a2a_call agent=%s msg_len=%d context_id=%r "
-        "platform=%s chat_id=%s thread_id=%s sender_real=%s collector_enabled=%s",
-        agent,
+        "hermes-a2a-bridge: hook stream dsh agent=dsh msg_len=%d context_id=%r "
+        "platform=%s chat_id=%s",
         len(message),
         context_id,
         platform,
         chat_id,
-        thread_id,
-        sender_is_real,
-        _COLLECTOR_ENABLED,
     )
-    try:
-        stats = consumer.consume_stream(
-            url=url,
-            token=token,
-            message=message,
-            context_id=context_id,
-            platform=platform,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            sender=sender,
-            min_interval=2.0,
-        )
-        logger.info(
-            "hermes-a2a-bridge: override a2a_call consumed events_seen=%s "
-            "messages_sent=%s final_text=%r",
-            stats.get("events_seen"),
-            stats.get("messages_sent"),
-            (stats.get("final_text") or "")[:80],
-        )
-    except Exception as exc:  # 网络 / 流式失败 → 回退同步原 handler，功能不丢
-        logger.warning(
-            "hermes-a2a-bridge: streaming a2a_call failed, fallback to original: %s",
-            exc,
-        )
-        return _ORIGINAL_A2A_CALL(args, **kw)
+    stats = consumer.consume_stream(
+        url=url,
+        token=token,
+        message=message,
+        context_id=context_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        sender=sender,
+        min_interval=2.0,
+    )
+    logger.info(
+        "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
+        "final_text=%.80r",
+        stats.get("events_seen"),
+        stats.get("messages_sent"),
+        stats.get("final_text") or "",
+    )
 
     states = stats.get("states") or []
     state = states[-1] if states else ""
@@ -322,26 +259,53 @@ def _on_pre_tool_call(
     args: Any = None,
     **_: Any,
 ) -> Optional[Dict[str, Any]]:
-    """pre_tool_call 钩子：仅对 a2a_call/a2a_orchestrate 注入 context_id。
+    """pre_tool_call 钩子：origin 注入 + dsh 单执行（block 原 a2a_call）。
 
-    直播 / 单一流式已改由 override 后的 ``a2a_call`` handler 承担（见
-    ``_override_a2a_call``）；此钩子不再启动任何后台线程，只做 origin 注入。
+    对 dsh 目标的 ``a2a_call``（collector 开 + 消息面 origin 非空 + message 非空）走
+    单执行：``_stream_dsh_call`` 发一条 SendStreamingMessage 收最终文本，随后
+    ``{"action": "block", "message": 结果}`` 阻止原 a2a_call 执行（消除双执行）。流式
+    失败时回退为仅注入 origin。其余情况（a2a_orchestrate / 非 dsh / collector 关 /
+    非消息面 / message 空）仅注入 origin 或放行。
     """
     if tool_name not in _TARGET_TOOLS:
         return None
 
     args = args if isinstance(args, dict) else {}
 
-    # 显式优先：调用方已给出 context_id（或 contextId 别名）时不覆盖。
-    # handler 同时接受两个键：args.get("context_id") or args.get("contextId")。
+    # 显式优先：调用方已给出 context_id（或 contextId 别名）时不拦截、不覆盖。
     if args.get("context_id") or args.get("contextId"):
         return None
 
     origin = _build_origin()
+
+    # 单执行：a2a_call 目标 dsh + collector 开 + messaging 面（origin 非空）。
+    if (
+        tool_name == "a2a_call"
+        and _COLLECTOR_ENABLED
+        and origin
+        and _is_dsh_agent(
+            str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+        )
+    ):
+        message = str(
+            args.get("message") or args.get("text") or args.get("task") or ""
+        ).strip()
+        if message:
+            try:
+                result = _stream_dsh_call(message, origin)
+                # block 阻止原 a2a_call 执行；block_message 即最终结果文本
+                # （模型经 {"error": ...} 拿到）。
+                return {"action": "block", "message": result}
+            except Exception as exc:
+                logger.warning(
+                    "hermes-a2a-bridge: hook stream failed, fallback sync: %s", exc
+                )
+                # 回退：注入 origin 让原 a2a_call 走同步 SendMessage（功能不丢）。
+                return {"action": "modify", "args": {"context_id": origin}}
+
+    # 其余（a2a_orchestrate / 非 dsh / collector 关 / 非 messaging）：仅 origin 注入。
     if not origin:
         return None
-
-    # 浅合并加 context_id 键；框架侧 dict(original_args).update(partial)，不会丢既有参数。
     return {"action": "modify", "args": {"context_id": origin}}
 
 
@@ -353,50 +317,21 @@ def _on_post_tool_call(
 ) -> None:
     """post_tool_call 钩子：占位放行（return None）。
 
-    直播 / 单一流式已改由 override 后的 ``a2a_call`` handler 承担，无需在 post 阶段
-    二次消费；本钩子保留占位以兼容 plugin.yaml 声明的 hook，无副作用。
+    单执行 / 直播已由 pre_tool_call hook 承担，无需在 post 阶段二次消费；本钩子保留
+    占位以兼容 plugin.yaml 声明的 hook，无副作用。
     """
     return None
 
 
 def register(ctx) -> None:
-    """插件入口：读 collector 门控、捕获并 override a2a_call、注册 pre/post 钩子。"""
-    global _COLLECTOR_ENABLED, _CTX, _ORIGINAL_A2A_CALL
+    """插件入口：读 collector 门控、注册 pre/post 钩子（单执行走 pre_tool_call hook）。"""
+    global _COLLECTOR_ENABLED, _CTX
     _CTX = ctx
     try:
         _COLLECTOR_ENABLED = _to_bool(ctx.get_config("collector.enabled", False))
     except Exception as exc:  # 读配置失败按默认关处理，绝不阻断插件加载
         logger.warning("hermes-a2a-bridge: read collector.enabled failed: %s", exc)
         _COLLECTOR_ENABLED = False
-
-    original = _capture_original_a2a_call(ctx)
-    if original is not None:
-        handler = getattr(original, "handler", None)
-        if handler is not None:
-            _ORIGINAL_A2A_CALL = handler
-            try:
-                ctx.register_tool(
-                    name="a2a_call",
-                    toolset=getattr(original, "toolset", "a2a"),
-                    schema=getattr(original, "schema", None),
-                    handler=_override_a2a_call,
-                    override=True,
-                    description=getattr(original, "description", None),
-                    emoji=getattr(original, "emoji", None),
-                )
-            except Exception as exc:  # 未授权 / 注册失败 → 不 override，退化为无双执行
-                logger.warning(
-                    "hermes-a2a-bridge: a2a_call override not authorized/failed: %s",
-                    exc,
-                )
-        else:
-            logger.warning(
-                "hermes-a2a-bridge: original a2a_call entry has no handler; skip override"
-            )
-    else:
-        logger.warning(
-            "hermes-a2a-bridge: original a2a_call not found; skip override (no live-stream)"
-        )
 
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)

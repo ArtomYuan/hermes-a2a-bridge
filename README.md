@@ -2,10 +2,11 @@
 
 Hermes 侧接入 dsh A2A server 的桥插件。
 
-> 状态：**P2c-fix — override a2a_call 单一流式，双执行已消除**。P2b 的 origin→contextId
-> 注入保留；P2c 直播消费者改为 override 后的 `a2a_call` handler：对 dsh 只发**一条**
+> 状态：**P2c-fix — pre_tool_call hook 单执行，双执行已消除**。P2b 的 origin→contextId
+> 注入保留；P2c 直播消费者改在 `pre_tool_call` hook 内对 dsh 目标只发**一条**
 > `SendStreamingMessage`，边消费 SSE 流边把中间进度推回飞书 / QQ（`collector.enabled`
-> 门控，默认关），同时把流末尾最终文本返回给 agent——任务只跑一遍。
+> 门控，默认关），随后以 block 语义把流末尾最终文本回传 agent——任务只跑一遍。
+> override 方案（`register_tool(override=True)`）因注册机制在真实 gateway 不可靠已弃用。
 
 仓库地址：<https://github.com/ArtomYuan/hermes-a2a-bridge>
 
@@ -73,9 +74,9 @@ TODO(P2c)：如改为 pip 包，补充 `pyproject.toml` + entry point 安装说�
 
 ## 与 dsh-a2a-server 配合
 
-本插件只负责在 Hermes 侧注入 `context_id`。要让会话令牌真正产生「一个 Hermes 对话
-session ↔ 一个 dsh 会话」的连续性，还需 dsh 侧部署 A2A server，并把 Hermes 的 A2A
-client 指向它。
+本插件负责在 Hermes 侧注入 `context_id`（并可选地对 dsh 目标做流式单执行，见下）。
+要让会话令牌真正产生「一个 Hermes 对话 session ↔ 一个 dsh 会话」的连续性，还需 dsh
+侧部署 A2A server，并把 Hermes 的 A2A client 指向它。
 
 ### Hermes 侧 a2a_agents 配置
 
@@ -109,53 +110,40 @@ dsh 侧由 `dsh-a2a-server` 库（`ArtomYuan/dsh-a2a-server`）暴露 A2A server
    重复投递 → 复用同一 dsh 会话（上下文连续）；不同对话 → 不同 contextId → 隔离。
 4. 显式传入 `context_id` / `contextId` 时保留调用方语义（可主动续接既有会话或指定键）。
 
-## 直播消费者（P2c-fix：override a2a_call 单一流式）
+## 直播消费者（P2c-fix：pre_tool_call hook 单执行）
 
 早期 P2c 在同步 `a2a_call`（`SendMessage`，执行 1）之外另起后台线程再发一条
-`SendStreamingMessage`（执行 2），导致 dsh 把任务**跑两遍**。本阶段改为 override
-`a2a_call` 为单一流式 handler，双执行已消除：
+`SendStreamingMessage`（执行 2），导致 dsh 把任务**跑两遍**。本阶段先尝试
+`register_tool(override=True)` 覆写 `a2a_call`，但实证发现 override 注册机制在真实
+gateway 里不可靠（a2a 平台 deferred load 二次 register_tools 会把 override 覆写回原
+handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行**：
 
-- **dsh 目标**：override handler 只发**一条** `SendStreamingMessage`，边消费 SSE
-  事件边把中间进度渲染推回飞书 / QQ（直播，`collector.enabled` 门控、默认关），同时
-  把流末尾的最终文本格式化为与原 `a2a_call` 同构的文本结果返回给 agent。
-- **非 dsh 目标**（如 `agent="ivan"`）：委托回原 handler，走原 `SendMessage` 完整
-  逻辑（security.audit / persist_message / metrics / redact）。
+- **dsh 目标单执行**：`pre_tool_call` hook 内同步调 `_stream_dsh_call`，只发**一条**
+  `SendStreamingMessage`，边消费 SSE 事件边把中间进度渲染推回飞书 / QQ（直播，
+  `collector.enabled` 门控、默认关），随后以 `{"action": "block", "message": 结果}`
+  阻止原 `a2a_call` 执行，结果文本经 block 语义回传（见下）。
+- **非 dsh 目标**（如 `agent="ivan"`）：不 block，仅注入 origin，走原 `SendMessage`
+  完整逻辑（security.audit / persist_message / metrics / redact）。
 - **降级回退**：dsh 目标但缺 url / message、或流式失败（网络 / SSE 解析异常）时，
-  同样委托回原 handler，功能不丢（退化为无直播但**无双执行**）。
+  退化为仅注入 origin，原 `a2a_call` 走同步 `SendMessage`，功能不丢（无直播但
+  **无双执行**）。
 
-### 授权（override 生效前提）
+### block 语义（已知取舍）
 
-`register_tool(override=True)` 会先查 `plugin_capability_granted(plugin_id,
-"tools.override")`，未授权则抛 `PluginToolOverrideError`。二选一授权（**需重启
-gateway 生效**）：
-
-```yaml
-# ~/.hermes/config.yaml —— 方式 A：legacy 键
-plugins:
-  entries:
-    hermes-a2a-bridge:
-      allow_tool_override: true
-
-# 方式 B：granted_capabilities 列表
-plugins:
-  entries:
-    hermes-a2a-bridge:
-      granted_capabilities: [tools.override]
-```
-
-未授权时本插件捕获异常、日志警告、**不 override**，退化为「无直播但无双执行」（原
-`a2a_call` 原样保留）。
+`pre_tool_call` hook 返回 `{"action": "block", "message": M}` 后，框架把 `M` 变成工具
+结果 `{"error": M}`（`agent/tool_executor.py` `json.dumps({"error": block_message})`）。
+模型能读到 `error` 字段里的完整最终文本，只是结果被包在 error 字段而非普通文本字段。
+这是本方案的已知取舍，已接受并在此注明。
 
 ### 启用方式（collector 直播门控）
 
-直播发送默认**关**，开启需两步（重启 gateway 生效）：
+直播发送默认**关**，开启（重启 gateway 生效）：
 
 ```yaml
 # ~/.hermes/config.yaml
 plugins:
   entries:
     hermes-a2a-bridge:
-      allow_tool_override: true   # override 生效前提（见上）
       settings:
         collector:
           enabled: true           # 直播发送门控
@@ -165,17 +153,19 @@ plugins:
 systemctl --user restart hermes-gateway
 ```
 
-`collector.enabled` 缺省 / 显式 `false` 时，override handler 仍走单一流式收取最终
-结果，但**不发直播**（sender 为 noop）；非 dsh 目标不受影响。
+`collector.enabled` 缺省 / 显式 `false` 时，dsh 目标**不走单执行分支**，`pre_tool_call`
+仅注入 origin，原 `a2a_call` 走同步 `SendMessage`（无直播、无双执行）；非 dsh 目标不受
+影响。
 
 ### 数据流链路
 
 ```
-a2a_call (override handler)
+a2a_call（pre_tool_call hook）
    │
-   ├─ 非 dsh 目标 ──────────────► 委托原 handler（SendMessage，原完整逻辑）
+   ├─ 非 dsh / collector 关 / 非消息面 ─► 仅注入 origin ─► 原 handler（SendMessage）
    │
-   └─ dsh 目标 ─► SendStreamingMessage（仅一条）─► dsh SSE 事件流
+   └─ dsh 目标 + collector 开 ─► _stream_dsh_call ─► SendStreamingMessage（仅一条）
+                        │                        └─► dsh SSE 事件流
                         │
               parse_sse_lines（data: JSON 逐行）
                         │
@@ -189,7 +179,8 @@ a2a_call (override handler)
                         │
               ┌─ sender（collector.enabled 时真发送飞书/QQ；否则 noop）
               │
-              └─ stats.final_text → 格式化返回 agent（[dsh · context … · state]）
+              └─ stats.final_text → 格式化结果 ─► block 语义回传 agent
+                        （[dsh · context … · state]，经 {"error": ...}）
 ```
 
 ### T0 行语言映射
@@ -211,16 +202,16 @@ a2a_call (override handler)
 ### 窗口期验证步骤清单
 
 1. 加载确认：`~/.hermes/logs/agent.log` 出现 plugin discovery 汇总，且无
-   `collector.enabled` 读取报错、无 `a2a_call override not authorized` 警告。
-2. 授权确认：`allow_tool_override: true`（或 `granted_capabilities: [tools.override]`）
-   已写入 `plugins.entries.hermes-a2a-bridge`；`collector.enabled: true` 已写入
+   `collector.enabled` 读取报错。
+2. 配置确认：`collector.enabled: true` 已写入
    `plugins.entries.hermes-a2a-bridge.settings`。
 3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察对话是否
    收到 `🚀 开始执行` → `🧠 思考中…` → `🔧 调用工具 …` → `📋 … 完成` → `📖 输出完成`
-   → `✅ 完成`，且 **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）。
+   → `✅ 完成`，且 **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
+   同时确认 agent 收到 `{"error": "[dsh · context …]\\n…"}` 形式的最终结果（block 语义）。
 4. redact 确认：进度文本中的 token 不落明文。
-5. 降级确认：临时把 `collector.enabled` 关掉，确认 dsh 目标仍只执行一次、无直播推送；
-   临时把 `allow_tool_override` 去掉，确认退化为原同步 `a2a_call`（无直播、无双执行）。
+5. 降级确认：临时把 `collector.enabled` 关掉，确认 dsh 目标仅注入 origin、走原同步
+   `a2a_call`（无直播、无双执行）。
 
 ## 单元测试
 
@@ -237,10 +228,10 @@ python3 tests/test_override.py
 渲染行 emoji 前缀、text 聚合只在终态 flush、高信号逐条、redact 调用、sender 两级
 回退（无 gateway → `no_gateway`）、异常事件不崩，并输出「事件序列 → 渲染消息样例」对照表。
 
-`test_override.py` 覆盖 override 后的 `_override_a2a_call` 与 `register`：非 dsh 目标
-委托原 handler、dsh 目标单一流式返回格式化结果、流式失败回退、collector 关时 noop
-sender、register 捕获原 a2a_call 以 `override=True` 注册、捕获不到时跳过不崩，并断言
-模块内已无 `_start_consumer` / `_spawn_consumer`（pre_tool_call 不再另起流式线程）。
+`test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
+dsh 目标（collector 开 + origin 非空 + message 非空）block 最终文本、流式失败回退注入
+origin、显式 context_id 放行、非 dsh / collector 关 / a2a_orchestrate / 非消息面仅注入
+origin，以及 `_stream_dsh_call` 格式化结果与缺 dsh 配置抛错。
 
 ## 验证（CLI 集成，留窗口期）
 
@@ -257,15 +248,18 @@ gateway 生效需重启（见「启用」）。本阶段不重启；真实 gatew
 - `_TARGET_TOOLS` 为裸名（`a2a_call` / `a2a_orchestrate`，无命名空间前缀），与 MCP
   的 `mcp__harness_plugin__agent_run` 风格不同；若 Hermes 内置 A2A 插件改了工具名，
   需同步修改 `__init__.py` 的 `_TARGET_TOOLS`。
-- override 只作用于 `a2a_call`；`a2a_orchestrate` 仍走原 handler（无直播），但
-  pre_tool_call 的 origin 注入同样适用于它。
-- `a2a_call` 工具 handler 运行于 worker 线程（原就是阻塞 urllib，不冻结 gateway），
-  ContextVar（session env）经 `propagate_context_to_thread` 传入，故 handler 内可读
-  `get_session_env`；直播发送走 `consumer.make_sender`，用 `safe_schedule_threadsafe`
-  跨线程调度到 gateway 主 loop，不会起新 loop 导致跨线程失败。
-- 触发条件：dsh 目标判定为 `a2a_call` 的 `agent=="dsh"` 或其 URL；非 dsh 目标委托
-  原 handler，不触发流式。
-- 流式失败 / 未授权时均回退原 handler，任务仍会执行一次（功能不丢），只是无直播。
+- 单执行只作用于 `a2a_call` 的 dsh 目标；`a2a_orchestrate` 仍走原 handler（无直播），
+  但 pre_tool_call 的 origin 注入同样适用于它。
+- 单执行在 `pre_tool_call` hook 内同步发流式请求（阻塞该工具调用路径，不冻结 gateway
+  主 loop）；路由信息从 origin 派生（不重读 ContextVar）。直播发送走
+  `consumer.make_sender`，用 `safe_schedule_threadsafe` 跨线程调度到 gateway 主 loop，
+  不会起新 loop 导致跨线程失败。
+- 触发条件：dsh 目标判定为 `a2a_call` 的 `agent=="dsh"` 或其 URL；非 dsh 目标不
+  block，仅注入 origin，不触发流式。
+- 流式失败 / 缺 dsh 配置时回退为仅注入 origin，任务仍会经原同步 `a2a_call` 执行一次
+  （功能不丢），只是无直播。
+- block 语义：单执行的结果经 `{"error": ...}` 回传（模型可读到完整文本），这是已知
+  取舍（见「block 语义」章节）。
 
 ## License
 

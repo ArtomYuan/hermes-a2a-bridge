@@ -184,6 +184,19 @@ def _import_consumer():
     return _consumer
 
 
+def _coerce_timeout(value: Any, default: float) -> float:
+    """把 peer 配置的 ``timeout`` 转为正数（int/float）；非法 / 缺失 / <=0 回退 ``default``。"""
+    if value is None:
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v <= 0:
+        return default
+    return int(v) if v.is_integer() else v
+
+
 def _stream_dsh_call(message: str, context_id: str) -> str:
     """对 dsh 发一条 ``SendStreamingMessage``，边消费 SSE 边直播，返回格式化最终文本。
 
@@ -197,9 +210,11 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         url = str(peer.get("url") or "").strip()
         auth = peer.get("auth") or {}
         token = str(auth.get("token") or "") if isinstance(auth, dict) else ""
+        timeout_raw = peer.get("timeout")
     else:
         url = ""
         token = ""
+        timeout_raw = None
     if not url or not message:
         raise RuntimeError("a2a_agents.dsh not configured")
 
@@ -225,6 +240,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         platform,
         chat_id,
     )
+    timeout = _coerce_timeout(timeout_raw, consumer._DEFAULT_TIMEOUT)
     stats = consumer.consume_stream(
         url=url,
         token=token,
@@ -235,6 +251,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         thread_id=thread_id,
         sender=sender,
         min_interval=2.0,
+        timeout=timeout,
     )
     logger.info(
         "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "

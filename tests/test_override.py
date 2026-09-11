@@ -88,6 +88,8 @@ def _install_fake_hermes_cli(config_dict):
 class _FakeConsumer:
     """假 consumer 模块：记录 make_sender / consume_stream 调用。"""
 
+    _DEFAULT_TIMEOUT = 300  # 与真实 consumer 一致，供 _coerce_timeout 的 default 兜底
+
     def __init__(self):
         self.consume_stream_calls = []
         self.make_sender_calls = []
@@ -260,9 +262,28 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["platform"], "feishu")
         self.assertEqual(call["chat_id"], "oc_x")
         self.assertEqual(call["thread_id"], "omt_y")
+        # 缺 timeout 配置 → 回退默认 300。
+        self.assertEqual(call["timeout"], 300)
         # 消息面（platform/chat_id 非空）→ 真 sender。
         self.assertEqual(len(consumer.make_sender_calls), 1)
         self.assertIs(call["sender"], consumer.last_sender)
+
+    # 12. peer 配置的 timeout 传给 consume_stream（缺省回退 300）。
+    def test_stream_dsh_call_passes_peer_timeout(self):
+        config = {
+            "a2a_agents": {
+                "dsh": {
+                    "url": "http://127.0.0.1:8092",
+                    "auth": {"type": "bearer", "token": "token-dsh"},
+                    "timeout": 3600,
+                }
+            }
+        }
+        _install_fake_hermes_cli(config)
+        consumer = _FakeConsumer()
+        _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._stream_dsh_call("hi", "feishu/oc_x")
+        self.assertEqual(consumer.consume_stream_calls[0]["timeout"], 3600)
 
 
 if __name__ == "__main__":

@@ -191,6 +191,30 @@ When `collector.enabled` is absent / explicitly `false`, the dsh target does
 the original `a2a_call` runs the synchronous `SendMessage` (no live output, no
 double execution); non-dsh targets are unaffected.
 
+### Code-block rendering toggle (collector.code_blocks)
+
+Whether live content is rendered as code blocks is controlled separately by
+`collector.code_blocks` (default `true`):
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    hermes-a2a-bridge:
+      settings:
+        collector:
+          enabled: true
+          code_blocks: true       # default true: render commands/results/long text as code blocks
+```
+
+- `true` (default): tool commands / execution results / long final text are
+  rendered as ``` code blocks (fence-aware chunking).
+- `false`: the above content falls back to plain-text lines (no fences, no fence
+  escaping, content preserved); long text is chunked at plain newline boundaries
+  (the `⏩ 续` marker is still kept).
+
+When unset it stays `true`, keeping existing deployments' behavior unchanged.
+
 ### Data-flow chain
 
 ```

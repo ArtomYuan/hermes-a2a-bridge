@@ -22,6 +22,9 @@
 - 长文本按代码块边界分块：超过网关单条上限时按代码围栏边界切分，块间以
   `⏩ 续` 提示衔接，避免代码框跨块断裂。
 - 直播发送门控 `collector.enabled`（默认关）。
+- 代码框渲染可配置：`collector.code_blocks`（默认 true）——false 时直播内容回退
+  纯文本行（不包围栏、不做围栏转义），长文本走普通换行边界分块（仍保留 `⏩ 续`
+  提示）。
 - 双语 README（README.md + README.en.md），含效果展示章节。
 
 ### Changed
@@ -38,5 +41,5 @@
 
 ### Tested
 
-- 单元测试 71 项：`test_consumer` 47、`test_origin_injection` 12、
+- 单元测试 80 项：`test_consumer` 56、`test_origin_injection` 12、
   `test_override` 12。

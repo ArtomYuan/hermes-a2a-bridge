@@ -153,6 +153,27 @@ systemctl --user restart hermes-gateway
 仅注入 origin，原 `a2a_call` 走同步 `SendMessage`（无直播、无双执行）；非 dsh 目标不受
 影响。
 
+### 代码框渲染开关（collector.code_blocks）
+
+直播内容是否以代码框渲染，可用 `collector.code_blocks` 单独开关（默认 `true`）：
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    hermes-a2a-bridge:
+      settings:
+        collector:
+          enabled: true
+          code_blocks: true       # 默认 true：工具命令/结果/长文本以代码框渲染
+```
+
+- `true`（默认）：工具命令 / 执行结果 / 长最终文本以 ``` 代码框输出（围栏感知分块）。
+- `false`：上述内容回退纯文本行（不包围栏、不做围栏转义，内容完整），长文本分块
+  走普通换行边界分块（仍保留 `⏩ 续` 提示）。
+
+未配置时保持 `true`，向后兼容已部署副本的现有行为。
+
 ### 数据流链路
 
 ```

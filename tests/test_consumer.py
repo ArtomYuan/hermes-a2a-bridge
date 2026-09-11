@@ -401,6 +401,71 @@ class RenderLineTest(unittest.TestCase):
         self.assertIsNone(consumer.render_line({"type": "nonsense"}))
 
 
+class RenderLineCodeBlocksTest(unittest.TestCase):
+    """code_blocks 开关：true 时框化，false 时纯文本（无围栏、内容完整）。"""
+
+    def test_tool_call_code_blocks_false_plain(self):
+        line = consumer.render_line(
+            {"type": "tool_call", "name": "shell_exec", "arguments": "ls -la"},
+            code_blocks=False,
+        )
+        self.assertNotIn("```", line)
+        self.assertEqual(line, "🔧 调用工具 `shell_exec`：ls -la")
+
+    def test_tool_call_code_blocks_true_fenced(self):
+        line = consumer.render_line(
+            {"type": "tool_call", "name": "shell_exec", "arguments": "ls"},
+            code_blocks=True,
+        )
+        self.assertIn("```bash", line)
+        self.assertEqual(line.count("```"), 2)
+
+    def test_tool_result_code_blocks_false_plain(self):
+        line = consumer.render_line(
+            {"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt"},
+            code_blocks=False,
+        )
+        self.assertNotIn("```", line)
+        # 纯文本下内容完整（不截断）。
+        self.assertIn("total 4", line)
+        self.assertIn("file1.txt", line)
+
+    def test_tool_result_code_blocks_true_fenced(self):
+        line = consumer.render_line(
+            {"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt"},
+            code_blocks=True,
+        )
+        self.assertEqual(line.count("```"), 2)
+
+    def test_final_text_code_blocks_false_plain_complete(self):
+        final_text = "line\n" * 10
+        line = consumer.render_line({"type": "text", "text": final_text, "final": True}, code_blocks=False)
+        self.assertNotIn("```", line)
+        # 内容完整保留（不包围栏、不截断）。
+        self.assertIn(final_text.strip(), line)
+
+    def test_final_text_code_blocks_true_fenced(self):
+        final_text = "line\n" * 10
+        line = consumer.render_line({"type": "text", "text": final_text, "final": True}, code_blocks=True)
+        self.assertEqual(line.count("```"), 2)
+
+    def test_non_final_text_code_blocks_false_plain(self):
+        # 非 final text：code_blocks=false 时即便含代码特征也不框化。
+        line = consumer.render_line({"type": "text", "text": "cmd\necho hi", "final": False}, code_blocks=False)
+        self.assertNotIn("```", line)
+
+    def test_split_plain_chunks_keeps_marker(self):
+        content = "x\n" * 200  # 400 chars
+        chunks = consumer._split_plain_chunks(content, limit=100)
+        self.assertGreater(len(chunks), 1)
+        # 分块间有「⏩ 续」提示。
+        self.assertIn("⏩ 续", chunks[0])
+
+    def test_split_plain_chunks_no_fence(self):
+        chunks = consumer._split_plain_chunks("a\nb\nc", limit=10)
+        self.assertEqual(chunks, ["a\nb\nc"])
+
+
 class ThrottlerTest(unittest.TestCase):
     def _run(self, events, min_interval=0.0):
         throttler = consumer.Throttler(min_interval=min_interval)

@@ -100,8 +100,8 @@ class _FakeConsumer:
             "states": ["working", "completed"],
         }
 
-    def make_sender(self, ctx):
-        self.make_sender_calls.append(ctx)
+    def make_sender(self, ctx, code_blocks=True):
+        self.make_sender_calls.append((ctx, code_blocks))
         # 返回可识别的真 sender，供用例断言 consume_stream 收到的 sender 是真实 sender。
         sender = lambda p, c, t, text: {"ok": True, "via": "make_sender"}
         self.last_sender = sender

@@ -78,6 +78,9 @@ _TARGET_TOOLS = frozenset(
 # ``_CTX`` 保存插件 ctx 引用传给 ``make_sender(_CTX)``（仅为签名兼容，实际发送不再走
 # dispatch_tool，而经 gateway 主 loop 调度 adapter）。
 _COLLECTOR_ENABLED = False
+# 代码框渲染开关：register() 读 ``collector.code_blocks``（默认 true）后写入；
+# false 时直播内容回退纯文本行（不包围栏）。
+_CODE_BLOCKS = True
 _CTX: Optional[Any] = None
 # consumer 模块缓存（惰性 import，见 _import_consumer）。
 _CONSUMER_MODULE: Optional[Any] = None
@@ -228,7 +231,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     consumer = _import_consumer()
     # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
     sender = (
-        consumer.make_sender(_CTX)
+        consumer.make_sender(_CTX, code_blocks=_CODE_BLOCKS)
         if (platform and chat_id)
         else lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
     )
@@ -252,6 +255,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         sender=sender,
         min_interval=2.0,
         timeout=timeout,
+        code_blocks=_CODE_BLOCKS,
     )
     logger.info(
         "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
@@ -342,13 +346,16 @@ def _on_post_tool_call(
 
 def register(ctx) -> None:
     """插件入口：读 collector 门控、注册 pre/post 钩子（单执行走 pre_tool_call hook）。"""
-    global _COLLECTOR_ENABLED, _CTX
+    global _COLLECTOR_ENABLED, _CODE_BLOCKS, _CTX
     _CTX = ctx
     try:
         _COLLECTOR_ENABLED = _to_bool(ctx.get_config("collector.enabled", False))
-    except Exception as exc:  # 读配置失败按默认关处理，绝不阻断插件加载
-        logger.warning("hermes-a2a-bridge: read collector.enabled failed: %s", exc)
+        # 代码框渲染开关默认 true（向后兼容）；显式 false 才回退纯文本。
+        _CODE_BLOCKS = _to_bool(ctx.get_config("collector.code_blocks", True))
+    except Exception as exc:  # 读配置失败按默认处理，绝不阻断插件加载
+        logger.warning("hermes-a2a-bridge: read collector settings failed: %s", exc)
         _COLLECTOR_ENABLED = False
+        _CODE_BLOCKS = True
 
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)

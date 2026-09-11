@@ -232,6 +232,9 @@ def _truncate(text: Any, limit: int) -> str:
 # 结果正文超过此长度（或含换行）时，final 文本以代码框输出（短结果保持普通行）。
 _FINAL_CODE_BLOCK_MIN_LEN = 120
 
+# 代码框渲染默认开（向后兼容：已部署副本不配置即保持代码框行为）。
+DEFAULT_CODE_BLOCKS = True
+
 
 def _escape_inner_fences(text: str) -> str:
     """把正文内的三层反引号围栏转义为不闭合外层代码框的形式。
@@ -330,11 +333,38 @@ def _split_fenced_chunks(
     return [c for c in chunks if c.strip()] or [content]
 
 
-def render_line(event: Dict[str, Any]) -> Optional[str]:
+def _split_plain_chunks(
+    content: str, limit: int = 8000, marker: str = "⏩ 续"
+) -> list:
+    """把长纯文本按换行边界分块（无围栏边界感知），块间追加 ``marker`` 提示。
+
+    供 ``code_blocks=False`` 时使用：内容不含代码围栏，只需保证每块 ≤ ``limit``
+    且块间有分隔提示。
+    """
+    if len(content) <= limit:
+        return [content]
+
+    chunks: list = []
+    cur: list = []
+    for line in content.split("\n"):
+        cur.append(line)
+        if sum(len(l) + 1 for l in cur) >= limit:
+            chunks.append("\n".join(cur) + f"\n{marker}")
+            cur = []
+    if cur:
+        chunks.append("\n".join(cur))
+    return [c for c in chunks if c.strip()] or [content]
+
+
+def render_line(event: Dict[str, Any], code_blocks: bool = True) -> Optional[str]:
     """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
 
-    操作内容（tool_call 命令 / tool_result 结果 / 长 final 文本）以 ``` 代码框
-    输出，让飞书渲染为可滚动代码框；短文本（thinking / 普通 text）保持普通行。
+    ``code_blocks=True``（默认）：操作内容（tool_call 命令 / tool_result 结果 /
+    长 final 文本）以 ``` 代码框输出，让飞书渲染为可滚动代码框；短文本
+    （thinking / 普通 text）保持普通行。
+
+    ``code_blocks=False``：所有内容回退纯文本行（不包围栏、不做围栏转义），内容
+    完整，飞书 / QQ 按普通文本渲染。
     """
     etype = event.get("type")
     if etype == "turn_start":
@@ -348,27 +378,36 @@ def render_line(event: Dict[str, Any]) -> Optional[str]:
         name = event.get("name") or ""
         arguments = str(event.get("arguments") or "").strip()
         if arguments:
-            # 命令正文进代码框，emoji 前缀 + 工具名留在框外。
-            return f"🔧 `{name}`\n{_fence(arguments, 'bash')}"
+            if code_blocks:
+                # 命令正文进代码框，emoji 前缀 + 工具名留在框外。
+                return f"🔧 `{name}`\n{_fence(arguments, 'bash')}"
+            return f"🔧 调用工具 `{name}`：{arguments}"
         return f"🔧 调用工具 `{name}`"
     if etype == "tool_result":
         name = event.get("name") or ""
         text = str(event.get("text") or "").strip()
         if text:
-            # 结果正文进代码框（无语言标签），emoji 前缀 + 工具名留在框外。
-            return f"📋 `{name}` 完成\n{_fence(text)}"
+            if code_blocks:
+                # 结果正文进代码框（无语言标签），emoji 前缀 + 工具名留在框外。
+                return f"📋 `{name}` 完成\n{_fence(text)}"
+            return f"📋 `{name}` 完成：{text}"
         return f"📋 `{name}` 完成" if name else "📋 工具完成"
     if etype == "text":
         if event.get("final"):
             final_text = str(event.get("text") or "")
-            # 长最终结果以代码框输出；短结果保持普通行（不滥框）。
-            if len(final_text) >= _FINAL_CODE_BLOCK_MIN_LEN or "\n" in final_text:
-                return f"📖 输出完成\n{_fence(final_text)}"
-            return "📖 输出完成"
+            if code_blocks:
+                # 长最终结果以代码框输出；短结果保持普通行（不滥框）。
+                if len(final_text) >= _FINAL_CODE_BLOCK_MIN_LEN or "\n" in final_text:
+                    return f"📖 输出完成\n{_fence(final_text)}"
+                return "📖 输出完成"
+            # 纯文本：最终文本完整输出（不截断、不包围栏）。
+            return f"📖 输出完成\n{final_text}" if final_text else "📖 输出完成"
         raw = str(event.get("text") or "")
-        # 非 final text：短文本普通行；含命令 / 代码特征时框化。
-        if _looks_like_code(raw):
-            return "📖 " + _fence(raw)
+        if code_blocks:
+            # 非 final text：短文本普通行；含命令 / 代码特征时框化。
+            if _looks_like_code(raw):
+                return "📖 " + _fence(raw)
+            return "📖 " + _truncate(raw, 120)
         return "📖 " + _truncate(raw, 120)
     if etype == "status":
         state = event.get("state")
@@ -484,8 +523,13 @@ def _target(platform: str, chat_id: str, thread_id: str) -> str:
     return target
 
 
-def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any]]:
+def make_sender(
+    ctx: Any = None, code_blocks: bool = DEFAULT_CODE_BLOCKS
+) -> Callable[[str, str, str, str], Dict[str, Any]]:
     """返回 ``send(platform, chat_id, thread_id, text) -> dict``。
+
+    ``code_blocks`` 控制长文本分块方式：``True``（默认）按代码块边界分块（围栏
+    感知）；``False`` 按纯文本换行边界分块（无围栏感知）。
 
     发送前必做 redact。发送只走一条通路：从 gateway 主 loop 上的 adapter 发——用
     ``_gateway_runner_ref`` 弱引用拿到 runner，取 ``runner._gateway_loop``（gateway
@@ -503,9 +547,12 @@ def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any
     def send(platform: str, chat_id: str, thread_id: str, text: str) -> Dict[str, Any]:
         redacted = _redact(text)
         target = _target(platform, chat_id, thread_id)
-        # 长文本（>8000）按代码块边界分块发送，避免代码围栏跨块断裂；
-        # 分块间由 _split_fenced_chunks 追加「⏩ 续」分隔提示。
-        chunks = _split_fenced_chunks(redacted)
+        # 长文本（>8000）按边界分块发送；code_blocks 决定围栏感知与否。分块间由
+        # 分块函数追加「⏩ 续」分隔提示。
+        if code_blocks:
+            chunks = _split_fenced_chunks(redacted)
+        else:
+            chunks = _split_plain_chunks(redacted)
 
         try:
             from gateway.run import _gateway_runner_ref
@@ -587,8 +634,11 @@ def consume_stream(
     sender: Callable[..., Any],
     min_interval: float = 2.0,
     timeout: int = _DEFAULT_TIMEOUT,
+    code_blocks: bool = DEFAULT_CODE_BLOCKS,
 ) -> Dict[str, Any]:
     """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → 节流 → 发送，返回统计。
+
+    ``code_blocks`` 透传给 ``render_line``，控制操作内容是否以代码框渲染。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
@@ -616,7 +666,7 @@ def consume_stream(
                     stats["states"].append(event.get("state"))
                 if event.get("type") == "text" and event.get("final"):
                     stats["final_text"] = event.get("text") or ""
-                line = render_line(event)
+                line = render_line(event, code_blocks=code_blocks)
                 for text in throttler.feed(event, line):
                     res = sender(platform, chat_id, thread_id, text)
                     if isinstance(res, dict) and not res.get("ok"):

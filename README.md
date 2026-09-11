@@ -272,4 +272,4 @@ gateway 生效需重启（见「启用」）。本阶段不重启；真实 gatew
 
 ## License
 
-TODO(P2c)：与上游 Hermes 生态对齐后确定（暂未附 LICENSE，待管理员定）。
+GPL-3.0（见 `LICENSE`）——本项目为独立自研插件。

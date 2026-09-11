@@ -1,5 +1,7 @@
 # hermes-a2a-bridge
 
+[English](README.en.md) | **简体中文**
+
 Hermes 侧接入 dsh A2A server 的桥插件。
 
 > 状态：**P2c-fix — pre_tool_call hook 单执行，双执行已消除**。P2b 的 origin→contextId

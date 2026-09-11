@@ -236,9 +236,13 @@ class HookTest(unittest.TestCase):
 
     # 10. _stream_dsh_call 缺 dsh 配置 → RuntimeError。
     def test_stream_dsh_call_missing_config_raises(self):
-        _restore_modules()  # 无 hermes_cli → _dsh_peer 返回 None → 无 url
-        with self.assertRaises(RuntimeError):
-            _MODULE._stream_dsh_call("hi", "feishu/oc_x")
+        import unittest.mock as mock
+
+        # 直接 patch 模块级 _dsh_peer 返回 None，使「缺 dsh 配置」路径确定性可触发，
+        # 不依赖「真实 hermes_cli 不可导入/配置里无 a2a_agents.dsh」这类环境前提。
+        with mock.patch.object(_MODULE, "_dsh_peer", return_value=None):
+            with self.assertRaises(RuntimeError):
+                _MODULE._stream_dsh_call("hi", "feishu/oc_x")
 
     # 11. _stream_dsh_call 格式化结果 + 路由从 context_id 派生。
     def test_stream_dsh_call_formats_result(self):

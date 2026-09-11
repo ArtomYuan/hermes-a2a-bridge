@@ -261,6 +261,15 @@ gateway 生效需重启（见「启用」）。本阶段不重启；真实 gatew
 - block 语义：单执行的结果经 `{"error": ...}` 回传（模型可读到完整文本），这是已知
   取舍（见「block 语义」章节）。
 
+## Known Issues（观察项，待观察不修）
+
+- **沙盒时代 dsh 会话跨环境复用后子代理委派失败**：某飞书对话（origin
+  `feishu/oc_adb23012c64433f9c10d16ccbe61ee8a/omt_19f819351c4f5be8`）对应的 dsh 会话
+  （`sessionId=e4a076ce-5cdb-4e04-ae76-f0836e3bf33d`，沙盒时代创建、agent-team preset）
+  在切到生产环境后，该会话内子代理委派通道（subagent / workflow）对 bash/文件类任务
+  持续失败，需 Lead 直接执行兜底。**待观察：新对话创建的新会话是否受影响**（若新会话
+  正常则仅为该沙盒遗留会话的预设/环境不匹配，非桥接缺陷）。未修复。
+
 ## License
 
 TODO(P2c)：与上游 Hermes 生态对齐后确定（暂未附 LICENSE，待管理员定）。

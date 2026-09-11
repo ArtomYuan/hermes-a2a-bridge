@@ -55,6 +55,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > Actual rendering depends on each gateway's client.
 
+Code-block rendering can be turned off via config (`collector.code_blocks`, on by
+default) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
+
 ## Architecture
 
 ```

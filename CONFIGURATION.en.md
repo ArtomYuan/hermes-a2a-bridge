@@ -193,8 +193,14 @@ double execution); non-dsh targets are unaffected.
 
 ### Code-block rendering toggle (collector.code_blocks)
 
-Whether live content is rendered as code blocks is controlled separately by
-`collector.code_blocks` (default `true`):
+Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.code_blocks`.
+
+Whether live content is rendered as code blocks is controlled separately by this
+key (default `true`). Relationship to `collector.enabled`: `enabled` is the live
+**master switch** (off by default, controls whether the single-execution live
+branch runs); `code_blocks` is the **rendering sub-switch** (once live streaming is
+enabled, controls whether operation content is rendered as code blocks or plain
+text).
 
 ```yaml
 # ~/.hermes/config.yaml

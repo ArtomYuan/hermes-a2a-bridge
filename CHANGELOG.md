@@ -30,6 +30,8 @@
 ### Changed
 
 - 流式超时改读 peer 配置 `a2a_agents.dsh.timeout`（缺省回退 300 秒）。
+- README 精简重构：README 只保留简介 / 效果展示 / 流程图 / 安装说明 / 链接，
+  配置与机制细节移入独立的 CONFIGURATION.md（及 CONFIGURATION.en.md）。
 
 ### Fixed
 

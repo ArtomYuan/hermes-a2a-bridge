@@ -155,7 +155,12 @@ systemctl --user restart hermes-gateway
 
 ### 代码框渲染开关（collector.code_blocks）
 
-直播内容是否以代码框渲染，可用 `collector.code_blocks` 单独开关（默认 `true`）：
+完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.code_blocks`。
+
+直播内容是否以代码框渲染，可用该键单独开关（默认 `true`）。它与 `collector.enabled`
+的关系：`enabled` 是直播**总开关**（默认关，控制是否走单执行直播分支）；
+`code_blocks` 是**渲染子开关**（在直播已开启的前提下，控制操作内容以代码框还是
+纯文本渲染）。
 
 ```yaml
 # ~/.hermes/config.yaml

@@ -50,6 +50,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > 实际效果以各网关客户端渲染为准。
 
+代码框渲染可通过配置关闭（`collector.code_blocks`，默认开启）——详见
+[CONFIGURATION.md](CONFIGURATION.md)。
+
 ## 流程图
 
 ```

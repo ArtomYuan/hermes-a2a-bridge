@@ -246,10 +246,11 @@ _EXPECTED_KINDS = [
 ]
 
 # consume_stream / Throttler 期望的发送行序列（min_interval=0）。
+# tool_call / tool_result 的操作内容现以 ``` 代码框输出（emoji 前缀 + 工具名在框外）。
 _EXPECTED_SENT = [
     "🧠 思考中…",
-    "🔧 调用工具 `shell_exec`",
-    "📋 `shell_exec` 完成：total 4 file1.txt file2.txt file3.txt",
+    "🔧 `shell_exec`\n```bash\nls\n```",
+    "📋 `shell_exec` 完成\n```\ntotal 4\nfile1.txt\nfile2.txt\nfile3.txt\n```",
     "📖 正在查看当前目录…",
     "📖 输出完成",
     "✅ 完成",
@@ -322,18 +323,34 @@ class RenderLineTest(unittest.TestCase):
         self.assertEqual(consumer.render_line({"type": "thinking", "text": "x"}), "🧠 思考中…")
 
     def test_tool_call(self):
-        self.assertEqual(consumer.render_line({"type": "tool_call", "name": "shell_exec"}), "🔧 调用工具 `shell_exec`")
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "name": "shell_exec", "arguments": "ls"}),
+            "🔧 `shell_exec`\n```bash\nls\n```",
+        )
+
+    def test_tool_call_no_arguments(self):
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "name": "shell_exec"}),
+            "🔧 调用工具 `shell_exec`",
+        )
 
     def test_tool_result_with_summary(self):
         line = consumer.render_line({"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt\nfile2.txt\nfile3.txt"})
-        self.assertEqual(line, "📋 `shell_exec` 完成：total 4 file1.txt file2.txt file3.txt")
+        self.assertEqual(
+            line,
+            "📋 `shell_exec` 完成\n```\ntotal 4\nfile1.txt\nfile2.txt\nfile3.txt\n```",
+        )
 
-    def test_tool_result_summary_truncated(self):
-        long_text = "x" * 200
-        line = consumer.render_line({"type": "tool_result", "name": "t", "text": long_text})
-        self.assertTrue(line.startswith("📋 `t` 完成："))
-        # 摘要（"："之后）不超过 60 字符。
-        self.assertLessEqual(len(line.split("：", 1)[1]), 60)
+    def test_tool_result_empty_text(self):
+        self.assertEqual(
+            consumer.render_line({"type": "tool_result", "name": "t", "text": ""}),
+            "📋 `t` 完成",
+        )
+
+    def test_tool_result_fence_is_balanced(self):
+        line = consumer.render_line({"type": "tool_result", "name": "t", "text": "a\nb\nc"})
+        # 代码框只有一对围栏（开 + 闭），无未闭合围栏。
+        self.assertEqual(line.count("```"), 2)
 
     def test_text_non_final_truncated(self):
         line = consumer.render_line({"type": "text", "text": "y" * 300, "final": False})
@@ -341,8 +358,36 @@ class RenderLineTest(unittest.TestCase):
         body = line[len("📖 "):]
         self.assertLessEqual(len(body), 120)
 
+    def test_text_non_final_code_like_fenced(self):
+        # 含换行的非 final 文本具备代码特征 → 框化，且围栏平衡。
+        line = consumer.render_line({"type": "text", "text": "cmd\necho hi", "final": False})
+        self.assertTrue(line.startswith("📖 ```"))
+        self.assertEqual(line.count("```"), 2)
+
     def test_text_final(self):
         self.assertEqual(consumer.render_line({"type": "text", "text": "big result", "final": True}), "📖 输出完成")
+
+    def test_text_final_long_fenced(self):
+        # 长最终结果（≥120 字符）以代码框输出，围栏平衡。
+        long_text = "line " * 40  # > 120 chars
+        line = consumer.render_line({"type": "text", "text": long_text, "final": True})
+        self.assertTrue(line.startswith("📖 输出完成\n```"))
+        self.assertTrue(line.endswith("```"))
+        self.assertEqual(line.count("```"), 2)
+
+    def test_text_final_multiline_fenced(self):
+        # 含换行的最终结果同样框化。
+        line = consumer.render_line({"type": "text", "text": "a\nb\nc", "final": True})
+        self.assertTrue(line.startswith("📖 输出完成\n```"))
+        self.assertEqual(line.count("```"), 2)
+
+    def test_inner_fence_escaped(self):
+        # 结果正文含 ``` 时，内层围栏被转义，外层围栏仍闭合（恰 2 个围栏）。
+        text = "code:\n```\nprint(1)\n```\ndone"
+        line = consumer.render_line({"type": "tool_result", "name": "t", "text": text})
+        self.assertEqual(line.count("```"), 2)
+        # 内层 ``` 已转义为 零宽空格 形式，不再作为围栏。
+        self.assertIn("`\u200b``", line)
 
     def test_status(self):
         self.assertEqual(consumer.render_line({"type": "status", "state": "completed"}), "✅ 完成")
@@ -392,14 +437,19 @@ class ThrottlerTest(unittest.TestCase):
     def test_high_signal_each_passed(self):
         events = [
             {"type": "thinking", "text": "a"},
-            {"type": "tool_call", "name": "x"},
+            {"type": "tool_call", "name": "x", "arguments": "ls"},
             {"type": "tool_result", "name": "x", "text": "r"},
             {"type": "turn_start", "turn": 1},
         ]
         sent = self._run(events)
         self.assertEqual(
             sent,
-            ["🧠 思考中…", "🔧 调用工具 `x`", "📋 `x` 完成：r", "🚀 第 1 轮"],
+            [
+                "🧠 思考中…",
+                "🔧 `x`\n```bash\nls\n```",
+                "📋 `x` 完成\n```\nr\n```",
+                "🚀 第 1 轮",
+            ],
         )
 
     def test_rate_limit_drops_nothing_with_zero_interval(self):
@@ -615,6 +665,59 @@ class ConsumeStreamTest(unittest.TestCase):
         )
         self.assertEqual(sent, ["✅ 完成"])
         self.assertEqual(stats["messages_sent"], 0)
+
+
+class SplitFencedChunksTest(unittest.TestCase):
+    def test_short_content_single_chunk(self):
+        self.assertEqual(consumer._split_fenced_chunks("hello"), ["hello"])
+
+    def test_no_fence_plain_split(self):
+        content = "x\n" * 200  # 400 chars
+        chunks = consumer._split_fenced_chunks(content, limit=100)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), 100 + 20)  # 允许 marker/围栏带来的小幅余量
+
+    def test_code_block_reopened_across_chunks(self):
+        # 一个长代码块，分块后每块围栏都平衡（``` 数量为偶数）。
+        body = "\n".join(f"line{i}" for i in range(2000))
+        content = "```python\n" + body + "\n```"
+        chunks = consumer._split_fenced_chunks(content, limit=800)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertEqual(c.count("```") % 2, 0, f"unbalanced fence: {c[:80]!r}")
+
+    def test_continuation_marker_added(self):
+        body = "\n".join(f"line{i}" for i in range(500))
+        content = "```bash\n" + body + "\n```"
+        chunks = consumer._split_fenced_chunks(content, limit=300)
+        self.assertGreater(len(chunks), 1)
+        # 分块间有「⏩ 续」分隔提示。
+        self.assertIn("⏩ 续", chunks[0])
+
+    def test_fenced_content_stays_balanced(self):
+        content = "```\n" + ("a" * 20000) + "\n```"
+        chunks = consumer._split_fenced_chunks(content, limit=8000)
+        for c in chunks:
+            self.assertEqual(c.count("```") % 2, 0)
+
+
+class SenderChunkingTest(unittest.TestCase):
+    def tearDown(self):
+        _restore_modules()
+
+    def test_sender_splits_long_fenced_text(self):
+        adapter = _FakeAdapter(success=True)
+        loop = types.SimpleNamespace()
+        runner = _FakeRunner({_FakePlatform("feishu"): adapter}, loop=loop)
+        _install_fake_gateway(lambda: runner)
+        _install_fake_async_utils()
+        send = consumer.make_sender(None)
+        long_text = "```\n" + ("data\n" * 5000) + "```"
+        res = send("feishu", "oc_x", "", long_text)
+        self.assertTrue(res["ok"])
+        # 长文本被拆成多块发送。
+        self.assertGreater(len(adapter.calls), 1)
 
 
 def _print_event_render_table():

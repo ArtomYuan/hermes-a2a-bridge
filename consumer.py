@@ -229,8 +229,113 @@ def _truncate(text: Any, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
+# 结果正文超过此长度（或含换行）时，final 文本以代码框输出（短结果保持普通行）。
+_FINAL_CODE_BLOCK_MIN_LEN = 120
+
+
+def _escape_inner_fences(text: str) -> str:
+    """把正文内的三层反引号围栏转义为不闭合外层代码框的形式。
+
+    结果正文本身可能含 markdown 代码围栏（三个连续反引号），直接塞进外层代码框会
+    提前闭合外层围栏、导致围栏断裂。此处把内层三个连续反引号替换为在两个反引号
+    之间插入零宽空格（U+200B）的形式，视觉上几乎不变，但不再被解析为围栏，保证
+    外层围栏闭合。
+    """
+    return str(text).replace("```", "`\u200b``")
+
+
+def _looks_like_code(text: str) -> bool:
+    """判断正文是否含命令 / 代码特征（多行、围栏、内联代码、shell 操作符等）。"""
+    s = str(text or "")
+    if "\n" in s:
+        return True
+    if "```" in s or "`" in s:
+        return True
+    if any(op in s for op in ("|", "&&", ">", "<", "$(", ";")):
+        return True
+    return False
+
+
+def _fence(text: str, lang: str = "") -> str:
+    """把正文包成代码框（转义内层围栏，保证外层围栏闭合）。"""
+    body = _escape_inner_fences(str(text).rstrip("\n"))
+    return f"```{lang}\n{body}\n```"
+
+
+def _split_fenced_chunks(
+    content: str, limit: int = 8000, marker: str = "⏩ 续"
+) -> list:
+    """把（含代码框的）长内容按代码块边界分块，避免围栏跨块断裂。
+
+    - 每块 ≤ ``limit`` 字符（代码块内部在换行处切分，不在围栏行中间切）。
+    - 若切分点落在代码块内，本块补闭合围栏，下一块用原语言标签重开围栏。
+    - 分块间追加 ``marker`` 分隔提示（仅当确实产生多块时）。
+    短于 ``limit`` 的内容原样返回单块。
+    """
+    if len(content) <= limit:
+        return [content]
+
+    lines = content.split("\n")
+    chunks: list = []
+    cur: list = []
+    in_code = False
+    lang = ""
+
+    def _emit(continuation: bool, reopen_lang: str = "") -> None:
+        nonlocal cur
+        if not cur:
+            return
+        body = "\n".join(cur)
+        # 若切分点落在代码块内，本块补闭合围栏。
+        if in_code:
+            body += "\n```"
+        if continuation:
+            body += f"\n{marker}"
+        chunks.append(body)
+        cur = []
+        if in_code and reopen_lang is not None:
+            cur.append(f"```{reopen_lang}")
+
+    for raw in lines:
+        stripped = raw.strip()
+        is_fence = stripped.startswith("```")
+        if is_fence:
+            if not in_code:
+                # 围栏开：先 flush 之前的普通行，再进入代码块。
+                _emit(False)
+                lang = stripped[3:].strip().split()[0] if stripped[3:].strip() else ""
+                in_code = True
+                cur.append(raw)
+                continue
+            # 围栏闭。
+            cur.append(raw)
+            in_code = False
+            lang = ""
+            # 代码块结束处是安全切分点。
+            if sum(len(l) + 1 for l in cur) + 1 > limit:
+                _emit(False)
+            continue
+        cur.append(raw)
+        # 超限时在换行边界切分；代码块内跨块时重开围栏。
+        if sum(len(l) + 1 for l in cur) >= limit:
+            _emit(True, reopen_lang=lang if in_code else "")
+
+    if cur:
+        body = "\n".join(cur)
+        if in_code:
+            body += "\n```"
+        chunks.append(body)
+
+    # 去掉空块。
+    return [c for c in chunks if c.strip()] or [content]
+
+
 def render_line(event: Dict[str, Any]) -> Optional[str]:
-    """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。"""
+    """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
+
+    操作内容（tool_call 命令 / tool_result 结果 / 长 final 文本）以 ``` 代码框
+    输出，让飞书渲染为可滚动代码框；短文本（thinking / 普通 text）保持普通行。
+    """
     etype = event.get("type")
     if etype == "turn_start":
         turn = event.get("turn")
@@ -240,18 +345,31 @@ def render_line(event: Dict[str, Any]) -> Optional[str]:
     if etype == "thinking":
         return "🧠 思考中…"
     if etype == "tool_call":
-        return f"🔧 调用工具 `{event.get('name') or ''}`"
+        name = event.get("name") or ""
+        arguments = str(event.get("arguments") or "").strip()
+        if arguments:
+            # 命令正文进代码框，emoji 前缀 + 工具名留在框外。
+            return f"🔧 `{name}`\n{_fence(arguments, 'bash')}"
+        return f"🔧 调用工具 `{name}`"
     if etype == "tool_result":
         name = event.get("name") or ""
-        line = f"📋 `{name}` 完成" if name else "📋 工具完成"
         text = str(event.get("text") or "").strip()
         if text:
-            line += "：" + _truncate(text, 60)
-        return line
+            # 结果正文进代码框（无语言标签），emoji 前缀 + 工具名留在框外。
+            return f"📋 `{name}` 完成\n{_fence(text)}"
+        return f"📋 `{name}` 完成" if name else "📋 工具完成"
     if etype == "text":
         if event.get("final"):
+            final_text = str(event.get("text") or "")
+            # 长最终结果以代码框输出；短结果保持普通行（不滥框）。
+            if len(final_text) >= _FINAL_CODE_BLOCK_MIN_LEN or "\n" in final_text:
+                return f"📖 输出完成\n{_fence(final_text)}"
             return "📖 输出完成"
-        return "📖 " + _truncate(event.get("text") or "", 120)
+        raw = str(event.get("text") or "")
+        # 非 final text：短文本普通行；含命令 / 代码特征时框化。
+        if _looks_like_code(raw):
+            return "📖 " + _fence(raw)
+        return "📖 " + _truncate(raw, 120)
     if etype == "status":
         state = event.get("state")
         if state == "completed":
@@ -383,8 +501,12 @@ def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any
     """
 
     def send(platform: str, chat_id: str, thread_id: str, text: str) -> Dict[str, Any]:
-        text = _redact(text)
+        redacted = _redact(text)
         target = _target(platform, chat_id, thread_id)
+        # 长文本（>8000）按代码块边界分块发送，避免代码围栏跨块断裂；
+        # 分块间由 _split_fenced_chunks 追加「⏩ 续」分隔提示。
+        chunks = _split_fenced_chunks(redacted)
+
         try:
             from gateway.run import _gateway_runner_ref
             from gateway.config import Platform
@@ -392,31 +514,36 @@ def make_sender(ctx: Any = None) -> Callable[[str, str, str, str], Dict[str, Any
 
             runner = _gateway_runner_ref()
             if runner is None:
-                return {"ok": False, "error": "no_gateway", "text": text, "target": target}
+                return {"ok": False, "error": "no_gateway", "text": redacted, "target": target}
             loop = getattr(runner, "_gateway_loop", None)
             if loop is None:
-                return {"ok": False, "error": "no_loop", "text": text, "target": target}
+                return {"ok": False, "error": "no_loop", "text": redacted, "target": target}
             try:
                 adapter = runner.adapters.get(Platform(platform))
             except Exception:
                 adapter = None
             if adapter is None:
-                return {"ok": False, "error": "no_adapter", "text": text, "target": target}
+                return {"ok": False, "error": "no_adapter", "text": redacted, "target": target}
             metadata = {"thread_id": thread_id} if thread_id else None
-            fut = safe_schedule_threadsafe(
-                adapter.send(chat_id=chat_id, content=text, metadata=metadata), loop
-            )
-            if fut is None:
-                return {"ok": False, "error": "schedule_failed", "text": text, "target": target}
-            result = fut.result(timeout=60)
-            if getattr(result, "success", False):
-                return {"ok": True, "via": "adapter", "target": target, "text": text}
-            return {"ok": False, "error": "send_failed",
-                    "detail": str(getattr(result, "error", "") or ""),
-                    "text": text, "target": target}
+
+            last: Dict[str, Any] = {"ok": True, "via": "adapter", "target": target, "text": redacted}
+            for chunk in chunks:
+                fut = safe_schedule_threadsafe(
+                    adapter.send(chat_id=chat_id, content=chunk, metadata=metadata), loop
+                )
+                if fut is None:
+                    return {"ok": False, "error": "schedule_failed", "text": chunk, "target": target}
+                result = fut.result(timeout=60)
+                if getattr(result, "success", False):
+                    last = {"ok": True, "via": "adapter", "target": target, "text": chunk}
+                else:
+                    last = {"ok": False, "error": "send_failed",
+                            "detail": str(getattr(result, "error", "") or ""),
+                            "text": chunk, "target": target}
+            return last
         except Exception as exc:
             logger.warning("hermes-a2a-bridge: adapter send failed: %s", exc)
-            return {"ok": False, "error": "send_failed", "text": text, "target": target}
+            return {"ok": False, "error": "send_failed", "text": redacted, "target": target}
 
     return send
 

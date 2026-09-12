@@ -85,9 +85,10 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
          token: <与 dsh 侧 A2A_SERVER_TOKEN 同一把>
    ```
 
-4. 重启 gateway 生效：
+4. 重启 Hermes 网关生效（方式取决于你的部署）：
 
    ```bash
+   # 示例：systemd 用户级服务
    systemctl --user restart hermes-gateway
    ```
 

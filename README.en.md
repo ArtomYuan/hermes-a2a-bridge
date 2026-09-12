@@ -90,9 +90,10 @@ default) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
          token: <same token as the dsh-side A2A_SERVER_TOKEN>
    ```
 
-4. Restart the gateway to take effect:
+4. Restart the Hermes gateway to take effect (how depends on your deployment):
 
    ```bash
+   # Example: user-level systemd service
    systemctl --user restart hermes-gateway
    ```
 

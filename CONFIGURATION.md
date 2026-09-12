@@ -49,9 +49,10 @@ hermes plugins enable hermes-a2a-bridge
 #       - hermes-a2a-bridge
 ```
 
-开启后**必须重启 gateway 才能加载**（插件发现是一次性、进程内缓存，无热重载）：
+开启后**必须重启 Hermes 网关才能加载**（插件发现是一次性、进程内缓存，无热重载）——重启方式取决于你的部署：
 
 ```bash
+# 示例：systemd 用户级服务
 systemctl --user restart hermes-gateway
 ```
 
@@ -67,6 +68,8 @@ git clone https://github.com/ArtomYuan/hermes-a2a-bridge ~/.hermes/plugins/herme
 ### 方式 B：pip 结构（后续）
 
 TODO(P2c)：如改为 pip 包，补充 `pyproject.toml` + entry point 安装说明。
+
+> **注**：以上只涉及插件文件部署。**重启 Hermes 网关的方式取决于你的 Hermes 部署形态**（用户级/系统级 systemd 服务、前台进程、Docker 容器等）——本文档中出现的 `systemctl --user restart hermes-gateway` 均为「用户级 systemd 服务」**示例**，请按实际部署方式重启。
 
 ## 与 dsh-a2a-server 配合
 
@@ -133,7 +136,7 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
 
 ### 启用方式（collector 直播门控）
 
-直播发送默认**关**，开启（重启 gateway 生效）：
+直播发送默认**关**，开启（重启 Hermes 网关生效）：
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -146,6 +149,7 @@ plugins:
 ```
 
 ```bash
+# 示例：systemd 用户级服务
 systemctl --user restart hermes-gateway
 ```
 

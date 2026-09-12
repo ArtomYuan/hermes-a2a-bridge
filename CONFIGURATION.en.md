@@ -66,9 +66,10 @@ hermes plugins enable hermes-a2a-bridge
 ```
 
 After enabling, **the gateway must be restarted to load it** (plugin discovery is
-one-shot and cached in-process, no hot reload):
+one-shot and cached in-process, no hot reload) — restart however your deployment requires:
 
 ```bash
+# Example: user-level systemd service
 systemctl --user restart hermes-gateway
 ```
 
@@ -85,6 +86,8 @@ git clone https://github.com/ArtomYuan/hermes-a2a-bridge ~/.hermes/plugins/herme
 
 TODO(P2c): if converted into a pip package, add `pyproject.toml` + entry point
 install instructions.
+
+> **Note**: The above covers plugin files only. **Restarting the Hermes gateway depends on how your Hermes is deployed** (user/system systemd service, foreground process, Docker container, …) — every `systemctl --user restart hermes-gateway` in this document is a *user-level systemd* **example**; restart per your actual deployment.
 
 ## Working with dsh-a2a-server
 
@@ -169,8 +172,8 @@ trade-off of this approach, accepted and noted here.
 
 ### Enable method (collector live gating)
 
-Live sending is **off** by default. Enable it (takes effect after restarting the
-gateway):
+Live sending is **off** by default. Enable it (takes effect after a Hermes
+gateway restart):
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -183,6 +186,7 @@ plugins:
 ```
 
 ```bash
+# Example: user-level systemd service
 systemctl --user restart hermes-gateway
 ```
 

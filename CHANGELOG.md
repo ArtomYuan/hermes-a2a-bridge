@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+（暂无未发布变更）
+
+## [0.1.0] - 2026-09-12
+
 ### Added
 
 - origin→contextId 注入：在 `pre_tool_call` 钩子内把稳定会话令牌

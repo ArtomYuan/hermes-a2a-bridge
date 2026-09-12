@@ -63,6 +63,17 @@ stream; both on by default) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ![Sequence](assets/sequence-en.png)
 
+## Relationship with dsh-a2a-server
+
+This plugin and [dsh-a2a-server](https://github.com/ArtomYuan/dsh-a2a-server) are not
+hard-bound; combine them as needed:
+
+| Combination | What you get |
+| --- | --- |
+| dsh-a2a-server only | A standard A2A interface callable by any A2A client |
+| This plugin only | Not applicable — it relies on dsh-a2a-server as its server |
+| Both together | Full experience: task submission + live progress (🔧 / 📖 / ✅) + session continuity (one conversation ↔ one dsh session) + single execution |
+
 ## Installation
 
 1. Clone the plugin into the plugins directory:

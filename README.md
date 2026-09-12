@@ -57,6 +57,16 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 ![链路时序](assets/sequence-zh.png)
 
+## 与 dsh-a2a-server 的关系
+
+本插件与 [dsh-a2a-server](https://github.com/ArtomYuan/dsh-a2a-server) 并非强绑定，可按需组合：
+
+| 组合 | 能实现 |
+| --- | --- |
+| 只用 dsh-a2a-server | 暴露标准 A2A 接口，任意 A2A 客户端可直接调用 |
+| 只用本插件 | 不适用——本插件依赖 dsh-a2a-server 作为服务端 |
+| 两者一起用 | 完整体验：任务投递 + 过程直播（🔧 / 📖 / ✅）+ 会话连续性（一个对话一个 dsh 会话）+ 单执行 |
+
 ## 安装说明
 
 1. 克隆插件到插件目录：

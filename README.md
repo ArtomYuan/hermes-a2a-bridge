@@ -55,21 +55,7 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 ## 流程图
 
-```
-Hermes 网关（a2a_call / a2a_orchestrate）
-        │  pre_tool_call 注入 origin → contextId
-        ▼
-hermes-a2a-bridge（pre_tool_call 单执行）
-        │  发送一条 SendStreamingMessage
-        ▼
-dsh-a2a-server（http://127.0.0.1:8092）
-        │  会话复用 + 执行
-        ▼
-dsh agent 会话
-        │  SSE 中间事件（思考/工具/状态/文本）
-        ▼
-hermes-a2a-bridge 消费 → 渲染 → 直播回流到飞书 / QQ
-```
+![链路时序](assets/sequence-zh.png)
 
 ## 安装说明
 

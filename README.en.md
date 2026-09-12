@@ -60,21 +60,7 @@ default) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ## Architecture
 
-```
-Hermes gateway (a2a_call / a2a_orchestrate)
-        │  pre_tool_call injects origin → contextId
-        ▼
-hermes-a2a-bridge (pre_tool_call single execution)
-        │  sends one SendStreamingMessage
-        ▼
-dsh-a2a-server (http://127.0.0.1:8092)
-        │  session reuse + execution
-        ▼
-dsh agent session
-        │  SSE intermediate events (thinking/tool/status/text)
-        ▼
-hermes-a2a-bridge consumes → renders → streams back to Feishu / QQ
-```
+![Sequence](assets/sequence-en.png)
 
 ## Installation
 

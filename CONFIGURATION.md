@@ -183,6 +183,32 @@ plugins:
 
 未配置时保持 `true`，向后兼容已部署副本的现有行为。
 
+### 事件流开关（collector.events）
+
+完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.events`。
+
+是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.code_blocks`
+正交：`code_blocks` 控制**渲染样式**（代码框还是纯文本），`events` 控制**推送范围**
+（中间事件 + 最终结果都推，还是只推最终结果）。
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    hermes-a2a-bridge:
+      settings:
+        collector:
+          enabled: true
+          events: true            # 默认 true：中间事件 + 最终结果都推
+```
+
+- `true`（默认）：现状——中间事件（🔧 工具调用 / 📖 中间文本 / 🧠 thinking /
+  状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
+- `false`（安静模式）：只推最终结果（📖 输出完成 + 终态状态行），中间事件不推
+  （不刷屏）。完成卡仍可含代码框，由 `code_blocks` 控制样式（两键正交）。
+
+未配置时保持 `true`，向后兼容已部署副本的现有行为。
+
 ### 数据流链路
 
 ```

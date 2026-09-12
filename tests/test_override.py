@@ -117,6 +117,8 @@ class HookTest(unittest.TestCase):
         _restore_modules()
         self._orig_stream = _MODULE._stream_dsh_call
         _MODULE._COLLECTOR_ENABLED = False
+        _MODULE._CODE_BLOCKS = True
+        _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
@@ -124,6 +126,8 @@ class HookTest(unittest.TestCase):
         _MODULE._stream_dsh_call = self._orig_stream
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
+        _MODULE._CODE_BLOCKS = True
+        _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
@@ -264,6 +268,8 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["thread_id"], "omt_y")
         # 缺 timeout 配置 → 回退默认 300。
         self.assertEqual(call["timeout"], 300)
+        # 默认 _EVENTS=True 且本用例不调 register → consume_stream 收到 events=True。
+        self.assertEqual(call["events"], True)
         # 消息面（platform/chat_id 非空）→ 真 sender。
         self.assertEqual(len(consumer.make_sender_calls), 1)
         self.assertIs(call["sender"], consumer.last_sender)
@@ -284,6 +290,43 @@ class HookTest(unittest.TestCase):
         _MODULE._CONSUMER_MODULE = consumer
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         self.assertEqual(consumer.consume_stream_calls[0]["timeout"], 3600)
+
+    # 13. register() 读 collector.enabled / code_blocks / events 配置。
+    def test_register_reads_collector_settings(self):
+        settings = {
+            "collector.enabled": True,
+            "collector.code_blocks": False,
+            "collector.events": False,
+        }
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return settings.get(key, default)
+
+            def register_hook(self, name, fn):
+                pass
+
+        _MODULE.register(FakeCtx())
+        self.assertIs(_MODULE._COLLECTOR_ENABLED, True)
+        self.assertIs(_MODULE._CODE_BLOCKS, False)
+        self.assertIs(_MODULE._EVENTS, False)
+
+    # 14. register() 缺 collector.events → 默认 true。
+    def test_register_events_default_true(self):
+        settings = {
+            "collector.enabled": True,
+            "collector.code_blocks": True,
+        }
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return settings.get(key, default)
+
+            def register_hook(self, name, fn):
+                pass
+
+        _MODULE.register(FakeCtx())
+        self.assertIs(_MODULE._EVENTS, True)
 
 
 if __name__ == "__main__":

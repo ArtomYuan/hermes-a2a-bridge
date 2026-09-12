@@ -225,6 +225,37 @@ plugins:
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
+### Event-stream toggle (collector.events)
+
+Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.events`.
+
+Whether "intermediate events" are pushed is controlled separately by this key
+(default `true`). It is orthogonal to `collector.code_blocks`: `code_blocks`
+controls the **rendering style** (code blocks vs plain text), while `events`
+controls the **push scope** (push intermediate events + final result, or push only
+the final result).
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    hermes-a2a-bridge:
+      settings:
+        collector:
+          enabled: true
+          events: true            # default true: push intermediate events + final result
+```
+
+- `true` (default): current behavior — intermediate events (🔧 tool call /
+  📖 intermediate text / 🧠 thinking / status lines) and the final result
+  (📖 output complete / ✅ done card) are all pushed.
+- `false` (quiet mode): push only the final result (📖 output complete + terminal
+  status line); intermediate events are not pushed (no spam). The done card may
+  still contain code blocks, whose style is controlled by `code_blocks` (the two
+  keys are orthogonal).
+
+When unset it stays `true`, keeping existing deployments' behavior unchanged.
+
 ### Data-flow chain
 
 ```

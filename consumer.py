@@ -235,6 +235,9 @@ _FINAL_CODE_BLOCK_MIN_LEN = 120
 # 代码框渲染默认开（向后兼容：已部署副本不配置即保持代码框行为）。
 DEFAULT_CODE_BLOCKS = True
 
+# 事件流开关默认开（向后兼容：已部署副本不配置即保持推送中间事件）。
+DEFAULT_EVENTS = True
+
 
 def _escape_inner_fences(text: str) -> str:
     """把正文内的三层反引号围栏转义为不闭合外层代码框的形式。
@@ -354,6 +357,16 @@ def _split_plain_chunks(
     if cur:
         chunks.append("\n".join(cur))
     return [c for c in chunks if c.strip()] or [content]
+
+
+def _is_final_event(event: Dict[str, Any]) -> bool:
+    """判断事件是否为「最终结果」：final 文本或终态 status（安静模式下仍推送）。"""
+    etype = event.get("type")
+    if etype == "text" and event.get("final"):
+        return True
+    if etype == "status" and event.get("state") in _TERMINAL_STATES:
+        return True
+    return False
 
 
 def render_line(event: Dict[str, Any], code_blocks: bool = True) -> Optional[str]:
@@ -635,10 +648,14 @@ def consume_stream(
     min_interval: float = 2.0,
     timeout: int = _DEFAULT_TIMEOUT,
     code_blocks: bool = DEFAULT_CODE_BLOCKS,
+    events: bool = DEFAULT_EVENTS,
 ) -> Dict[str, Any]:
     """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → 节流 → 发送，返回统计。
 
     ``code_blocks`` 透传给 ``render_line``，控制操作内容是否以代码框渲染。
+    ``events`` 控制「中间事件」是否推送：``False`` 时只推最终结果（final 文本 /
+    终态 status），中间事件（工具调用 / 中间文本 / thinking / 状态行）跳过渲染与
+    发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
@@ -666,6 +683,9 @@ def consume_stream(
                     stats["states"].append(event.get("state"))
                 if event.get("type") == "text" and event.get("final"):
                     stats["final_text"] = event.get("text") or ""
+                # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
+                if not events and not _is_final_event(event):
+                    continue
                 line = render_line(event, code_blocks=code_blocks)
                 for text in throttler.feed(event, line):
                     res = sender(platform, chat_id, thread_id, text)

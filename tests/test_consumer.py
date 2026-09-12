@@ -732,6 +732,55 @@ class ConsumeStreamTest(unittest.TestCase):
         self.assertEqual(stats["messages_sent"], 0)
 
 
+class ConsumeStreamEventsTest(unittest.TestCase):
+    """consume_stream 的 events 开关：false 安静模式只推最终结果，true 与现状一致。"""
+
+    def tearDown(self):
+        if hasattr(consumer, "_orig_iter_sse_data"):
+            consumer.iter_sse_data = consumer._orig_iter_sse_data
+            del consumer._orig_iter_sse_data
+
+    def _run(self, events):
+        results = _wire_sequence()
+        consumer._orig_iter_sse_data = consumer.iter_sse_data
+        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        sent = []
+
+        def sender(platform, chat_id, thread_id, text):
+            sent.append(text)
+            return {"ok": True}
+
+        kw = dict(
+            url="http://127.0.0.1:8092/",
+            token="fake-token",
+            message="列出当前目录",
+            context_id="feishu/oc_x",
+            platform="feishu",
+            chat_id="oc_x",
+            thread_id="",
+            sender=sender,
+            min_interval=0.0,
+        )
+        if events is not None:
+            kw["events"] = events
+        stats = consumer.consume_stream(**kw)
+        return stats, sent
+
+    def test_events_false_quiet_mode(self):
+        stats, sent = self._run(False)
+        self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
+        self.assertEqual(stats["events_seen"], 9)
+        self.assertEqual(stats["states"], ["submitted", "working", "completed"])
+        self.assertEqual(stats["messages_sent"], 2)
+        # 只有最终结果，无任何中间事件。
+        self.assertEqual(sent, ["📖 输出完成", "✅ 完成"])
+
+    def test_events_true_matches_current(self):
+        stats, sent = self._run(True)
+        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(sent, _EXPECTED_SENT)
+
+
 class SplitFencedChunksTest(unittest.TestCase):
     def test_short_content_single_chunk(self):
         self.assertEqual(consumer._split_fenced_chunks("hello"), ["hello"])

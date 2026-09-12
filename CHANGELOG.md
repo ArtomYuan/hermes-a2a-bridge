@@ -25,6 +25,8 @@
 - 代码框渲染可配置：`collector.code_blocks`（默认 true）——false 时直播内容回退
   纯文本行（不包围栏、不做围栏转义），长文本走普通换行边界分块（仍保留 `⏩ 续`
   提示）。
+- 事件流开关 `collector.events`（默认 true）——false 安静模式只推最终结果/完成卡，
+  中间事件不推；与 `code_blocks` 正交。
 - 双语 README（README.md + README.en.md），含效果展示章节。
 
 ### Changed
@@ -43,5 +45,5 @@
 
 ### Tested
 
-- 单元测试 80 项：`test_consumer` 56、`test_origin_injection` 12、
-  `test_override` 12。
+- 单元测试 84 项：`test_consumer` 58、`test_origin_injection` 12、
+  `test_override` 14。

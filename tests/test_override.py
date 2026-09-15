@@ -93,6 +93,7 @@ class _FakeConsumer:
     def __init__(self):
         self.consume_stream_calls = []
         self.make_sender_calls = []
+        self.senders = []
         self.stats = {
             "final_text": "收到",
             "events_seen": 5,
@@ -102,8 +103,14 @@ class _FakeConsumer:
 
     def make_sender(self, ctx, code_blocks=True):
         self.make_sender_calls.append((ctx, code_blocks))
-        # 返回可识别的真 sender，供用例断言 consume_stream 收到的 sender 是真实 sender。
-        sender = lambda p, c, t, text: {"ok": True, "via": "make_sender"}
+        # 返回可识别的真 sender（记录发送内容），供用例断言发送路径与结果送达文本。
+        sent = []
+
+        def sender(p, c, t, text):
+            sent.append((p, c, t, text))
+            return {"ok": True, "via": "make_sender"}
+
+        self.senders.append((code_blocks, sender, sent))
         self.last_sender = sender
         return sender
 
@@ -116,6 +123,7 @@ class HookTest(unittest.TestCase):
     def setUp(self):
         _restore_modules()
         self._orig_stream = _MODULE._stream_dsh_call
+        self._orig_spawn = _MODULE._spawn_stream_worker
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CODE_BLOCKS = True
         _MODULE._EVENTS = True
@@ -124,6 +132,7 @@ class HookTest(unittest.TestCase):
 
     def tearDown(self):
         _MODULE._stream_dsh_call = self._orig_stream
+        _MODULE._spawn_stream_worker = self._orig_spawn
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CODE_BLOCKS = True
@@ -149,28 +158,26 @@ class HookTest(unittest.TestCase):
             )
         )
 
-    # 3. a2a_call + dsh + collector 开 + origin 非空 + message 非空 → block 最终文本。
-    def test_dsh_single_execution_blocks_with_final_text(self):
+    # 3. a2a_call + dsh + collector 开 + origin 非空 + message 非空 → 异步 spawn + block 受理回执。
+    def test_dsh_single_execution_spawns_async_and_blocks(self):
         _install_fake_gateway(
             True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
         )
         _MODULE._COLLECTOR_ENABLED = True
         calls = []
 
-        def fake_stream(message, context_id):
+        def fake_spawn(message, context_id):
             calls.append((message, context_id))
-            return "[dsh · context feishu/oc_x · completed]\n收到"
 
-        _MODULE._stream_dsh_call = fake_stream
+        _MODULE._spawn_stream_worker = fake_spawn
         result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
-        self.assertEqual(
-            result,
-            {"action": "block", "message": "[dsh · context feishu/oc_x · completed]\n收到"},
-        )
+        self.assertEqual(result["action"], "block")
+        self.assertIn("已受理", result["message"])
+        self.assertIn("feishu/oc_x", result["message"])
         self.assertEqual(calls, [("hi", "feishu/oc_x")])
 
-    # 4. _stream_dsh_call 抛异常 → 回退仅注入 origin（走同步 SendMessage）。
-    def test_dsh_stream_failure_falls_back_to_inject(self):
+    # 4. spawn 失败（如线程创建失败）→ 回退仅注入 origin（走同步 SendMessage）。
+    def test_dsh_spawn_failure_falls_back_to_inject(self):
         _install_fake_gateway(
             True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
         )
@@ -179,7 +186,7 @@ class HookTest(unittest.TestCase):
         def boom(message, context_id):
             raise RuntimeError("boom")
 
-        _MODULE._stream_dsh_call = boom
+        _MODULE._spawn_stream_worker = boom
         result = _MODULE._on_pre_tool_call("a2a_call", {"agent": "dsh", "message": "hi"})
         self.assertEqual(
             result, {"action": "modify", "args": {"context_id": "feishu/oc_x"}}
@@ -270,9 +277,19 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["timeout"], 300)
         # 默认 _EVENTS=True 且本用例不调 register → consume_stream 收到 events=True。
         self.assertEqual(call["events"], True)
-        # 消息面（platform/chat_id 非空）→ 真 sender。
-        self.assertEqual(len(consumer.make_sender_calls), 1)
-        self.assertIs(call["sender"], consumer.last_sender)
+        # 消息面（platform/chat_id 非空）→ 真 sender：直播（code_blocks=True）与
+        # 结果送达（code_blocks=False）各构造一次。
+        self.assertEqual(len(consumer.make_sender_calls), 2)
+        self.assertIs(consumer.make_sender_calls[0][1], True)
+        self.assertIs(consumer.make_sender_calls[1][1], False)
+        self.assertIs(call["sender"], consumer.senders[0][1])
+        # 结果主动送达：📬 头行 + 全文，发到同一消息面。
+        sent = consumer.senders[1][2]
+        self.assertEqual(len(sent), 1)
+        p, c, t, text = sent[0]
+        self.assertEqual((p, c, t), ("feishu", "oc_x", "omt_y"))
+        self.assertIn("📬 **dsh 任务完成，结果如下**", text)
+        self.assertTrue(text.endswith("\n\n收到"))
 
     # 12. peer 配置的 timeout 传给 consume_stream（缺省回退 300）。
     def test_stream_dsh_call_passes_peer_timeout(self):
@@ -327,6 +344,44 @@ class HookTest(unittest.TestCase):
 
         _MODULE.register(FakeCtx())
         self.assertIs(_MODULE._EVENTS, True)
+
+    # 15. _format_result_message：完成 / 异常态 / 空文本三态。
+    def test_format_result_message_variants(self):
+        done = _MODULE._format_result_message("# 报告\n正文", "completed", 90)
+        self.assertTrue(
+            done.startswith("📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）\n\n")
+        )
+        self.assertTrue(done.endswith("# 报告\n正文"))
+        failed = _MODULE._format_result_message("x", "failed", 5)
+        self.assertIn("已结束（失败）", failed)
+        self.assertIn("用时 5 秒", failed)
+        empty = _MODULE._format_result_message("", "completed", 3)
+        self.assertIn("无文本输出", empty)
+
+    # 16. _stream_worker：流式异常被吞掉（只记日志，不向线程外抛）。
+    def test_stream_worker_swallows_exception(self):
+        def boom(message, context_id):
+            raise RuntimeError("boom")
+
+        _MODULE._stream_dsh_call = boom
+        _MODULE._stream_worker("hi", "feishu/oc_x")  # 不应抛出
+
+    # 17. _deliver_final_result：发送失败重试一次（第二次成功即返回）。
+    def test_result_delivery_retries_once(self):
+        consumer = _FakeConsumer()
+        attempts = []
+
+        def flaky_sender(p, c, t, text):
+            attempts.append(text)
+            return {"ok": len(attempts) > 1, "error": "send_failed"}
+
+        consumer.make_sender = lambda ctx, code_blocks=True: flaky_sender
+        _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._deliver_final_result(
+            "feishu", "oc_x", "omt_y", "报告", "completed", 0.0
+        )
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("📬", attempts[1])
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ Hermes 内置 A2A 插件（``~/.hermes/hermes-agent/plugins/platforms/a2a/``）�
 - 默认关：本插件不在 ``plugins.enabled`` 白名单时不会被加载，故「未启用即无副作用」。
   启用方式见 README.md。
 
-单执行（pre_tool_call hook，替代已弃用的 override）
+单执行（pre_tool_call hook，异步版）
 --------------------------------------------------
 早期方案用 ``register_tool(override=True)`` 覆写 ``a2a_call`` handler 为单一流式，但
 实证发现 override 注册机制在真实 gateway 里不可靠（a2a 平台 deferred load 二次
@@ -44,21 +44,22 @@ hook 里对 dsh 目标做**单执行**：
 
 - 触发条件：``a2a_call`` + ``_is_dsh_agent(agent)`` + ``collector.enabled`` 开 +
   消息面 origin 非空 + message 非空。
-- 单执行：hook 内同步调用 ``_stream_dsh_call(message, origin)`` 发一条
-  ``SendStreamingMessage``，边消费 SSE 事件边渲染推回消息面（直播，``collector.enabled``
-  门控），返回格式化最终文本；随后以 ``{"action": "block", "message": 结果}`` 阻止
-  原 ``a2a_call`` 执行（消除双执行）。
-- block 语义（已知取舍）：hook 返回 ``{"action":"block","message":M}`` 后，框架把
-  ``M`` 变成工具结果 ``{"error": M}``——模型能读到 ``error`` 字段里的完整最终文本，
-  只是结果被包在 error 字段而非普通文本字段。本方案接受该取舍，README/docstring 均已
-  注明。
-- 回退：``_stream_dsh_call`` 抛异常（缺 dsh 配置 / 流式失败）时，退化为注入 origin
-  让原 ``a2a_call`` 走同步 ``SendMessage``（功能不丢、无直播）。
+- 单执行（异步，2026-09-15 改）：hook 立即 spawn 后台 daemon 线程跑
+  ``_stream_dsh_call``（发 ``SendStreamingMessage``、消费 SSE 直播），并立刻以
+  ``{"action": "block", "message": 受理回执}`` 阻止原 ``a2a_call`` 执行（消除双执行）。
+  必须异步的原因：框架 hook 回调超时 30s，超时即 fail-closed 且其后一段时间内
+  所有工具调用被连锁跳过（历史缺陷，2026-09-15 修复）。
+- 结果送达：``_stream_dsh_call`` 在任务完成时把最终结果以普通消息（非代码框）主动
+  送达消息面（``📬 dsh 任务完成…``），失败重试一次后仅记日志——「完成」之后不静默。
+- 回退：spawn 失败时退化为注入 origin 让原 ``a2a_call`` 走同步 ``SendMessage``
+  （功能不丢、无直播）。
 - 其余（``a2a_orchestrate`` / 非 dsh 目标 / collector 关 / 非消息面 / message 空）：
   仅注入 origin，不 block。
 """
 
 import logging
+import threading
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     注入 origin 走同步 SendMessage）。返回 ``[dsh · context {context_id} · {state}]
     \\n{final_text}``。
     """
+    started_at = time.time()
     peer = _dsh_peer()
     if peer:
         url = str(peer.get("url") or "").strip()
@@ -276,7 +278,95 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     if state:
         header += f" · {state}"
     header += "]"
+
+    # 结果主动送达：任务完成即把最终结果以普通消息推回消息面（「完成」之后不静默）。
+    if platform and chat_id:
+        _deliver_final_result(
+            platform, chat_id, thread_id, final_text, state, started_at
+        )
+
     return f"{header}\n{final_text or '(no text reply)'}"
+
+
+_STATE_ZH = {
+    "completed": "完成",
+    "failed": "失败",
+    "canceled": "已取消",
+}
+
+
+def _format_result_message(final_text: str, state: str, elapsed_secs: float) -> str:
+    """构造「任务结果」主动送达消息：📬 头行（状态 + 耗时）+ 结果全文。"""
+    minutes, seconds = divmod(max(0, int(elapsed_secs)), 60)
+    cost = f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
+    state_zh = _STATE_ZH.get(state, state)
+    if not final_text:
+        return (
+            f"📬 **dsh 任务已结束**（{state_zh or '完成'} · 用时 {cost}）"
+            "——本次无文本输出。"
+        )
+    if state and state not in ("completed", ""):
+        head = f"📬 **dsh 任务已结束（{state_zh}），输出如下**（用时 {cost}）"
+    else:
+        head = f"📬 **dsh 任务完成，结果如下**（用时 {cost}）"
+    return f"{head}\n\n{final_text}"
+
+
+def _deliver_final_result(
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    final_text: str,
+    state: str,
+    started_at: float,
+) -> None:
+    """把任务最终结果以普通消息主动送达消息面（失败重试一次，绝不抛出）。"""
+    try:
+        consumer = _import_consumer()
+        sender = consumer.make_sender(_CTX, code_blocks=False)
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: result sender unavailable: %s", exc)
+        return
+    text = _format_result_message(final_text, state, time.time() - started_at)
+    for attempt in (1, 2):
+        try:
+            res = sender(platform, chat_id, thread_id, text)
+        except Exception as exc:
+            logger.warning(
+                "hermes-a2a-bridge: result delivery raised (attempt %d): %s",
+                attempt,
+                exc,
+            )
+            continue
+        if isinstance(res, dict) and res.get("ok"):
+            logger.info(
+                "hermes-a2a-bridge: final result delivered (%d chars)", len(text)
+            )
+            return
+        logger.warning(
+            "hermes-a2a-bridge: result delivery failed (attempt %d): %s",
+            attempt,
+            res.get("error") if isinstance(res, dict) else res,
+        )
+
+
+def _stream_worker(message: str, origin: str) -> None:
+    """后台线程体：跑一次完整流式（直播 + 结果送达），异常只记日志。"""
+    try:
+        _stream_dsh_call(message, origin)
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: stream worker failed: %s", exc)
+
+
+def _spawn_stream_worker(message: str, origin: str) -> None:
+    """spawn 后台 daemon 线程跑 ``_stream_worker``（失败向上抛，触发同步回退）。"""
+    thread = threading.Thread(
+        target=_stream_worker,
+        args=(message, origin),
+        name="hermes-a2a-bridge-stream",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _on_pre_tool_call(
@@ -317,13 +407,20 @@ def _on_pre_tool_call(
         ).strip()
         if message:
             try:
-                result = _stream_dsh_call(message, origin)
-                # block 阻止原 a2a_call 执行；block_message 即最终结果文本
-                # （模型经 {"error": ...} 拿到）。
-                return {"action": "block", "message": result}
+                _spawn_stream_worker(message, origin)
+                # 异步单执行（2026-09-15）：回调秒回受理回执，任务在后台直播 +
+                # 完成后结果自动送达；block 阻止原 a2a_call 执行（消除双执行）。
+                return {
+                    "action": "block",
+                    "message": (
+                        f"[dsh · context {origin}] ⏳ 已受理——任务在后台执行，"
+                        "过程直播中；完成后结果会自动送达本对话。"
+                    ),
+                }
             except Exception as exc:
                 logger.warning(
-                    "hermes-a2a-bridge: hook stream failed, fallback sync: %s", exc
+                    "hermes-a2a-bridge: stream worker spawn failed, fallback sync: %s",
+                    exc,
                 )
                 # 回退：注入 origin 让原 a2a_call 走同步 SendMessage（功能不丢）。
                 return {"action": "modify", "args": {"context_id": origin}}

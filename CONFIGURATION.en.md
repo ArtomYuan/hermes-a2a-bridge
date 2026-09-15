@@ -1,14 +1,16 @@
 # hermes-a2a-bridge Configuration & Mechanics
 
-> Status: **P2c-fix — pre_tool_call hook single execution, double execution
-> eliminated**. The P2b origin→contextId injection is retained; the P2c live
-> consumer now sends only **one** `SendStreamingMessage` to the dsh target inside
-> the `pre_tool_call` hook, consuming the SSE stream while pushing intermediate
-> progress back to Feishu / QQ (gated by `collector.enabled`, off by default), and
-> then returns the final text at the end of the stream to the agent with block
-> semantics — the task runs only once. The override approach
-> (`register_tool(override=True)`) was abandoned because the registration
-> mechanism is unreliable on the real gateway.
+> Status: **P2c-fix — pre_tool_call hook single execution (async), double
+> execution eliminated**. The P2b origin→contextId injection is retained; the P2c
+> live consumer now sends only **one** `SendStreamingMessage` to the dsh target
+> inside the `pre_tool_call` hook: the hook returns an "accepted" receipt
+> immediately while a background thread consumes the SSE stream and pushes
+> intermediate progress back to Feishu / QQ (gated by `collector.enabled`, off by
+> default); when the task finishes, the final result is actively delivered to the
+> messaging surface as a normal message — the task runs only once, and there is
+> no silence after "done". The override approach (`register_tool(override=True)`)
+> was abandoned because the registration mechanism is unreliable on the real
+> gateway.
 
 ## Behavior
 
@@ -147,12 +149,17 @@ a2a platform's deferred load `register_tools` overwrites the override back to th
 original handler), so override was abandoned and single execution was moved into
 the `pre_tool_call` hook:
 
-- **dsh-target single execution**: inside the `pre_tool_call` hook, synchronously
-  call `_stream_dsh_call`, send only **one** `SendStreamingMessage`, consume SSE
-  events while rendering intermediate progress back to Feishu / QQ (live, gated
-  by `collector.enabled`, off by default), then block the original `a2a_call`
-  with `{"action": "block", "message": result}`, with the result text returned
-  via block semantics (see below).
+- **dsh-target single execution (async)**: the `pre_tool_call` hook immediately
+  spawns a background daemon thread running `_stream_dsh_call` (sends only **one**
+  `SendStreamingMessage`, consumes SSE events while rendering intermediate
+  progress back to Feishu / QQ; live, gated by `collector.enabled`, off by
+  default), and right away blocks the original `a2a_call` with
+  `{"action": "block", "message": receipt}`. When the task finishes, the final
+  result is actively delivered to the messaging surface as a normal message (see
+  "Receipt & result delivery"). The hook callback returns instantly — framework
+  hook callbacks have a 30 s cap; synchronously waiting on a long task triggers a
+  timeout fail-closed that cascades into skipping other tool calls. Async is the
+  fix.
 - **Non-dsh targets** (e.g. `agent="ivan"`): do not block, only inject origin,
   and run the original `SendMessage` full logic (security.audit / persist_message
   / metrics / redact).
@@ -161,14 +168,22 @@ the `pre_tool_call` hook:
   the original `a2a_call` run the synchronous `SendMessage` — functionality is
   preserved (no live output but **no double execution**).
 
-### block semantics (known trade-off)
+### Receipt & result delivery
 
 After the `pre_tool_call` hook returns `{"action": "block", "message": M}`, the
 framework turns `M` into the tool result `{"error": M}`
-(`agent/tool_executor.py` `json.dumps({"error": block_message})`). The model can
-read the complete final text inside the `error` field, except the result is
-wrapped in the error field rather than a normal text field. This is a known
-trade-off of this approach, accepted and noted here.
+(`agent/tool_executor.py` `json.dumps({"error": block_message})`). In the async
+version `M` is an "accepted" receipt (origin + a note that the result will be
+delivered automatically) — the final text no longer travels this path (the
+synchronous hand-back necessarily times out on long tasks; see the fix note
+above).
+
+The final result travels an independent path: when the task finishes,
+`_stream_dsh_call` calls `_deliver_final_result`, sending a
+`📬 **dsh 任务完成，结果如下**（用时 …）` header line + the full result as a
+**normal message** (plain-text chunking, `make_sender(code_blocks=False)`) to the
+messaging surface; on failure it retries once and only logs a warning — no
+silence after "done".
 
 ### Enable method (collector live gating)
 
@@ -263,7 +278,7 @@ a2a_call (pre_tool_call hook)
    |
    +-- non-dsh / collector off / non-messaging surface --> inject origin only --> original handler (SendMessage)
    |
-   +-- dsh target + collector on --> _stream_dsh_call --> SendStreamingMessage (only one)
+   +-- dsh target + collector on --> instant receipt + background thread _stream_dsh_call --> SendStreamingMessage (only one)
                         |                        +--> dsh SSE event stream
                         |
               parse_sse_lines (data: JSON line by line)
@@ -278,8 +293,8 @@ a2a_call (pre_tool_call hook)
                         |
               +-- sender (really sends to Feishu/QQ when collector.enabled; otherwise noop)
               |
-              +-- stats.final_text -> formatted result --> block semantics back to agent
-                        ([dsh - context ... - state], via {"error": ...})
+              +-- stats.final_text -> result message (📬 header + full text, plain-text chunks) --> delivered
+                        to the messaging surface (no silence after "done"; the receipt carries only "accepted")
 ```
 
 ### T0 line-language mapping
@@ -315,11 +330,13 @@ a2a_call (pre_tool_call hook)
 2. Config confirmation: `collector.enabled: true` is written into
    `plugins.entries.hermes-a2a-bridge.settings`.
 3. Behavior confirmation: in a Feishu / QQ conversation, have the agent call
-   `a2a_call(agent="dsh", ...)` and observe the conversation receiving `Starting
-   execution` → `Thinking...` → `Calling tool ...` → `... done` → `Output
-   complete` → `Done`, and that **dsh executes only once** (the dsh-a2a-server
-   log shows only one task submission); also confirm the agent receives the final
-   result in the form `{"error": "[dsh - context ...]\n..."}` (block semantics).
+   `a2a_call(agent="dsh", ...)` and observe ① the agent receives the "accepted"
+   receipt within seconds (no more long blocking); ② the conversation receives
+   `Starting execution` → `Thinking...` → `Calling tool ...` → `... done` →
+   `Output complete` → `Done`, and that **dsh executes only once** (the
+   dsh-a2a-server log shows only one task submission); ③ when the task finishes,
+   the conversation receives the "📬 dsh 任务完成，结果如下" result message
+   (header + full text).
 4. redact confirmation: tokens in progress text do not appear in plaintext.
 5. Degradation confirmation: temporarily turn off `collector.enabled` and confirm
    the dsh target only injects origin and runs the original synchronous
@@ -345,10 +362,12 @@ state, high-signal one-by-one sends, redact invocation, two-level sender fallbac
 
 `test_override.py` covers `_on_pre_tool_call`'s single-execution hook branch and
 `_stream_dsh_call`: dsh target (collector on + origin non-empty + message
-non-empty) blocks the final text, streaming failure falls back to origin
-injection, explicit context_id is passed through, non-dsh / collector off /
-a2a_orchestrate / non-messaging surface injects origin only, and
-`_stream_dsh_call` formats the result and raises on missing dsh config.
+non-empty) spawns async and blocks with an "accepted" receipt, spawn failure
+falls back to origin injection, explicit context_id is passed through, non-dsh /
+collector off / a2a_orchestrate / non-messaging surface injects origin only, and
+`_stream_dsh_call` formats the result, result delivery (`_format_result_message`
+three variants / worker swallows exceptions / delivery retries once), and raises
+on missing dsh config.
 
 ## Verification (CLI integration, deferred to window period)
 
@@ -373,21 +392,22 @@ end-to-end verification under the real gateway is deferred to the window period
 - Single execution applies only to the dsh target of `a2a_call`;
   `a2a_orchestrate` still runs the original handler (no live output), but the
   pre_tool_call origin injection applies to it as well.
-- Single execution sends the streaming request synchronously inside the
-  `pre_tool_call` hook (blocking that tool-call path, not freezing the gateway
-  main loop); routing info is derived from origin (not re-reading the ContextVar).
-  Live sending goes through `consumer.make_sender`, which uses
-  `safe_schedule_threadsafe` to schedule across threads onto the gateway main
-  loop, avoiding a new loop that would cause cross-thread failure.
+- Single execution returns instantly from the `pre_tool_call` hook: a background
+  daemon thread sends the streaming request (not blocking that tool-call path,
+  not freezing the gateway main loop, and never touching the framework's 30 s
+  hook-callback cap); routing info is derived from origin (not re-reading the
+  ContextVar). Both live and result sending go through `consumer.make_sender`,
+  which uses `safe_schedule_threadsafe` to schedule across threads onto the
+  gateway main loop, avoiding a new loop that would cause cross-thread failure.
 - Trigger condition: a dsh target is judged by `a2a_call`'s `agent=="dsh"` or its
   URL; non-dsh targets are not blocked, only inject origin, and do not trigger
   streaming.
-- On streaming failure / missing dsh config, fall back to origin-injection only;
-  the task still executes once via the original synchronous `a2a_call`
+- On spawn failure / missing dsh config, fall back to origin-injection only; the
+  task still executes once via the original synchronous `a2a_call`
   (functionality preserved), just without live output.
-- block semantics: the single-execution result is returned via `{"error": ...}`
-  (the model can read the full text); this is a known trade-off (see the "block
-  semantics" section).
+- Receipt and result are separate: the "accepted" receipt is returned via
+  `{"error": ...}` (instantly); the final result travels the delivery path back
+  to the messaging surface (see the "Receipt & result delivery" section).
 
 ## Known Issues (observation items, watch but do not fix)
 

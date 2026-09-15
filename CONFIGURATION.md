@@ -1,9 +1,10 @@
 # hermes-a2a-bridge 配置与机制说明
 
-> 状态：**P2c-fix — pre_tool_call hook 单执行，双执行已消除**。P2b 的 origin→contextId
-> 注入保留；P2c 直播消费者改在 `pre_tool_call` hook 内对 dsh 目标只发**一条**
-> `SendStreamingMessage`，边消费 SSE 流边把中间进度推回飞书 / QQ（`collector.enabled`
-> 门控，默认关），随后以 block 语义把流末尾最终文本回传 agent——任务只跑一遍。
+> 状态：**P2c-fix — pre_tool_call hook 单执行（异步版），双执行已消除**。P2b 的
+> origin→contextId 注入保留；P2c 直播消费者改在 `pre_tool_call` hook 内对 dsh 目标
+> 只发**一条** `SendStreamingMessage`：hook 秒回「已受理」回执，任务在后台线程边消费
+> SSE 流边把中间进度推回飞书 / QQ（`collector.enabled` 门控，默认关），结束时把最终
+> 结果以普通消息主动送达消息面——任务只跑一遍，「完成」之后不静默。
 > override 方案（`register_tool(override=True)`）因注册机制在真实 gateway 不可靠已弃用。
 
 ## 行为
@@ -117,22 +118,30 @@ dsh 侧由 `dsh-a2a-server` 库（`ArtomYuan/dsh-a2a-server`）暴露 A2A server
 gateway 里不可靠（a2a 平台 deferred load 二次 register_tools 会把 override 覆写回原
 handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行**：
 
-- **dsh 目标单执行**：`pre_tool_call` hook 内同步调 `_stream_dsh_call`，只发**一条**
-  `SendStreamingMessage`，边消费 SSE 事件边把中间进度渲染推回飞书 / QQ（直播，
-  `collector.enabled` 门控、默认关），随后以 `{"action": "block", "message": 结果}`
-  阻止原 `a2a_call` 执行，结果文本经 block 语义回传（见下）。
+- **dsh 目标单执行（异步）**：`pre_tool_call` hook 立即 spawn 后台 daemon 线程跑
+  `_stream_dsh_call`（只发**一条** `SendStreamingMessage`，边消费 SSE 事件边把中间
+  进度渲染推回飞书 / QQ；`collector.enabled` 门控、默认关），并当即以
+  `{"action": "block", "message": 受理回执}` 阻止原 `a2a_call` 执行。任务结束时把
+  最终结果以普通消息主动送达消息面（见「受理回执与结果送达」）。hook 回调秒回——
+  框架 hook 回调有 30 秒上限，同步等待长任务会触发超时 fail-closed 并连锁跳过其它
+  工具调用，异步化即为此修复。
 - **非 dsh 目标**（如 `agent="ivan"`）：不 block，仅注入 origin，走原 `SendMessage`
   完整逻辑（security.audit / persist_message / metrics / redact）。
 - **降级回退**：dsh 目标但缺 url / message、或流式失败（网络 / SSE 解析异常）时，
   退化为仅注入 origin，原 `a2a_call` 走同步 `SendMessage`，功能不丢（无直播但
   **无双执行**）。
 
-### block 语义（已知取舍）
+### 受理回执与结果送达
 
 `pre_tool_call` hook 返回 `{"action": "block", "message": M}` 后，框架把 `M` 变成工具
 结果 `{"error": M}`（`agent/tool_executor.py` `json.dumps({"error": block_message})`）。
-模型能读到 `error` 字段里的完整最终文本，只是结果被包在 error 字段而非普通文本字段。
-这是本方案的已知取舍，已接受并在此注明。
+异步版中 `M` 是「已受理」回执（含 origin 与「结果将自动送达」提示）——最终文本不再
+走这条通道（同步回传在长任务下必然超时，见上方修复说明）。
+
+最终结果走独立通道：任务完成时 `_stream_dsh_call` 调 `_deliver_final_result`，把
+`📬 **dsh 任务完成，结果如下**（用时 …）` 头行 + 结果全文以**普通消息**（纯文本分块，
+`make_sender(code_blocks=False)`）送达消息面；失败重试一次后仅记 warning——「完成」
+之后不静默。
 
 ### 启用方式（collector 直播门控）
 
@@ -216,7 +225,7 @@ a2a_call（pre_tool_call hook）
    │
    ├─ 非 dsh / collector 关 / 非消息面 ─► 仅注入 origin ─► 原 handler（SendMessage）
    │
-   └─ dsh 目标 + collector 开 ─► _stream_dsh_call ─► SendStreamingMessage（仅一条）
+   └─ dsh 目标 + collector 开 ─► hook 秒回「已受理」＋后台线程 _stream_dsh_call ─► SendStreamingMessage（仅一条）
                         │                        └─► dsh SSE 事件流
                         │
               parse_sse_lines（data: JSON 逐行）
@@ -231,8 +240,8 @@ a2a_call（pre_tool_call hook）
                         │
               ┌─ sender（collector.enabled 时真发送飞书/QQ；否则 noop）
               │
-              └─ stats.final_text → 格式化结果 ─► block 语义回传 agent
-                        （[dsh · context … · state]，经 {"error": ...}）
+              └─ stats.final_text → 结果消息（📬 头行 + 全文，纯文本分块）─► 主动送达消息面
+                        （「完成」之后不静默；block 回执仅含「已受理」）
 ```
 
 ### T0 行语言映射
@@ -265,10 +274,11 @@ a2a_call（pre_tool_call hook）
    `collector.enabled` 读取报错。
 2. 配置确认：`collector.enabled: true` 已写入
    `plugins.entries.hermes-a2a-bridge.settings`。
-3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察对话是否
-   收到 `🚀 开始执行` → `🧠 思考中…` → `🔧 调用工具 …` → `📋 … 完成` → `📖 输出完成`
+3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察 ①agent
+   立即（秒级）收到「已受理」回执、不再长阻塞；②对话收到
+   `🚀 开始执行` → `🧠 思考中…` → `🔧 调用工具 …` → `📋 … 完成` → `📖 输出完成`
    → `✅ 完成`，且 **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
-   同时确认 agent 收到 `{"error": "[dsh · context …]\\n…"}` 形式的最终结果（block 语义）。
+   ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 全文）。
 4. redact 确认：进度文本中的 token 不落明文。
 5. 降级确认：临时把 `collector.enabled` 关掉，确认 dsh 目标仅注入 origin、走原同步
    `a2a_call`（无直播、无双执行）。
@@ -289,9 +299,11 @@ python3 tests/test_override.py
 回退（无 gateway → `no_gateway`）、异常事件不崩，并输出「事件序列 → 渲染消息样例」对照表。
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
-dsh 目标（collector 开 + origin 非空 + message 非空）block 最终文本、流式失败回退注入
-origin、显式 context_id 放行、非 dsh / collector 关 / a2a_orchestrate / 非消息面仅注入
-origin，以及 `_stream_dsh_call` 格式化结果与缺 dsh 配置抛错。
+dsh 目标（collector 开 + origin 非空 + message 非空）异步 spawn + 受理回执回传、
+spawn 失败回退注入 origin、显式 context_id 放行、非 dsh / collector 关 /
+a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格式化结果、
+结果送达（`_format_result_message` 三态 / worker 吞异常 / 送达重试一次）与缺 dsh
+配置抛错。
 
 ## 验证（CLI 集成，留窗口期）
 
@@ -310,16 +322,17 @@ gateway 生效需重启（见「启用」）。本阶段不重启；真实 gatew
   需同步修改 `__init__.py` 的 `_TARGET_TOOLS`。
 - 单执行只作用于 `a2a_call` 的 dsh 目标；`a2a_orchestrate` 仍走原 handler（无直播），
   但 pre_tool_call 的 origin 注入同样适用于它。
-- 单执行在 `pre_tool_call` hook 内同步发流式请求（阻塞该工具调用路径，不冻结 gateway
-  主 loop）；路由信息从 origin 派生（不重读 ContextVar）。直播发送走
+- 单执行在 `pre_tool_call` hook 内**秒回**：spawn 后台 daemon 线程发流式请求（不阻塞
+  工具调用路径、不冻结 gateway 主 loop，也不会触及框架 hook 回调的 30 秒上限）；
+  路由信息从 origin 派生（不重读 ContextVar）。直播与结果发送都走
   `consumer.make_sender`，用 `safe_schedule_threadsafe` 跨线程调度到 gateway 主 loop，
   不会起新 loop 导致跨线程失败。
 - 触发条件：dsh 目标判定为 `a2a_call` 的 `agent=="dsh"` 或其 URL；非 dsh 目标不
   block，仅注入 origin，不触发流式。
-- 流式失败 / 缺 dsh 配置时回退为仅注入 origin，任务仍会经原同步 `a2a_call` 执行一次
-  （功能不丢），只是无直播。
-- block 语义：单执行的结果经 `{"error": ...}` 回传（模型可读到完整文本），这是已知
-  取舍（见「block 语义」章节）。
+- spawn 失败 / 缺 dsh 配置时回退为仅注入 origin，任务仍会经原同步 `a2a_call` 执行一
+  次（功能不丢），只是无直播。
+- 回执与结果分开：受理回执经 `{"error": ...}` 回传（秒回）；最终结果经结果送达通道
+  主动推回消息面（见「受理回执与结果送达」章节）。
 
 ## Known Issues（观察项，待观察不修）
 

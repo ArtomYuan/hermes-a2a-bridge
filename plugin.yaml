@@ -1,5 +1,5 @@
 name: hermes-a2a-bridge
-version: "0.1.0"
+version: "0.1.1"
 description: "Hermes-side bridge to the dsh A2A server: injects a stable origin token as context_id into a2a_call/a2a_orchestrate (P2b); P2c live-stream consumer (collector.enabled gated, default off) relays dsh progress events to Feishu/QQ"
 kind: standalone
 hooks:

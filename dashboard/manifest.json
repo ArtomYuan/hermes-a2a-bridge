@@ -1,0 +1,15 @@
+{
+  "name": "hermes-a2a-bridge",
+  "label": "A2A 直播开关",
+  "description": "A2A live switches — collector.enabled / events / code_blocks 可视化开关；保存即时生效（热读），无需重启网关",
+  "icon": "Settings",
+  "version": "0.2.0",
+  "tab": {
+    "path": "/hermes-a2a-bridge",
+    "hidden": true
+  },
+  "slots": ["plugins:top"],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "api.py"
+}

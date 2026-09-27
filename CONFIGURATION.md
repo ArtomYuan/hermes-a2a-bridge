@@ -145,7 +145,9 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
 
 ### 启用方式（collector 直播门控）
 
-直播发送默认**关**，开启（重启 Hermes 网关生效）：
+直播发送默认**关**。开启方式：Hermes Dashboard「插件管理」页顶部的
+「A2A 直播开关」面板点选（见下文「Dashboard 可视化开关」），或手改
+`~/.hermes/config.yaml`：
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -157,10 +159,8 @@ plugins:
           enabled: true           # 直播发送门控
 ```
 
-```bash
-# 示例：systemd 用户级服务
-systemctl --user restart hermes-gateway
-```
+> 三个 collector 开关均为**热读**：保存（Dashboard 点选或手改 config.yaml）后
+> **即时生效，无需重启网关**——与「插件加载需重启」不同（见上文「启用」节）。
 
 `collector.enabled` 缺省 / 显式 `false` 时，dsh 目标**不走单执行分支**，`pre_tool_call`
 仅注入 origin，原 `a2a_call` 走同步 `SendMessage`（无直播、无双执行）；非 dsh 目标不受
@@ -217,6 +217,27 @@ plugins:
   （不刷屏）。完成卡仍可含代码框，由 `code_blocks` 控制样式（两键正交）。
 
 未配置时保持 `true`，向后兼容已部署副本的现有行为。
+
+### Dashboard 可视化开关（即时生效）
+
+本插件自带 Dashboard 扩展面：插件管理页（9120「插件管理」）顶部显示
+「A2A 直播开关 / A2A live switches」卡片，三个开关（直播总开关 / 中间事件推送 /
+代码框渲染）可直接点选，保存**即时生效（无需重启网关）**——三开关在每次
+hook / 流式任务开始时热读 `ctx.get_config`（Hermes 配置读取按文件 mtime 签名
+缓存，改 config.yaml 后自动感知）。
+
+后端端点（挂在 dashboard 进程，与 gateway 解耦）：
+
+- `GET /api/plugins/hermes-a2a-bridge/collector` — 三开关当前值与默认值元数据
+  （**不返回任何密钥**）。
+- `POST /api/plugins/hermes-a2a-bridge/collector` — 严格校验（只接受布尔、拒绝
+  多余键）后原子写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`；
+  写回保留条目顶层 `allow_tool_override` 与文件中其它所有键。失败返回 4xx/5xx
+  与明确 detail，不静默吞。
+
+部署注意：dashboard 插件后端路由与前端面板的发现都是一次性的——**升级插件后
+需重启一次 Hermes dashboard 进程**（或触发插件重扫）面板与 API 才会出现；
+gateway 侧开关热读无需任何重启。
 
 ### 数据流链路
 
@@ -280,8 +301,14 @@ a2a_call（pre_tool_call hook）
    → `✅ 完成`，且 **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
    ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 全文）。
 4. redact 确认：进度文本中的 token 不落明文。
-5. 降级确认：临时把 `collector.enabled` 关掉，确认 dsh 目标仅注入 origin、走原同步
-   `a2a_call`（无直播、无双执行）。
+5. 降级确认：临时把 `collector.enabled` 关掉（Dashboard 面板点选或改 config），
+   确认 dsh 目标仅注入 origin、走原同步 `a2a_call`（无直播、无双执行）——且
+   **无需重启网关**（热读即时生效）。
+6. Dashboard 面板确认：插件管理页顶部出现「A2A 直播开关」卡片，三开关与
+   config.yaml 当前值一致；点选改动后 `GET /collector` 与
+   `~/.hermes/config.yaml` 的 `plugins.entries.hermes-a2a-bridge.settings.collector.*`
+   同步变化（条目顶层 `allow_tool_override` 与其它键不丢）。首次部署面板需先重启
+   一次 dashboard 进程（后端路由与插件发现是一次性的）。
 
 ## 单元测试
 
@@ -289,6 +316,8 @@ a2a_call（pre_tool_call hook）
 python3 tests/test_origin_injection.py
 python3 tests/test_consumer.py
 python3 tests/test_override.py
+python3 tests/test_hot_read.py
+python3 tests/test_dashboard_api.py
 ```
 
 `test_origin_injection.py` 覆盖 origin→contextId 注入（纯静态，通过 `sys.modules`
@@ -304,6 +333,18 @@ spawn 失败回退注入 origin、显式 context_id 放行、非 dsh / collector
 a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格式化结果、
 结果送达（`_format_result_message` 三态 / worker 吞异常 / 送达重试一次）与缺 dsh
 配置抛错。
+
+`test_hot_read.py` 覆盖三开关热读改造：`_read_switch` 改 FakeCtx 配置后再次调用
+拿到新值、`_CTX=None` 回退模块级全局、读取抛错回退 default、字符串布尔归一化，
+以及两个读取点（`_on_pre_tool_call` 的 enabled、`_stream_dsh_call` 的
+code_blocks / events）确实随配置变化切换行为、同一任务每键只热读一次、
+register() 写全局不回归。
+
+`test_dashboard_api.py` 覆盖 Dashboard 后端（fake fastapi / hermes_cli）：
+POST body 严格校验（仅布尔 / 拒绝多余键 / 空对象 / 非对象）、collector partial
+嵌套构造、写回姿势（`merge_existing=True` + `preserve_keys` 完整路径 + 损坏
+YAML fail-closed + managed 拒绝 + 失败 fail loud）、读取语义（settings →
+legacy config → 默认）、GET/POST handler 响应只含三键元数据（绝不带密钥）。
 
 ## 验证（CLI 集成，留窗口期）
 

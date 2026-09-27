@@ -187,8 +187,9 @@ silence after "done".
 
 ### Enable method (collector live gating)
 
-Live sending is **off** by default. Enable it (takes effect after a Hermes
-gateway restart):
+Live sending is **off** by default. Enable it from the "A2A live switches" panel
+at the top of the Hermes Dashboard "Plugins" page (see "Dashboard visual
+switches" below), or by editing `~/.hermes/config.yaml`:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -200,10 +201,9 @@ plugins:
           enabled: true           # live-send gate
 ```
 
-```bash
-# Example: user-level systemd service
-systemctl --user restart hermes-gateway
-```
+> All three collector switches are **hot-read**: saving (Dashboard toggle or a
+> manual config.yaml edit) takes effect **immediately — no gateway restart** —
+> unlike loading the plugin itself (see "Enable" above).
 
 When `collector.enabled` is absent / explicitly `false`, the dsh target does
 **not** take the single-execution branch; `pre_tool_call` only injects origin and
@@ -270,6 +270,30 @@ plugins:
   keys are orthogonal).
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
+
+### Dashboard visual switches (instant effect)
+
+This plugin ships a Dashboard extension: the "Plugins" page (port 9120) shows an
+"A2A live switches / A2A 直播开关" card at the top with the three switches (master
+switch / intermediate events / code-block rendering). Toggling any of them takes
+effect **immediately (no gateway restart)** — the three switches are hot-read via
+`ctx.get_config` at the start of every hook / stream task (Hermes' config reader
+caches by file mtime signature and picks up config.yaml changes automatically).
+
+Backend endpoints (mounted in the dashboard process, decoupled from the gateway):
+
+- `GET /api/plugins/hermes-a2a-bridge/collector` — current values + default
+  metadata for the three switches (**never returns any secrets**).
+- `POST /api/plugins/hermes-a2a-bridge/collector` — strict validation (booleans
+  only, unknown keys rejected), then atomically writes back
+  `plugins.entries.hermes-a2a-bridge.settings.collector.*`; the write preserves
+  the entry-level `allow_tool_override` and every other key in the file. Failures
+  return 4xx/5xx with a concrete detail — never silently swallowed.
+
+Deployment note: dashboard plugin discovery and backend route mounting are
+one-shot — **after upgrading the plugin, restart the Hermes dashboard process
+once** (or trigger a plugin rescan) for the panel and API to appear; the
+gateway-side switch hot-read needs no restart at all.
 
 ### Data-flow chain
 
@@ -338,9 +362,17 @@ a2a_call (pre_tool_call hook)
    the conversation receives the "📬 dsh 任务完成，结果如下" result message
    (header + full text).
 4. redact confirmation: tokens in progress text do not appear in plaintext.
-5. Degradation confirmation: temporarily turn off `collector.enabled` and confirm
-   the dsh target only injects origin and runs the original synchronous
-   `a2a_call` (no live output, no double execution).
+5. Degradation confirmation: temporarily turn off `collector.enabled` (Dashboard
+   toggle or a config edit) and confirm the dsh target only injects origin and
+   runs the original synchronous `a2a_call` (no live output, no double execution)
+   — with **no gateway restart** (hot-read takes effect immediately).
+6. Dashboard panel confirmation: the "A2A live switches" card appears at the top
+   of the "Plugins" page with all three switches matching the current
+   config.yaml values; after toggling, `GET /collector` and
+   `plugins.entries.hermes-a2a-bridge.settings.collector.*` in
+   `~/.hermes/config.yaml` change in step (the entry-level `allow_tool_override`
+   and all other keys survive). First deployment needs one dashboard-process
+   restart (backend mounting and plugin discovery are one-shot).
 
 ## Unit tests
 
@@ -348,6 +380,8 @@ a2a_call (pre_tool_call hook)
 python3 tests/test_origin_injection.py
 python3 tests/test_consumer.py
 python3 tests/test_override.py
+python3 tests/test_hot_read.py
+python3 tests/test_dashboard_api.py
 ```
 
 `test_origin_injection.py` covers origin→contextId injection (pure static, injects
@@ -368,6 +402,22 @@ collector off / a2a_orchestrate / non-messaging surface injects origin only, and
 `_stream_dsh_call` formats the result, result delivery (`_format_result_message`
 three variants / worker swallows exceptions / delivery retries once), and raises
 on missing dsh config.
+
+`test_hot_read.py` covers the hot-read rework: `_read_switch` returns the new
+value after changing a FakeCtx's config, falls back to the module-level globals
+when `_CTX is None`, falls back to the passed default when the read raises,
+normalizes string booleans, and proves both read sites (`_on_pre_tool_call`'s
+enabled check, `_stream_dsh_call`'s code_blocks / events) switch behavior with
+the config, read each key only once per task, and keep register()'s global
+writes intact.
+
+`test_dashboard_api.py` covers the Dashboard backend (fake fastapi /
+hermes_cli): strict POST body validation (booleans only / unknown keys / empty /
+non-object rejected), collector-partial nesting, the write posture
+(`merge_existing=True` + full-path `preserve_keys` + fail-closed on corrupt YAML
++ managed rejection + fail-loud on write errors), read semantics (settings →
+legacy config → defaults), and GET/POST handler responses containing only the
+three-key metadata (never any secrets).
 
 ## Verification (CLI integration, deferred to window period)
 

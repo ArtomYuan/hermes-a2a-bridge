@@ -1,0 +1,74 @@
+/* hermes-a2a-bridge dashboard panel styles (h2ab- prefixed to avoid host collisions) */
+
+.h2ab-card {
+  width: 100%;
+}
+
+.h2ab-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.h2ab-subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  opacity: 0.72;
+}
+
+.h2ab-hot-badge {
+  white-space: normal;
+  text-align: right;
+}
+
+.h2ab-switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+}
+
+.h2ab-switch-row + .h2ab-switch-row {
+  border-top: 1px solid rgba(128, 128, 128, 0.18);
+}
+
+.h2ab-switch-row > input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.h2ab-switch-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.h2ab-switch-label {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.h2ab-switch-desc {
+  font-size: 12px;
+  opacity: 0.72;
+  margin-top: 2px;
+  overflow-wrap: break-word;
+}
+
+.h2ab-loading {
+  font-size: 12px;
+  opacity: 0.72;
+}
+
+.h2ab-error {
+  color: #dc2626;
+  font-size: 12px;
+  margin-bottom: 8px;
+  overflow-wrap: break-word;
+}
+
+.h2ab-saved {
+  color: #16a34a;
+  font-size: 12px;
+  margin-top: 8px;
+}

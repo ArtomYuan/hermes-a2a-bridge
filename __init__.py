@@ -75,17 +75,26 @@ _TARGET_TOOLS = frozenset(
     }
 )
 
-# P2c 直播消费者门控状态：register() 读 ``collector.enabled``（默认关）后写入；
+# P2c 直播消费者门控状态：register() 读 ``collector.enabled``（默认关）后写入全局，
+# 作为初始值与无 ``_CTX``（单测/直跑）时的回退值；运行期读取点经 ``_read_switch``
+# 热读（每次 hook/任务都问 ``_CTX.get_config``，Dashboard 改配置即时生效）。
 # ``_CTX`` 保存插件 ctx 引用传给 ``make_sender(_CTX)``（仅为签名兼容，实际发送不再走
 # dispatch_tool，而经 gateway 主 loop 调度 adapter）。
 _COLLECTOR_ENABLED = False
-# 代码框渲染开关：register() 读 ``collector.code_blocks``（默认 true）后写入；
-# false 时直播内容回退纯文本行（不包围栏）。
+# 代码框渲染开关：register() 读 ``collector.code_blocks``（默认 true）后写入全局；
+# false 时直播内容回退纯文本行（不包围栏）。运行期同样经 ``_read_switch`` 热读。
 _CODE_BLOCKS = True
-# 事件流开关：register() 读 ``collector.events``（默认 true）后写入；
-# false 时安静模式只推最终结果（中间事件不推）。
+# 事件流开关：register() 读 ``collector.events``（默认 true）后写入全局；
+# false 时安静模式只推最终结果（中间事件不推）。运行期同样经 ``_read_switch`` 热读。
 _EVENTS = True
 _CTX: Optional[Any] = None
+
+# ``_read_switch`` 无 ``_CTX`` 回退时用的全局名映射（键 → 模块级全局变量名）。
+_SWITCH_GLOBAL_BY_KEY = {
+    "collector.enabled": "_COLLECTOR_ENABLED",
+    "collector.code_blocks": "_CODE_BLOCKS",
+    "collector.events": "_EVENTS",
+}
 # consumer 模块缓存（惰性 import，见 _import_consumer）。
 _CONSUMER_MODULE: Optional[Any] = None
 
@@ -98,6 +107,23 @@ def _to_bool(value: Any) -> bool:
         return False
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "on", "enabled"}
+
+
+def _read_switch(key: str, default: bool) -> bool:
+    """热读一个 collector 开关（Dashboard 改 config 后即时生效，无需重启网关）。
+
+    优先 ``_CTX.get_config(key, default)``——Hermes 的 config 读取按
+    ``(mtime_ns, size)`` 签名缓存，每次调用都感知 config.yaml 变更（官方热读通道）。
+    ``_CTX`` 为 None（单测 / 直跑）时回退模块级全局（register() 固化值 / 测试后门）；
+    读取抛错回退传入的 ``default``，绝不阻断工具调用。
+    """
+    if _CTX is not None:
+        try:
+            return _to_bool(_CTX.get_config(key, default))
+        except Exception as exc:  # 读配置失败不阻断工具调用
+            logger.warning("hermes-a2a-bridge: hot-read %s failed: %s", key, exc)
+            return bool(default)
+    return bool(globals().get(_SWITCH_GLOBAL_BY_KEY.get(key, ""), default))
 
 
 def _clean_segment(seg: str) -> str:
@@ -234,9 +260,13 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     thread_id = parts[2] if len(parts) > 2 else ""
 
     consumer = _import_consumer()
+    # 热读渲染/事件两开关（本任务开始时各读一次，任务中途改配置不影响进行中任务，
+    # 与历史语义一致）。enabled 总开关在 hook 入口已热读。
+    code_blocks = _read_switch("collector.code_blocks", True)
+    events = _read_switch("collector.events", True)
     # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
     sender = (
-        consumer.make_sender(_CTX, code_blocks=_CODE_BLOCKS)
+        consumer.make_sender(_CTX, code_blocks=code_blocks)
         if (platform and chat_id)
         else lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
     )
@@ -260,8 +290,8 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         sender=sender,
         min_interval=2.0,
         timeout=timeout,
-        code_blocks=_CODE_BLOCKS,
-        events=_EVENTS,
+        code_blocks=code_blocks,
+        events=events,
     )
     logger.info(
         "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
@@ -394,9 +424,10 @@ def _on_pre_tool_call(
     origin = _build_origin()
 
     # 单执行：a2a_call 目标 dsh + collector 开 + messaging 面（origin 非空）。
+    # collector.enabled 热读：Dashboard 改配置后下一次工具调用即生效。
     if (
         tool_name == "a2a_call"
-        and _COLLECTOR_ENABLED
+        and _read_switch("collector.enabled", False)
         and origin
         and _is_dsh_agent(
             str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
@@ -446,7 +477,11 @@ def _on_post_tool_call(
 
 
 def register(ctx) -> None:
-    """插件入口：读 collector 门控、注册 pre/post 钩子（单执行走 pre_tool_call hook）。"""
+    """插件入口：读 collector 门控、注册 pre/post 钩子（单执行走 pre_tool_call hook）。
+
+    三开关仍在此读一次写入模块级全局（作为初始值 / ``_CTX=None`` 时的回退值）；
+    运行期读取点已改热读（``_read_switch``），此处的值不再固化生效。
+    """
     global _COLLECTOR_ENABLED, _CODE_BLOCKS, _EVENTS, _CTX
     _CTX = ctx
     try:

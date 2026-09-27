@@ -7,7 +7,30 @@
 
 ## [Unreleased]
 
-（暂无未发布变更）
+### Added
+
+- Dashboard 扩展面：插件管理页顶部「A2A 直播开关 / A2A live switches」卡片
+  （`dashboard/manifest.json` + 手写 IIFE 前端 + `dashboard/api.py` 后端），三个
+  开关（直播总开关 / 中间事件推送 / 代码框渲染）可视化点选；后端
+  `GET/POST /api/plugins/hermes-a2a-bridge/collector` 严格校验（只接受布尔、
+  拒绝多余键）后写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`，
+  保留条目顶层 `allow_tool_override` 与其它所有键；面板同时注册隐藏路由
+  `/hermes-a2a-bridge` 兜底，双语文案跟随页面语言。
+- 三开关热读：读取点改为每次调用 `ctx.get_config`（Hermes 配置读取按文件 mtime
+  签名缓存），Dashboard 点选或改 config.yaml 后**即时生效，无需重启网关**；
+  模块级全局保留为默认值 / 单测回退值。
+
+### Changed
+
+- CONFIGURATION / README「直播消费者」节更新为「可在 Dashboard 改，改后即时
+  生效（热读）」，并补充 Dashboard 面板部署注意（升级后需重启一次 dashboard
+  进程）。
+
+### Tested
+
+- 单元测试 118 项：`test_consumer` 58、`test_origin_injection` 12、
+  `test_override` 17、`test_hot_read` 8（热读）、`test_dashboard_api` 23
+  （后端校验与写回）。
 
 ## [0.1.1] - 2026-09-15
 

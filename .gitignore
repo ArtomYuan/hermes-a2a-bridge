@@ -3,6 +3,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+# Dashboard 前端产物必须随库分发（宿主直接 serve 插件目录，无构建步骤）。
+!dashboard/dist/
+!dashboard/dist/*
 lib/
 node_modules/
 .venv/

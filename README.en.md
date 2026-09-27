@@ -57,7 +57,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 Code-block rendering and intermediate-event push are both configurable
 (`collector.code_blocks` for code-block style, `collector.events` for the event
-stream; both on by default) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
+stream; both on by default), and can be toggled from the "A2A live switches"
+panel on the Dashboard "Plugins" page (instant effect) — see
+[CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ## Architecture
 
@@ -108,6 +110,19 @@ hard-bound; combine them as needed:
    # Example: user-level systemd service
    systemctl --user restart hermes-gateway
    ```
+
+## Live switches (Dashboard, instant effect)
+
+Once the plugin is loaded, the three live-stream switches — `collector.enabled`
+(master switch) / `collector.events` (intermediate events) / `collector.code_blocks`
+(code-block rendering) — can be toggled directly from the "A2A live switches"
+panel at the top of the Hermes Dashboard "Plugins" page; saving takes effect
+**immediately (no gateway restart — hot read)**. The backend endpoints
+`GET/POST /api/plugins/hermes-a2a-bridge/collector` strictly validate and write
+back `plugins.entries.hermes-a2a-bridge.settings.collector.*` (preserving the
+entry-level `allow_tool_override` and all other keys). First deployment needs one
+dashboard-process restart for the panel to appear.
+See [CONFIGURATION.en.md](CONFIGURATION.en.md), "Live consumer".
 
 ## Links
 

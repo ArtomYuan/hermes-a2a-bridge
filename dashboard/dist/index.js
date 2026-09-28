@@ -179,6 +179,11 @@
       return h("div", {
         key: meta.key,
         className: "h2ab-switch-row",
+        // Stable hooks for isolated end-to-end verification (CDP) and for
+        // users of assistive tech: the row names the switch and its state.
+        "data-testid": "a2a-bridge-switch-" + meta.key,
+        "data-key": meta.key,
+        "data-checked": checked ? "true" : "false",
       }, h("div", { className: "h2ab-switch-info" },
         h("div", { className: "h2ab-switch-label" }, t[meta.label]),
         h("div", { className: "h2ab-switch-desc" }, t[meta.desc])),
@@ -196,11 +201,15 @@
           h("p", { className: "h2ab-subtitle" }, t.subtitle)),
         h(Badge, { className: "h2ab-hot-badge" }, t.hotBadge)),
       h(CardContent, null,
-        error ? h("div", { className: "h2ab-error" }, error) : null,
-        values === null ? h("div", { className: "h2ab-loading" },
-          t.loading + (saving ? " " + t.saving : "")) : rows,
-        saving ? h("div", { className: "h2ab-loading" }, t.saving) : null,
-        saved ? h("div", { className: "h2ab-saved" }, t.saved) : null),
+        h("div", {
+          "data-testid": "a2a-bridge-panel",
+          "data-state": values === null ? "loading" : "ready",
+        },
+          error ? h("div", { className: "h2ab-error" }, error) : null,
+          values === null ? h("div", { className: "h2ab-loading" },
+            t.loading + (saving ? " " + t.saving : "")) : rows,
+          saving ? h("div", { className: "h2ab-loading" }, t.saving) : null,
+          saved ? h("div", { className: "h2ab-saved" }, t.saved) : null)),
       Toast ? h(Toast, { toast: toast }) : null);
   }
 

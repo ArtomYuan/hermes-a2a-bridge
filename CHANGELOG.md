@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-29
+
 ### Added
 
 - Dashboard 扩展面：插件管理页顶部「A2A 直播开关 / A2A live switches」卡片

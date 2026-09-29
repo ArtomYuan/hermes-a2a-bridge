@@ -467,23 +467,27 @@ class RenderLineCodeBlocksTest(unittest.TestCase):
 
 
 class RenderLineContentTest(unittest.TestCase):
-    """content 开关：false 时 text/thinking → None、tool_result 只留完成标记，
-    其余（起止标记 / 工具调用）照常；默认（True）与现状等价。"""
+    """content 开关：false 只关闭「操作内细节」（tool_call 参数 / tool_result 输出），
+    **操作流照常**——text（含 final）与 thinking 与 True 同款渲染。"""
 
     def test_default_content_is_true(self):
         self.assertIs(consumer.DEFAULT_CONTENT, True)
 
-    def test_content_false_text_returns_none(self):
-        self.assertIsNone(
-            consumer.render_line({"type": "text", "text": "正文", "final": False}, content=False)
+    def test_content_false_keeps_narrative_text(self):
+        # 操作流不受影响：叙述文本与 content=true 同款渲染。
+        self.assertEqual(
+            consumer.render_line({"type": "text", "text": "正文", "final": False}, content=False),
+            consumer.render_line({"type": "text", "text": "正文", "final": False}, content=True),
         )
-        self.assertIsNone(
-            consumer.render_line({"type": "text", "text": "最终结果", "final": True}, content=False)
+        self.assertEqual(
+            consumer.render_line({"type": "text", "text": "最终结果", "final": True}, content=False),
+            "📖 输出完成",
         )
 
-    def test_content_false_thinking_returns_none(self):
-        self.assertIsNone(
-            consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False)
+    def test_content_false_keeps_thinking(self):
+        self.assertEqual(
+            consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False),
+            "🧠 思考中…",
         )
 
     def test_content_false_tool_result_marker_only(self):
@@ -891,36 +895,41 @@ class ConsumeStreamContentTest(unittest.TestCase):
         stats = consumer.consume_stream(**kw)
         return stats, sent
 
-    def test_content_false_tool_calls_only(self):
+    def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
-        # 混合事件流（turn_start 类标记不在该序列 / tool_call + tool_result +
-        # 非 final text + final text + thinking + 终态 status）在 content=false
-        # 下只产出工具名条目与完成标记。
+        # content=false 只收窄「操作内细节」：tool_call 无参数、tool_result 无输出；
+        # 操作流（🧠 thinking / 📖 叙述 / 📖 最终）+ 起止标记 ✅ 与 content=true 一致。
         self.assertEqual(
             sent,
             [
+                "🧠 思考中…",
                 "🔧 `shell_exec`",
                 "📋 `shell_exec` 完成",
+                "📖 正在查看当前目录…",
+                "📖 输出完成",
                 "✅ 完成",
             ],
         )
-        # 不出现正文 / 输出文本 / 工具参数，不出现 📖 行、🧠 行与代码框。
+        # 细节不泄露：不出现工具参数 / 输出正文 / 任何代码框。
         for line in sent:
-            self.assertNotIn("📖", line)
-            self.assertNotIn("🧠", line)
-            self.assertNotIn("正在查看", line)
+            self.assertNotIn("ls\n", line)
             self.assertNotIn("total 4", line)
-            self.assertNotIn("目录下", line)
+            self.assertNotIn("file1.txt", line)
             self.assertNotIn("```", line)
+        # 与 content=true 的唯一差异就是被收窄的那两行。
+        self.assertEqual(len(sent), len(_EXPECTED_SENT))
+        self.assertEqual(
+            [line for line in sent if "🔧" in line or "📋" in line],
+            ["🔧 `shell_exec`", "📋 `shell_exec` 完成"],
+        )
         # stats 完整性不变：final_text / events_seen / states 仍完整统计。
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
-        self.assertEqual(stats["messages_sent"], 3)
+        self.assertEqual(stats["messages_sent"], 6)
 
-    def test_content_false_turn_end_does_not_flush_book(self):
-        # 非 final text 被 content 门跳过（不喂 Throttler）→ turn_end / 终态
-        # flush 不产生 📖 聚合行。
+    def test_content_false_turn_end_flushes_narrative(self):
+        # 非 final text 仍被喂入 Throttler（操作流不关）→ turn_end 正常 flush 成 📖 行。
         results = [
             {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
             _artifact_update([_text_part("中间正文一")], last_chunk=False),
@@ -941,7 +950,7 @@ class ConsumeStreamContentTest(unittest.TestCase):
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
             min_interval=0.0, content=False,
         )
-        self.assertEqual(sent, ["✅ 完成"])
+        self.assertEqual(sent, ["📖 中间正文一 中间正文二", "✅ 完成"])
         self.assertEqual(stats["final_text"], "")
         self.assertEqual(stats["events_seen"], 5)
 
@@ -957,7 +966,7 @@ class ConsumeStreamContentTest(unittest.TestCase):
         results = [
             {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
             _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
-            _artifact_update([_data_part({"kind": "thinking", "turn": 1, "text": "思考"})], last_chunk=False),
+            _artifact_update([_data_part({"kind": "thinking", "turn": 1, "text": "内部推理线索ALPHA"})], last_chunk=False),
             _artifact_update([_data_part({"kind": "tool_call", "turn": 1, "name": "shell_exec", "arguments": "ls /tmp"})], last_chunk=False),
             _artifact_update([_data_part({"kind": "tool_result", "turn": 1, "name": "shell_exec", "text": "输出正文 file1.txt"})], last_chunk=False),
             _artifact_update([_text_part("中间叙述正文")], last_chunk=False),
@@ -978,30 +987,31 @@ class ConsumeStreamContentTest(unittest.TestCase):
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
             min_interval=0.0, content=False,
         )
+        # 操作流保留：🧠 thinking、📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；
+        # 只有工具调用的参数与工具输出正文被收窄掉。
         self.assertEqual(
             sent,
             [
                 "🚀 第 1 轮",
+                "🧠 思考中…",
                 "🔧 `shell_exec`",
                 "📋 `shell_exec` 完成",
+                "📖 输出完成",
+                "📖 中间叙述正文",
                 "✅ 完成",
             ],
         )
         for line in sent:
-            self.assertNotIn("📖", line)
-            self.assertNotIn("🧠", line)
-            self.assertNotIn("思考", line)
-            self.assertNotIn("叙述", line)
-            self.assertNotIn("结果", line)
-            self.assertNotIn("file1.txt", line)
-            # content=false：工具调用只留工具名，不带参数 / 命令正文。
+            # 细节（参数 / 输出 / 思考全文）不出现。
             self.assertNotIn("ls /tmp", line)
+            self.assertNotIn("file1.txt", line)
+            self.assertNotIn("内部推理线索ALPHA", line)
             self.assertNotIn("```", line)
         # stats 完整：final_text 仍记录（📬 送达依赖它）。
         self.assertEqual(stats["final_text"], "最终结果正文")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "completed"])
-        self.assertEqual(stats["messages_sent"], 4)
+        self.assertEqual(stats["messages_sent"], 7)
 
 
 class SplitFencedChunksTest(unittest.TestCase):

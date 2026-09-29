@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 内容开关边界修正（管理员最终澄清）：`content=false` 只关闭**操作内详细信息**
+  （工具调用的参数 / 命令正文、工具输出正文），**不再关闭操作流**——`text`
+  （叙述 / 说明，含 final）与 `thinking` 恢复渲染，与 `content=true` 同款；
+  `tool_call` 只留工具名、`tool_result` 只留完成标记的收窄保持不变。受理回执、
+  📬 最终结果送达、起止标记与 stats 完整性均不变。
+
 ### Fixed
 
 - 内容开关口径修正（管理员澄清）：`content=false` 时工具调用**只显示工具名**

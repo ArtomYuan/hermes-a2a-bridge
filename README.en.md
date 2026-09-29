@@ -56,8 +56,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 > Actual rendering depends on each gateway's client.
 
 Content display and intermediate-event push are both configurable
-(`collector.content` for content display — off hides tool output and narrative,
-leaving tool calls only; `collector.events` for the event stream; both on by
+(`collector.content` for operation details — off keeps the tool name and the
+completion marker only, hiding arguments and output bodies, while narrative and
+thinking stay visible; `collector.events` for the event stream; both on by
 default. Code-block rendering stays as the internal style when content is shown
 and is no longer a standalone switch), and can be toggled from the "A2A live
 switches" panel on the Dashboard "Plugins" page (instant effect) — see
@@ -117,7 +118,8 @@ hard-bound; combine them as needed:
 
 Once the plugin is loaded, the three live-stream switches — `collector.enabled`
 (master switch) / `collector.events` (intermediate events) / `collector.content`
-(content display; off → tool calls only, hiding tool output and narrative) — can
+(content display; off → hides tool-call arguments and tool output bodies, leaving
+tool name and completion marker only; narrative and thinking are unaffected) — can
 be toggled directly from the "A2A live switches" panel at the top of the Hermes
 Dashboard "Plugins" page; saving takes effect **immediately (no gateway restart
 — hot read)**. The backend endpoints

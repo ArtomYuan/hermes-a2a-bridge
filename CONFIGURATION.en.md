@@ -231,27 +231,27 @@ plugins:
           content: true        # default true: full live display (tool calls + output + narrative)
 ```
 
-Semantics (orthogonal to `events`; the two keys compose independently):
+Semantics: `content` closes **operation details only; the operation flow stays** (orthogonal to `events`).
 
 | Event type | `content: true` (default) | `content: false` |
 | --- | --- | --- |
-| `turn_start` (🚀 turn N) | current behavior | kept (progress marker, not content) |
+| `turn_start` (🚀 turn N) | current behavior | kept (operation-flow marker) |
 | `tool_call` (🔧 tool name + args) | current behavior (name + argument code block) | **tool name only** `🔧 \`name\`` (**no arguments / command body**, hence no code block) |
 | `tool_result` (📋) | current behavior (with output body) | completion marker only: `📋 \`name\` 完成` (no output body) |
-| `text` (incl. `final`) | current behavior | not pushed (agent narrative hidden) |
-| `thinking` | current behavior | not pushed |
+| `text` (incl. `final`, narrative) | current behavior | **kept** (operation flow, rendered exactly as with `true`) |
+| `thinking` | current behavior | **kept** (operation flow, rendered as `🧠 思考中…`) |
 | `status` terminal (✅/❌/⚠️) | current behavior | kept (start/end markers) |
 | `turn_end` | current behavior (renders None) | current behavior |
 
 - **When it takes effect**: same level as `events` — hot-read once at the start
   of each stream task; changing it mid-task does not affect the running task;
   the next task picks up the new value immediately (no gateway restart).
-- **Stats stay complete**: `content: false` only suppresses pushes;
+- **Stats stay complete**: `content` never changes what is counted;
   `final_text` / `events_seen` / `states` are still fully recorded
   (`_stream_dsh_call` relies on `final_text` for result delivery).
 - **Boundary: the receipt and the final-result delivery are unaffected by this
-  switch** (administrator's explicit requirement). `content` constrains only what
-  the **live stream** shows; the two never-silent paths are constant:
+  switch** (administrator's explicit requirement). `content` constrains only the
+  **operation details in the live stream**; the two never-silent paths are constant:
   - **① Instant acceptance receipt**: the dsh single-execution branch returns
     `{"action": "block", "message": "[dsh · context …] ⏳ accepted — …"}` straight
     from `pre_tool_call`. It is gated by `collector.enabled` **alone**, so the
@@ -282,9 +282,9 @@ Whether "intermediate events" are pushed is controlled separately by this key
 shown, off = tool calls and start/end markers only), while `events` controls the
 **push scope** (push intermediate events + final result, or push only the final
 result). The two keys compose independently: with `events: false` only the final
-result is pushed; with `content: false` only tool-call entries and start/end
-markers are pushed; with both `false`, the final result's text content is hidden
-too (only the terminal status line remains) — the 📬 delivery is unaffected.
+result is pushed; with `content: false` tool details narrow while the operation
+flow stays; with both `false` only the final result is pushed (its tool details
+narrowed as well) — the 📬 delivery is unaffected.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -376,9 +376,11 @@ a2a_call (pre_tool_call hook)
 | `status` canceled | `Canceled` |
 | `status` working / submitted | (not sent separately) |
 
-With `collector.content: false`: `text` (incl. final) and `thinking` lines are
-not pushed; `tool_result` keeps only the `📋 \`{name}\` 完成` marker (no output
-body); all other lines are unchanged.
+With `collector.content: false`: only the **operation details** narrow —
+`tool_call` keeps the tool name alone (`🔧 \`{name}\``, no arguments) and
+`tool_result` keeps only the `📋 \`{name}\` 完成` marker (no output body).
+`text` (incl. final) and `thinking` are part of the operation flow and render
+exactly as with `content: true`; all other lines are unchanged.
 
 ### Throttling and soft limits
 
@@ -417,13 +419,13 @@ body); all other lines are unchanged.
    and all other keys survive). First deployment needs one dashboard-process
    restart (backend mounting and plugin discovery are one-shot).
 7. Content-toggle confirmation: temporarily turn off `collector.content` and, on
-   the next task, confirm the live stream shows **only** 🔧 tool-name entries
-   (e.g. `🔧 \`bash\``, **without arguments / command body**), 📋 completion
-   markers and ✅/❌ start/end markers — **without** tool output
-   bodies, agent narrative or thinking (no 📖 lines); at task completion the
-   "📬 dsh 任务完成，结果如下" message is still delivered as usual. A residual
-   `collector.code_blocks` key in the config file has no side effects (ignored,
-   no error).
+   the next task, confirm the live stream still shows the full **operation flow**
+   (🚀 turns, 🧠 thinking, 📖 narrative and final output, ✅/❌ start/end markers)
+   while the **operation details** narrow — 🔧 tool name only (e.g. `🔧 \`bash\``,
+   no arguments / command body, no code block) and 📋 the completion marker alone
+   (no output body); at task completion the "📬 dsh 任务完成，结果如下" message is
+   still delivered as usual. A residual `collector.code_blocks` key in the config
+   file has no side effects (ignored, no error).
 
 ## Unit tests
 

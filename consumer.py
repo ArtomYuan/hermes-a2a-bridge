@@ -385,19 +385,14 @@ def render_line(
     开关控制。
 
     ``content=True``（默认）：与现状等价（全显）。``content=False``（内容开关
-    关）：text（含 final）与 thinking 返回 None（不推），tool_result 只返回
-    ``📋 `name` 完成`` 完成标记（不带输出正文）；tool_call 只保留工具名
-    ``🔧 `name```（**不带参数 / 命令正文**）；turn_start / status 终态等起止
-    标记事件照常渲染。
+    关）：只关闭**操作内细节**——tool_call 只保留工具名 ``🔧 `name```（不带参数 /
+    命令正文），tool_result 只返回 ``📋 `name` 完成`` 完成标记（不带输出正文）。
+    **操作流不受影响**：text（含 final）与 thinking 与 ``content=True`` 同款渲染，
+    turn_start / status 终态等起止标记照常。
     """
     etype = event.get("type")
-    # 内容开关关：隐去正文 / 叙述 / 思考、工具输出正文与工具调用的参数细节，
-    # 只保留「谁被调用了」与完成标记。
+    # 内容开关关：只收窄「操作内细节」两个分支；叙述 / 思考等操作流照常渲染。
     if not content:
-        if etype == "text":
-            return None
-        if etype == "thinking":
-            return None
         if etype == "tool_call":
             name = event.get("name") or ""
             return f"🔧 `{name}`" if name else "🔧 调用工具"
@@ -684,11 +679,11 @@ def consume_stream(
     ``events`` 控制「中间事件」是否推送：``False`` 时只推最终结果（final 文本 /
     终态 status），中间事件（工具调用 / 中间文本 / thinking / 状态行）跳过渲染与
     发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
-    ``content`` 控制「内容」是否推送：``False`` 时 text（含 final）与 thinking
-    事件不推（在 ``throttler.feed`` 之前跳过，避免非 final text 进缓冲后在
-    turn_end / 终态被 flush 成 📖 行），tool_result 仍 feed（由 ``render_line``
-    只产出 ``📋 `name` 完成`` 完成标记）；tool_call / turn_start / status 终态等
-    起止标记照常推送。stats 完整性不受 content 影响（final_text / events_seen /
+    ``content`` 控制「操作内细节」是否推送：``False`` 时只关闭**细节**——
+    ``tool_call`` 只留工具名（不带参数 / 命令正文，``render_line`` 负责）与
+    ``tool_result`` 只留 ``📋 `name` 完成`` 完成标记（不带输出正文）。**操作流本身
+    不受影响**：text（含 final）与 thinking 照常渲染推送，turn_start / status 终态
+    等起止标记亦然。stats 完整性不受 content 影响（final_text / events_seen /
     states 仍完整统计，供上层「📬 最终结果送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
@@ -720,12 +715,9 @@ def consume_stream(
                 # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
                 if not events and not _is_final_event(event):
                     continue
-                # 内容开关（content=false）：不推内容类事件（text 含 final / thinking）。
-                # 必须在 throttler.feed 之前 continue——否则非 final text 会进
-                # Throttler 缓冲，在 turn_end / 终态被 flush 成 📖 行，破坏「不显示
-                # 内容」。tool_result 仍走 feed（render_line 只产完成标记行）。
-                if not content and event.get("type") in ("text", "thinking"):
-                    continue
+                # 内容开关（content=false）只关闭「操作内细节」，由 render_line 在
+                # tool_call / tool_result 两个分支上收窄；操作流（text / thinking）
+                # 与其起止标记照常走 feed，因此这里不再跳过任何事件类型。
                 line = render_line(
                     event, code_blocks=code_blocks, content=content
                 )

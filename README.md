@@ -50,8 +50,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > 实际效果以各网关客户端渲染为准。
 
-内容显示与中间事件推送均可调整（`collector.content` 控制内容显示——关闭后直播只显示
-工具调用、隐去工具输出与正文；`collector.events` 控制事件流开关；两者均默认开启。
+内容显示与中间事件推送均可调整（`collector.content` 控制操作细节显示——关闭后工具
+调用只留名称、工具结果只留完成标记，隐去参数与输出正文，**叙述与思考照常显示**；
+`collector.events` 控制事件流开关；两者均默认开启。
 代码框渲染保留为内容显示时的内部样式，不再单独暴露开关），可在 Dashboard「插件管理」
 页的「A2A 直播开关」面板点选（即时生效）——详见
 [CONFIGURATION.md](CONFIGURATION.md)。
@@ -108,8 +109,9 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 ## 直播开关（Dashboard 即时生效）
 
 插件加载后，直播的三个开关——`collector.enabled`（总开关）/ `collector.events`
-（中间事件推送）/ `collector.content`（内容显示，关 → 只显示工具调用，隐去工具
-输出与正文）——可在 Hermes Dashboard「插件管理」页顶部的「A2A 直播开关」面板直接
+（中间事件推送）/ `collector.content`（内容显示，关 → 隐去工具调用的参数与工具
+输出正文，工具只留名称与完成标记；叙述与 thinking 不受影响）——可在 Hermes
+Dashboard「插件管理」页顶部的「A2A 直播开关」面板直接
 点选，保存**即时生效（无需重启网关，热读）**。后端端点
 `GET/POST /api/plugins/hermes-a2a-bridge/collector` 严格校验后写回
 `plugins.entries.hermes-a2a-bridge.settings.collector.*`（保留条目顶层

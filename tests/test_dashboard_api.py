@@ -114,6 +114,12 @@ def _install_fake_modules():
         )
         if config.save_raises:
             raise config.save_raises
+        # 真实 save_config(merge_existing=True) 把 partial 深合并进磁盘配置；假件照做，
+        # 否则写入后的读回会停留在写入前状态，掩盖「POST 返回写后状态」的契约。
+        if merge_existing:
+            _deep_merge(config.config, copy.deepcopy(cfg))
+        else:
+            config.config = copy.deepcopy(cfg)
 
     config.load_config_readonly = load_config_readonly
     config.read_user_config_raw = read_user_config_raw
@@ -155,6 +161,16 @@ def _restore_modules():
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = prev
+
+
+def _deep_merge(target, patch):
+    """把 ``patch`` 深合并进 ``target``（模拟 save_config(merge_existing=True)）。"""
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+    return target
 
 
 def _entry_config(settings=None, legacy=None, extra=None):
@@ -364,11 +380,22 @@ class DashboardApiTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_post_collector_success_writes_and_returns_state(self):
-        resp = self.api.post_collector({"enabled": True})
+        # 已存 enabled=true（非默认），只提交 events → 响应必须回报**写后磁盘状态**：
+        # 未提交的 enabled 仍是 true，而不是被误报成默认 false。
+        self.config.config = _entry_config(settings={"collector": {"enabled": True}})
+        resp = self.api.post_collector({"events": False})
         self.assertEqual(len(self.config.save_calls), 1)
-        self.assertIs(resp["enabled"]["value"], True)
-        self.assertIs(resp["events"]["value"], True)  # 未提交的键保持默认
+        self.assertIs(resp["events"]["value"], False)
+        self.assertIs(resp["enabled"]["value"], True)  # 来自库中值，不是默认
         self.assertIs(resp["content"]["value"], True)
+        self.assertEqual(set(resp), set(_SWITCH_KEYS))
+
+    def test_post_collector_response_reflects_persisted_not_defaults(self):
+        # enabled 默认 false：若响应照提交子集回报，未提交键会被报成默认值。
+        self.config.config = _entry_config(settings={"collector": {"enabled": True}})
+        resp = self.api.post_collector({"content": False})
+        self.assertIs(resp["content"]["value"], False)
+        self.assertIs(resp["enabled"]["value"], True)
 
     def test_post_collector_alias_writes_content_path(self):
         # 旧面板 POST code_blocks → 写回的是 content 键，响应也只含三键元数据。

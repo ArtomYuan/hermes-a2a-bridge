@@ -207,7 +207,12 @@ def get_collector() -> Dict[str, Dict[str, Any]]:
 
 @router.post("/collector")
 def post_collector(body: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """严格校验并原子写回三开关；返回写后状态。"""
+    """严格校验并原子写回三开关；返回写后状态。
+
+    响应体是**写后从磁盘读回**的完整三键状态，而不是本次请求携带的子集：部分写入
+    下未提交的开关仍保持库中值，若照子集回报会把它们报成各自默认值（例如
+    ``enabled`` 默认为 false），与库中状态矛盾。
+    """
     try:
         values = _validate_switch_payload(body)
     except ValueError as exc:
@@ -221,4 +226,4 @@ def post_collector(body: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         raise HTTPException(
             status_code=500, detail=f"failed to write collector settings: {exc}"
         )
-    return _collector_state(values)
+    return _collector_state(_read_collector_values())

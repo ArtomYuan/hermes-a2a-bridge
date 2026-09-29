@@ -236,7 +236,7 @@ Semantics (orthogonal to `events`; the two keys compose independently):
 | Event type | `content: true` (default) | `content: false` |
 | --- | --- | --- |
 | `turn_start` (🚀 turn N) | current behavior | kept (progress marker, not content) |
-| `tool_call` (🔧 tool name + args) | current behavior | kept (tool name + args summary, rendered as today) |
+| `tool_call` (🔧 tool name + args) | current behavior (name + argument code block) | **tool name only** `🔧 \`name\`` (**no arguments / command body**, hence no code block) |
 | `tool_result` (📋) | current behavior (with output body) | completion marker only: `📋 \`name\` 完成` (no output body) |
 | `text` (incl. `final`) | current behavior | not pushed (agent narrative hidden) |
 | `thinking` | current behavior | not pushed |
@@ -417,8 +417,9 @@ body); all other lines are unchanged.
    and all other keys survive). First deployment needs one dashboard-process
    restart (backend mounting and plugin discovery are one-shot).
 7. Content-toggle confirmation: temporarily turn off `collector.content` and, on
-   the next task, confirm the live stream shows **only** 🔧 tool-call entries,
-   📋 completion markers and ✅/❌ start/end markers — **without** tool output
+   the next task, confirm the live stream shows **only** 🔧 tool-name entries
+   (e.g. `🔧 \`bash\``, **without arguments / command body**), 📋 completion
+   markers and ✅/❌ start/end markers — **without** tool output
    bodies, agent narrative or thinking (no 📖 lines); at task completion the
    "📬 dsh 任务完成，结果如下" message is still delivered as usual. A residual
    `collector.code_blocks` key in the config file has no side effects (ignored,

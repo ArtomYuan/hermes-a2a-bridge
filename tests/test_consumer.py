@@ -502,14 +502,23 @@ class RenderLineContentTest(unittest.TestCase):
         )
 
     def test_content_false_keeps_control_events(self):
-        # 起止标记与工具调用是「非内容」，content=false 下照常渲染。
+        # 起止标记照常渲染；工具调用只保留工具名（不带参数 / 命令正文）。
         self.assertEqual(
             consumer.render_line({"type": "turn_start", "turn": 2}, content=False),
             "🚀 第 2 轮",
         )
         self.assertEqual(
             consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, content=False),
-            "🔧 `bash`\n```bash\nls\n```",
+            "🔧 `bash`",
+        )
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "name": "bash"}, content=False),
+            "🔧 `bash`",
+        )
+        # name 缺失时的兜底措辞（不带参数）。
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "arguments": "ls"}, content=False),
+            "🔧 调用工具",
         )
         self.assertEqual(
             consumer.render_line({"type": "status", "state": "completed"}, content=False),
@@ -886,22 +895,23 @@ class ConsumeStreamContentTest(unittest.TestCase):
         stats, sent = self._run(False)
         # 混合事件流（turn_start 类标记不在该序列 / tool_call + tool_result +
         # 非 final text + final text + thinking + 终态 status）在 content=false
-        # 下只产出工具调用条目与完成标记。
+        # 下只产出工具名条目与完成标记。
         self.assertEqual(
             sent,
             [
-                "🔧 `shell_exec`\n```bash\nls\n```",
+                "🔧 `shell_exec`",
                 "📋 `shell_exec` 完成",
                 "✅ 完成",
             ],
         )
-        # 不出现正文 / 输出文本，不出现 📖 行与 🧠 行（Throttler 未被喂入 text）。
+        # 不出现正文 / 输出文本 / 工具参数，不出现 📖 行、🧠 行与代码框。
         for line in sent:
             self.assertNotIn("📖", line)
             self.assertNotIn("🧠", line)
             self.assertNotIn("正在查看", line)
             self.assertNotIn("total 4", line)
             self.assertNotIn("目录下", line)
+            self.assertNotIn("```", line)
         # stats 完整性不变：final_text / events_seen / states 仍完整统计。
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
@@ -972,7 +982,7 @@ class ConsumeStreamContentTest(unittest.TestCase):
             sent,
             [
                 "🚀 第 1 轮",
-                "🔧 `shell_exec`\n```bash\nls /tmp\n```",
+                "🔧 `shell_exec`",
                 "📋 `shell_exec` 完成",
                 "✅ 完成",
             ],
@@ -984,6 +994,9 @@ class ConsumeStreamContentTest(unittest.TestCase):
             self.assertNotIn("叙述", line)
             self.assertNotIn("结果", line)
             self.assertNotIn("file1.txt", line)
+            # content=false：工具调用只留工具名，不带参数 / 命令正文。
+            self.assertNotIn("ls /tmp", line)
+            self.assertNotIn("```", line)
         # stats 完整：final_text 仍记录（📬 送达依赖它）。
         self.assertEqual(stats["final_text"], "最终结果正文")
         self.assertEqual(stats["events_seen"], 9)

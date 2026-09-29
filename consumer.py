@@ -386,16 +386,21 @@ def render_line(
 
     ``content=True``（默认）：与现状等价（全显）。``content=False``（内容开关
     关）：text（含 final）与 thinking 返回 None（不推），tool_result 只返回
-    ``📋 `name` 完成`` 完成标记（不带输出正文）；turn_start / tool_call / status
-    终态等起止标记事件照常渲染。
+    ``📋 `name` 完成`` 完成标记（不带输出正文）；tool_call 只保留工具名
+    ``🔧 `name```（**不带参数 / 命令正文**）；turn_start / status 终态等起止
+    标记事件照常渲染。
     """
     etype = event.get("type")
-    # 内容开关关：隐去正文 / 叙述 / 思考与工具输出正文，只保留完成标记。
+    # 内容开关关：隐去正文 / 叙述 / 思考、工具输出正文与工具调用的参数细节，
+    # 只保留「谁被调用了」与完成标记。
     if not content:
         if etype == "text":
             return None
         if etype == "thinking":
             return None
+        if etype == "tool_call":
+            name = event.get("name") or ""
+            return f"🔧 `{name}`" if name else "🔧 调用工具"
         if etype == "tool_result":
             name = event.get("name") or ""
             return f"📋 `{name}` 完成" if name else "📋 工具完成"

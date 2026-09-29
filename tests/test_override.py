@@ -125,7 +125,7 @@ class HookTest(unittest.TestCase):
         self._orig_stream = _MODULE._stream_dsh_call
         self._orig_spawn = _MODULE._spawn_stream_worker
         _MODULE._COLLECTOR_ENABLED = False
-        _MODULE._CODE_BLOCKS = True
+        _MODULE._CONTENT = True
         _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
@@ -135,7 +135,7 @@ class HookTest(unittest.TestCase):
         _MODULE._spawn_stream_worker = self._orig_spawn
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
-        _MODULE._CODE_BLOCKS = True
+        _MODULE._CONTENT = True
         _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
@@ -275,8 +275,11 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["thread_id"], "omt_y")
         # 缺 timeout 配置 → 回退默认 300。
         self.assertEqual(call["timeout"], 300)
-        # 默认 _EVENTS=True 且本用例不调 register → consume_stream 收到 events=True。
+        # 默认 _EVENTS=True / _CONTENT=True 且本用例不调 register →
+        # consume_stream 收到 events=True / content=True；code_blocks 固定 True。
         self.assertEqual(call["events"], True)
+        self.assertEqual(call["content"], True)
+        self.assertIs(call["code_blocks"], True)
         # 消息面（platform/chat_id 非空）→ 真 sender：直播（code_blocks=True）与
         # 结果送达（code_blocks=False）各构造一次。
         self.assertEqual(len(consumer.make_sender_calls), 2)
@@ -308,11 +311,11 @@ class HookTest(unittest.TestCase):
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         self.assertEqual(consumer.consume_stream_calls[0]["timeout"], 3600)
 
-    # 13. register() 读 collector.enabled / code_blocks / events 配置。
+    # 13. register() 读 collector.enabled / content / events 配置。
     def test_register_reads_collector_settings(self):
         settings = {
             "collector.enabled": True,
-            "collector.code_blocks": False,
+            "collector.content": False,
             "collector.events": False,
         }
 
@@ -325,14 +328,14 @@ class HookTest(unittest.TestCase):
 
         _MODULE.register(FakeCtx())
         self.assertIs(_MODULE._COLLECTOR_ENABLED, True)
-        self.assertIs(_MODULE._CODE_BLOCKS, False)
+        self.assertIs(_MODULE._CONTENT, False)
         self.assertIs(_MODULE._EVENTS, False)
 
     # 14. register() 缺 collector.events → 默认 true。
     def test_register_events_default_true(self):
         settings = {
             "collector.enabled": True,
-            "collector.code_blocks": True,
+            "collector.content": True,
         }
 
         class FakeCtx:
@@ -344,6 +347,7 @@ class HookTest(unittest.TestCase):
 
         _MODULE.register(FakeCtx())
         self.assertIs(_MODULE._EVENTS, True)
+        self.assertIs(_MODULE._CONTENT, True)
 
     # 15. _format_result_message：完成 / 异常态 / 空文本三态。
     def test_format_result_message_variants(self):

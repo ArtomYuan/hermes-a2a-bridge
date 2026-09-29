@@ -3,11 +3,16 @@
 端点
 ----
 - ``GET  /collector``：三开关当前值 + 默认值元数据。**绝不返回任何密钥**
-  （只返回 enabled / events / code_blocks 三个键）。
+  （只返回 enabled / events / content 三个键）。
 - ``POST /collector``：严格校验（只接受布尔值、拒绝多余键），原子写回
   ``plugins.entries.hermes-a2a-bridge.settings.collector.<key>``；
   ``merge_existing=True`` 保证条目顶层 ``allow_tool_override`` 与文件中其它所有键
   都被保留。失败 fail loud（4xx/5xx + 明确 detail），不静默吞。
+
+兼容说明：``collector.code_blocks`` 自 v0.3.0 起废弃（语义已被 ``collector.content``
+取代）。POST 容忍旧键名 ``code_blocks`` 作为 ``content`` 的 **deprecated 别名**
+（升级窗口内已打开的旧面板不会报错）；GET 永不返回 ``code_blocks``，配置文件里
+残留的 ``code_blocks`` 键被忽略（不读取、不迁移、不当 fallback）。
 
 写回姿势：dashboard 进程里没有 ``PluginContext``，等价写法是直接调
 ``hermes_cli.config.save_config``（与 ``PluginContext.set_config`` 同型，
@@ -32,12 +37,15 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_ID = "hermes-a2a-bridge"
-_SWITCH_KEYS = ("enabled", "events", "code_blocks")
+_SWITCH_KEYS = ("enabled", "events", "content")
 _SWITCH_DEFAULTS: Dict[str, bool] = {
     "enabled": False,
     "events": True,
-    "code_blocks": True,
+    "content": True,
 }
+# 升级窗口兼容：旧面板 POST 的 ``code_blocks`` 作为 ``content`` 的 deprecated 别名
+# 被接受（两者同时给出时显式 ``content`` 优先）。GET 永不返回该键。
+_DEPRECATED_ALIASES: Dict[str, str] = {"code_blocks": "content"}
 
 
 def _to_bool(value: Any) -> bool:
@@ -68,18 +76,27 @@ def _validate_switch_payload(data: Any) -> Dict[str, bool]:
     """严格校验 POST body；任何违规 raise ``ValueError``（消息可直接作 400 detail）。
 
     - 必须 JSON 对象；空对象拒绝；
-    - 键只允许 ``enabled`` / ``events`` / ``code_blocks``，多余键拒绝；
+    - 键只允许 ``enabled`` / ``events`` / ``content``，多余键拒绝；
+    - ``code_blocks`` 作为 ``content`` 的 **deprecated 别名**被容忍（升级窗口内
+      已打开的旧面板 POST 旧键不会报错）；两者同时给出时显式 ``content`` 优先；
     - 值只接受布尔（``1`` / ``"true"`` 等一律拒绝）。
     """
     if not isinstance(data, dict):
         raise ValueError("payload must be a JSON object")
-    unknown = sorted(key for key in data if key not in _SWITCH_KEYS)
+    normalized = dict(data)
+    for alias, target in _DEPRECATED_ALIASES.items():
+        if alias in normalized:
+            if target not in normalized:
+                normalized[target] = normalized.pop(alias)
+            else:
+                normalized.pop(alias)  # 显式 content 已给出 → 别名值忽略
+    unknown = sorted(key for key in normalized if key not in _SWITCH_KEYS)
     if unknown:
         raise ValueError("unknown keys: " + ", ".join(unknown))
-    if not data:
+    if not normalized:
         raise ValueError("no switch values provided")
     result: Dict[str, bool] = {}
-    for key, value in data.items():
+    for key, value in normalized.items():
         if type(value) is not bool:
             raise ValueError(
                 f"{key!r} must be a boolean, got {type(value).__name__}"

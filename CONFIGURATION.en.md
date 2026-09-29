@@ -210,16 +210,15 @@ When `collector.enabled` is absent / explicitly `false`, the dsh target does
 the original `a2a_call` runs the synchronous `SendMessage` (no live output, no
 double execution); non-dsh targets are unaffected.
 
-### Code-block rendering toggle (collector.code_blocks)
+### Content toggle (collector.content)
 
-Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.code_blocks`.
+Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.content`.
 
-Whether live content is rendered as code blocks is controlled separately by this
-key (default `true`). Relationship to `collector.enabled`: `enabled` is the live
+Whether live output shows **content** is controlled separately by this key
+(default `true`). Relationship to `collector.enabled`: `enabled` is the live
 **master switch** (off by default, controls whether the single-execution live
-branch runs); `code_blocks` is the **rendering sub-switch** (once live streaming is
-enabled, controls whether operation content is rendered as code blocks or plain
-text).
+branch runs); `content` is the **content sub-switch** (once live streaming is
+enabled, controls whether content events are pushed).
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -229,26 +228,58 @@ plugins:
       settings:
         collector:
           enabled: true
-          code_blocks: true       # default true: render commands/results/long text as code blocks
+          content: true        # default true: full live display (tool calls + output + narrative)
 ```
 
-- `true` (default): tool commands / execution results / long final text are
-  rendered as ``` code blocks (fence-aware chunking).
-- `false`: the above content falls back to plain-text lines (no fences, no fence
-  escaping, content preserved); long text is chunked at plain newline boundaries
-  (the `⏩ 续` marker is still kept).
+Semantics (orthogonal to `events`; the two keys compose independently):
 
-When unset it stays `true`, keeping existing deployments' behavior unchanged.
+| Event type | `content: true` (default) | `content: false` |
+| --- | --- | --- |
+| `turn_start` (🚀 turn N) | current behavior | kept (progress marker, not content) |
+| `tool_call` (🔧 tool name + args) | current behavior | kept (tool name + args summary, rendered as today) |
+| `tool_result` (📋) | current behavior (with output body) | completion marker only: `📋 \`name\` 完成` (no output body) |
+| `text` (incl. `final`) | current behavior | not pushed (agent narrative hidden) |
+| `thinking` | current behavior | not pushed |
+| `status` terminal (✅/❌/⚠️) | current behavior | kept (start/end markers) |
+| `turn_end` | current behavior (renders None) | current behavior |
+
+- **When it takes effect**: same level as `events` — hot-read once at the start
+  of each stream task; changing it mid-task does not affect the running task;
+  the next task picks up the new value immediately (no gateway restart).
+- **Stats stay complete**: `content: false` only suppresses pushes;
+  `final_text` / `events_seen` / `states` are still fully recorded
+  (`_stream_dsh_call` relies on `final_text` for result delivery).
+- **📬 final-result delivery unchanged**: `content` affects only the **live
+  stream**; the final result at task completion is still actively delivered via
+  `_deliver_final_result` (full body). This round's requirement is interpreted
+  as "the live stream shows tool calls only"; hiding the delivered final body
+  too would be a one-line change — a decision for the next step.
+- **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
+  **ignored entirely** — never read, never an error, never migrated, never a
+  fallback. Its semantics changed (old `false` = plain-text lines; using it as a
+  fallback would silently turn all content off — a wrong migration); a residual
+  `code_blocks` key in the config file has no side effects and no exceptions.
+- **Code-block rendering stays as internal style**: with `content: true`,
+  operation content (tool commands / execution results / long final text) is
+  still rendered as ``` code blocks (fence-aware chunking); it is no longer a
+  standalone switch.
+
+When unset it stays `true`, keeping existing deployments' behavior unchanged
+(full display).
 
 ### Event-stream toggle (collector.events)
 
 Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.events`.
 
 Whether "intermediate events" are pushed is controlled separately by this key
-(default `true`). It is orthogonal to `collector.code_blocks`: `code_blocks`
-controls the **rendering style** (code blocks vs plain text), while `events`
-controls the **push scope** (push intermediate events + final result, or push only
-the final result).
+(default `true`). It is orthogonal to `collector.content`: `content` controls
+**whether content events are shown** (on = tool calls + output + narrative all
+shown, off = tool calls and start/end markers only), while `events` controls the
+**push scope** (push intermediate events + final result, or push only the final
+result). The two keys compose independently: with `events: false` only the final
+result is pushed; with `content: false` only tool-call entries and start/end
+markers are pushed; with both `false`, the final result's text content is hidden
+too (only the terminal status line remains) — the 📬 delivery is unaffected.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -265,9 +296,9 @@ plugins:
   📖 intermediate text / 🧠 thinking / status lines) and the final result
   (📖 output complete / ✅ done card) are all pushed.
 - `false` (quiet mode): push only the final result (📖 output complete + terminal
-  status line); intermediate events are not pushed (no spam). The done card may
-  still contain code blocks, whose style is controlled by `code_blocks` (the two
-  keys are orthogonal).
+  status line); intermediate events are not pushed (no spam). The done card's
+  style stays code blocks (internal rendering, no longer configurable; the two
+  keys are orthogonal — see "Content toggle").
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
@@ -275,7 +306,7 @@ When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
 This plugin ships a Dashboard extension: the "Plugins" page (port 9120) shows an
 "A2A live switches / A2A 直播开关" card at the top with the three switches (master
-switch / intermediate events / code-block rendering). Toggling any of them takes
+switch / intermediate events / content display). Toggling any of them takes
 effect **immediately (no gateway restart)** — the three switches are hot-read via
 `ctx.get_config` at the start of every hook / stream task (Hermes' config reader
 caches by file mtime signature and picks up config.yaml changes automatically).
@@ -283,12 +314,15 @@ caches by file mtime signature and picks up config.yaml changes automatically).
 Backend endpoints (mounted in the dashboard process, decoupled from the gateway):
 
 - `GET /api/plugins/hermes-a2a-bridge/collector` — current values + default
-  metadata for the three switches (**never returns any secrets**).
+  metadata for the three switches (`enabled` / `events` / `content`; **never
+  returns any secrets**, and never returns the deprecated `code_blocks` key).
 - `POST /api/plugins/hermes-a2a-bridge/collector` — strict validation (booleans
   only, unknown keys rejected), then atomically writes back
   `plugins.entries.hermes-a2a-bridge.settings.collector.*`; the write preserves
   the entry-level `allow_tool_override` and every other key in the file. Failures
-  return 4xx/5xx with a concrete detail — never silently swallowed.
+  return 4xx/5xx with a concrete detail — never silently swallowed. During the
+  upgrade window, a `code_blocks` key POSTed by an already-open old panel is
+  tolerated as a deprecated alias of `content` (the `content` key is written).
 
 Deployment note: dashboard plugin discovery and backend route mounting are
 one-shot — **after upgrading the plugin, restart the Hermes dashboard process
@@ -328,14 +362,18 @@ a2a_call (pre_tool_call hook)
 | `turn_start` (no turn) | `Starting execution` |
 | `turn_start` (with turn N) | `Turn N` |
 | `thinking` | `Thinking...` |
-| `tool_call` | `Calling tool \`{name}\`` |
-| `tool_result` | `\`{name}\` done` (append a <=60 char summary when result is non-empty) |
+| `tool_call` | `Calling tool \`{name}\`` (with args, the command goes into a code block) |
+| `tool_result` | `\`{name}\` done` (with non-empty result, the output body goes into a code block; empty result = marker only) |
 | `text` (non-final) | `{text truncated to <=120}` (flush only at terminal state) |
 | `text` (final, lastChunk) | `Output complete` (the final result is not dumped in full) |
 | `status` completed | `Done` |
 | `status` failed | `Failed` |
 | `status` canceled | `Canceled` |
 | `status` working / submitted | (not sent separately) |
+
+With `collector.content: false`: `text` (incl. final) and `thinking` lines are
+not pushed; `tool_result` keeps only the `📋 \`{name}\` 完成` marker (no output
+body); all other lines are unchanged.
 
 ### Throttling and soft limits
 
@@ -373,6 +411,13 @@ a2a_call (pre_tool_call hook)
    `~/.hermes/config.yaml` change in step (the entry-level `allow_tool_override`
    and all other keys survive). First deployment needs one dashboard-process
    restart (backend mounting and plugin discovery are one-shot).
+7. Content-toggle confirmation: temporarily turn off `collector.content` and, on
+   the next task, confirm the live stream shows **only** 🔧 tool-call entries,
+   📋 completion markers and ✅/❌ start/end markers — **without** tool output
+   bodies, agent narrative or thinking (no 📖 lines); at task completion the
+   "📬 dsh 任务完成，结果如下" message is still delivered as usual. A residual
+   `collector.code_blocks` key in the config file has no side effects (ignored,
+   no error).
 
 ## Unit tests
 
@@ -391,8 +436,11 @@ a fake `gateway.session_context` via `sys.modules`). `test_consumer.py` drives
 format (a mock sender records the send list), covering normalized event kinds and
 order, rendered-line emoji prefixes, text aggregation flushing only at terminal
 state, high-signal one-by-one sends, redact invocation, two-level sender fallback
-(no gateway → `no_gateway`), and no crash on abnormal events, and outputs an
-"event sequence → rendered message sample" mapping table.
+(no gateway → `no_gateway`), no crash on abnormal events, the content switch
+(`content=false` pushes only tool-call entries and completion markers; no
+text/thinking, no 📖 lines, stats fully recorded), the code-block rendering
+parameter (internal style), and outputs an "event sequence → rendered message
+sample" mapping table.
 
 `test_override.py` covers `_on_pre_tool_call`'s single-execution hook branch and
 `_stream_dsh_call`: dsh target (collector on + origin non-empty + message
@@ -407,17 +455,19 @@ on missing dsh config.
 value after changing a FakeCtx's config, falls back to the module-level globals
 when `_CTX is None`, falls back to the passed default when the read raises,
 normalizes string booleans, and proves both read sites (`_on_pre_tool_call`'s
-enabled check, `_stream_dsh_call`'s code_blocks / events) switch behavior with
-the config, read each key only once per task, and keep register()'s global
-writes intact.
+enabled check, `_stream_dsh_call`'s events / content) switch behavior with the
+config, read each key only once per task, keep register()'s global writes
+intact, and ignore a residual legacy `collector.code_blocks` key (content keeps
+its default of true).
 
 `test_dashboard_api.py` covers the Dashboard backend (fake fastapi /
 hermes_cli): strict POST body validation (booleans only / unknown keys / empty /
-non-object rejected), collector-partial nesting, the write posture
-(`merge_existing=True` + full-path `preserve_keys` + fail-closed on corrupt YAML
-+ managed rejection + fail-loud on write errors), read semantics (settings →
-legacy config → defaults), and GET/POST handler responses containing only the
-three-key metadata (never any secrets).
+non-object rejected), the legacy `code_blocks` key accepted and mapped as a
+deprecated alias of `content` (GET never returns it), collector-partial nesting,
+the write posture (`merge_existing=True` + full-path `preserve_keys` +
+fail-closed on corrupt YAML + managed rejection + fail-loud on write errors),
+read semantics (settings → legacy config → defaults), and GET/POST handler
+responses containing only the three-key metadata (never any secrets).
 
 ## Verification (CLI integration, deferred to window period)
 

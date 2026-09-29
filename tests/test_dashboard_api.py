@@ -6,10 +6,12 @@
 
 注入假 ``fastapi``（APIRouter / HTTPException）与假 ``hermes_cli`` 包
 （config / web_server / plugins_state），用 spec 加载 ``dashboard/api.py``，
-覆盖：POST body 严格校验（仅布尔、拒绝多余键/空对象/非对象）、collector partial
-嵌套构造、写回姿势（merge_existing=True + preserve_keys 完整路径 + fail-closed
-读检查 + managed 拒绝 + 失败 fail loud）、读取语义（settings → legacy config →
-默认，字符串布尔归一化）、GET/POST handler 的响应体只含三键元数据（绝不带密钥）。
+覆盖：POST body 严格校验（仅布尔、拒绝多余键/空对象/非对象）、旧键
+``code_blocks`` 作为 ``content`` 的 deprecated 别名被接受并映射（GET 永不返回）、
+collector partial 嵌套构造、写回姿势（merge_existing=True + preserve_keys
+完整路径 + fail-closed 读检查 + managed 拒绝 + 失败 fail loud）、读取语义
+（settings → legacy config → 默认，字符串布尔归一化，残留旧键忽略）、
+GET/POST handler 的响应体只含三键元数据（绝不带密钥）。
 """
 
 import contextlib
@@ -38,8 +40,8 @@ _PREEXISTING = {
 }
 
 _PLUGIN_ID = "hermes-a2a-bridge"
-_SWITCH_KEYS = ("enabled", "events", "code_blocks")
-_DEFAULTS = {"enabled": False, "events": True, "code_blocks": True}
+_SWITCH_KEYS = ("enabled", "events", "content")
+_DEFAULTS = {"enabled": False, "events": True, "content": True}
 
 
 class FakeHTTPException(Exception):
@@ -185,8 +187,24 @@ class DashboardApiTest(unittest.TestCase):
     def test_validate_accepts_bools_partial_and_full(self):
         self.assertEqual(self.api._validate_switch_payload({"enabled": True}),
                          {"enabled": True})
-        full = {"enabled": False, "events": False, "code_blocks": True}
+        full = {"enabled": False, "events": False, "content": True}
         self.assertEqual(self.api._validate_switch_payload(full), full)
+
+    def test_validate_accepts_code_blocks_as_deprecated_alias(self):
+        # 旧面板（升级窗口）POST 旧键 code_blocks → 映射为 content。
+        self.assertEqual(
+            self.api._validate_switch_payload({"code_blocks": False}),
+            {"content": False},
+        )
+        # 别名与显式 content 同时给出 → 显式 content 优先。
+        self.assertEqual(
+            self.api._validate_switch_payload({"code_blocks": False, "content": True}),
+            {"content": True},
+        )
+
+    def test_validate_alias_value_must_be_bool(self):
+        with self.assertRaises(ValueError):
+            self.api._validate_switch_payload({"code_blocks": "false"})
 
     def test_validate_rejects_non_dict(self):
         for bad in (None, [], "x", 42, True):
@@ -199,6 +217,9 @@ class DashboardApiTest(unittest.TestCase):
         self.assertIn("bogus", str(ctx.exception))
         with self.assertRaises(ValueError):
             self.api._validate_switch_payload({"token": "SECRET"})
+        # 别名存在时多余键仍拒绝。
+        with self.assertRaises(ValueError):
+            self.api._validate_switch_payload({"code_blocks": True, "bogus": True})
 
     def test_validate_rejects_non_bool_values(self):
         for bad in (1, 0, "true", None, 1.0):
@@ -261,12 +282,12 @@ class DashboardApiTest(unittest.TestCase):
 
     def test_read_collector_values_from_settings(self):
         self.config.config = _entry_config(
-            settings={"collector": {"enabled": True, "code_blocks": False}},
+            settings={"collector": {"enabled": True, "content": False}},
             extra={"allow_tool_override": True},
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": True, "events": True, "code_blocks": False},
+            {"enabled": True, "events": True, "content": False},
         )
 
     def test_read_collector_values_legacy_config_fallback(self):
@@ -275,23 +296,38 @@ class DashboardApiTest(unittest.TestCase):
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": True, "events": False, "code_blocks": True},
+            {"enabled": True, "events": False, "content": True},
         )
 
     def test_read_collector_values_normalizes_string_bools(self):
         self.config.config = _entry_config(
-            settings={"collector": {"enabled": "false", "code_blocks": "true"}},
+            settings={"collector": {"enabled": "false", "content": "true"}},
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": False, "events": True, "code_blocks": True},
+            {"enabled": False, "events": True, "content": True},
         )
 
     def test_read_collector_values_missing_entry_defaults(self):
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": False, "events": True, "code_blocks": True},
+            {"enabled": False, "events": True, "content": True},
         )
+
+    def test_read_collector_ignores_legacy_code_blocks_key(self):
+        # 配置文件里残留旧键 code_blocks：不读取、不报错、不当 fallback，
+        # content 取默认 true；GET 永不返回 code_blocks。
+        self.config.config = _entry_config(
+            settings={"collector": {"enabled": True, "code_blocks": False}},
+        )
+        self.assertEqual(
+            self.api._read_collector_values(),
+            {"enabled": True, "events": True, "content": True},
+        )
+        resp = self.api.get_collector()
+        self.assertEqual(set(resp), set(_SWITCH_KEYS))
+        self.assertNotIn("code_blocks", resp)
+        self.assertIs(resp["content"]["value"], True)
 
     def test_read_collector_values_fails_loud_on_read_error(self):
         self.config.read_raises = OSError("io error")
@@ -332,7 +368,19 @@ class DashboardApiTest(unittest.TestCase):
         self.assertEqual(len(self.config.save_calls), 1)
         self.assertIs(resp["enabled"]["value"], True)
         self.assertIs(resp["events"]["value"], True)  # 未提交的键保持默认
-        self.assertIs(resp["code_blocks"]["value"], True)
+        self.assertIs(resp["content"]["value"], True)
+
+    def test_post_collector_alias_writes_content_path(self):
+        # 旧面板 POST code_blocks → 写回的是 content 键，响应也只含三键元数据。
+        resp = self.api.post_collector({"code_blocks": False})
+        self.assertEqual(len(self.config.save_calls), 1)
+        self.assertIs(resp["content"]["value"], False)
+        self.assertEqual(set(resp), set(_SWITCH_KEYS))
+        collector = self.config.save_calls[0]["config"]["plugins"]["entries"][
+            _PLUGIN_ID
+        ]["settings"]["collector"]
+        self.assertIn("content", collector)
+        self.assertNotIn("code_blocks", collector)
 
     def test_post_collector_write_failure_500(self):
         self.config.save_raises = OSError("disk full")

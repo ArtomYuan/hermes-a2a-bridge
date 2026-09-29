@@ -1,7 +1,7 @@
 /**
  * hermes-a2a-bridge — Dashboard panel: A2A live switches.
  *
- * Three collector switches (collector.enabled / events / code_blocks) rendered
+ * Three collector switches (collector.enabled / events / content) rendered
  * as one card at the top of the "Plugins" page (slot "plugins:top") and also
  * registered for the hidden tab route /hermes-a2a-bridge. Reads current values
  * from GET /api/plugins/hermes-a2a-bridge/collector; each toggle POSTs its own
@@ -52,7 +52,7 @@
 
   var PLUGIN_NAME = "hermes-a2a-bridge";
   var API = "/api/plugins/hermes-a2a-bridge/collector";
-  var KEYS = ["enabled", "events", "code_blocks"];
+  var KEYS = ["enabled", "events", "content"];
 
   var T = {
     zh: {
@@ -66,8 +66,8 @@
       enabledDesc: "collector.enabled：开 → dsh 任务走单执行直播；关 → 仅注入 origin。默认关。",
       eventsLabel: "中间事件推送",
       eventsDesc: "collector.events：开 → 中间事件 + 最终结果都推；关 → 安静模式只推最终结果。默认开。",
-      codeBlocksLabel: "代码框渲染",
-      codeBlocksDesc: "collector.code_blocks：开 → 代码框渲染；关 → 纯文本行。默认开。",
+      contentLabel: "内容显示",
+      contentDesc: "collector.content：开 → 直播显示内容（工具调用 + 输出 + 正文）；关 → 只显示工具调用，隐去工具输出与正文。默认开。",
       loadError: "加载开关状态失败：",
       saveError: "保存失败：",
     },
@@ -82,8 +82,8 @@
       enabledDesc: "collector.enabled: on → single-execution live stream for dsh tasks; off → origin injection only. Default off.",
       eventsLabel: "Intermediate events",
       eventsDesc: "collector.events: on → push intermediate events + final result; off → quiet mode, final result only. Default on.",
-      codeBlocksLabel: "Code-block rendering",
-      codeBlocksDesc: "collector.code_blocks: on → render as code blocks; off → plain-text lines. Default on.",
+      contentLabel: "Content display",
+      contentDesc: "collector.content: on → show content (tool calls + output + narrative); off → tool calls only, hiding tool output and narrative. Default on.",
       loadError: "Failed to load switch state: ",
       saveError: "Failed to save: ",
     },
@@ -92,7 +92,7 @@
   var SWITCH_META = [
     { key: "enabled", label: "enabledLabel", desc: "enabledDesc" },
     { key: "events", label: "eventsLabel", desc: "eventsDesc" },
-    { key: "code_blocks", label: "codeBlocksLabel", desc: "codeBlocksDesc" },
+    { key: "content", label: "contentLabel", desc: "contentDesc" },
   ];
 
   function errText(err) {

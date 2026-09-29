@@ -81,19 +81,21 @@ _TARGET_TOOLS = frozenset(
 # ``_CTX`` 保存插件 ctx 引用传给 ``make_sender(_CTX)``（仅为签名兼容，实际发送不再走
 # dispatch_tool，而经 gateway 主 loop 调度 adapter）。
 _COLLECTOR_ENABLED = False
-# 代码框渲染开关：register() 读 ``collector.code_blocks``（默认 true）后写入全局；
-# false 时直播内容回退纯文本行（不包围栏）。运行期同样经 ``_read_switch`` 热读。
-_CODE_BLOCKS = True
 # 事件流开关：register() 读 ``collector.events``（默认 true）后写入全局；
 # false 时安静模式只推最终结果（中间事件不推）。运行期同样经 ``_read_switch`` 热读。
 _EVENTS = True
+# 内容开关：register() 读 ``collector.content``（默认 true）后写入全局；
+# false 时直播隐去内容类事件（text / thinking 不推、tool_result 只留完成标记），
+# 只显示工具调用与起止标记。运行期同样经 ``_read_switch`` 热读。
+# 旧键 ``collector.code_blocks`` 已废弃并一律忽略（不读取、不迁移、不当 fallback）。
+_CONTENT = True
 _CTX: Optional[Any] = None
 
 # ``_read_switch`` 无 ``_CTX`` 回退时用的全局名映射（键 → 模块级全局变量名）。
 _SWITCH_GLOBAL_BY_KEY = {
     "collector.enabled": "_COLLECTOR_ENABLED",
-    "collector.code_blocks": "_CODE_BLOCKS",
     "collector.events": "_EVENTS",
+    "collector.content": "_CONTENT",
 }
 # consumer 模块缓存（惰性 import，见 _import_consumer）。
 _CONSUMER_MODULE: Optional[Any] = None
@@ -260,13 +262,16 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     thread_id = parts[2] if len(parts) > 2 else ""
 
     consumer = _import_consumer()
-    # 热读渲染/事件两开关（本任务开始时各读一次，任务中途改配置不影响进行中任务，
-    # 与历史语义一致）。enabled 总开关在 hook 入口已热读。
-    code_blocks = _read_switch("collector.code_blocks", True)
+    # 热读事件/内容两开关（本任务开始时各读一次，任务中途改配置不影响进行中任务，
+    # 与历史语义一致）。enabled 总开关在 hook 入口已热读。渲染样式（code_blocks）
+    # 不再由配置控制：直播路径固定 True（内容显示时以代码框渲染的内部样式）。
     events = _read_switch("collector.events", True)
+    content = _read_switch("collector.content", True)
     # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
+    # 直播 sender 固定 code_blocks=True（内部样式）；结果送达 sender 固定 False
+    # （普通消息，见 _deliver_final_result）。
     sender = (
-        consumer.make_sender(_CTX, code_blocks=code_blocks)
+        consumer.make_sender(_CTX, code_blocks=True)
         if (platform and chat_id)
         else lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
     )
@@ -290,8 +295,9 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         sender=sender,
         min_interval=2.0,
         timeout=timeout,
-        code_blocks=code_blocks,
+        code_blocks=True,
         events=events,
+        content=content,
     )
     logger.info(
         "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
@@ -481,20 +487,22 @@ def register(ctx) -> None:
 
     三开关仍在此读一次写入模块级全局（作为初始值 / ``_CTX=None`` 时的回退值）；
     运行期读取点已改热读（``_read_switch``），此处的值不再固化生效。
+    旧键 ``collector.code_blocks`` 已废弃：此处不读取（一律忽略）。
     """
-    global _COLLECTOR_ENABLED, _CODE_BLOCKS, _EVENTS, _CTX
+    global _COLLECTOR_ENABLED, _EVENTS, _CONTENT, _CTX
     _CTX = ctx
     try:
         _COLLECTOR_ENABLED = _to_bool(ctx.get_config("collector.enabled", False))
-        # 代码框渲染开关默认 true（向后兼容）；显式 false 才回退纯文本。
-        _CODE_BLOCKS = _to_bool(ctx.get_config("collector.code_blocks", True))
         # 事件流开关默认 true（向后兼容）；显式 false 才安静模式（只推最终结果）。
         _EVENTS = _to_bool(ctx.get_config("collector.events", True))
+        # 内容开关默认 true（向后兼容）；显式 false 才隐去内容类事件
+        # （只显示工具调用与起止标记）。
+        _CONTENT = _to_bool(ctx.get_config("collector.content", True))
     except Exception as exc:  # 读配置失败按默认处理，绝不阻断插件加载
         logger.warning("hermes-a2a-bridge: read collector settings failed: %s", exc)
         _COLLECTOR_ENABLED = False
-        _CODE_BLOCKS = True
         _EVENTS = True
+        _CONTENT = True
 
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)

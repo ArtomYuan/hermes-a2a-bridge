@@ -11,7 +11,8 @@
 - ``get_config`` 抛错：回退传入 default，不阻断。
 
 以及两个读取点（``_on_pre_tool_call`` 的 enabled 判断、``_stream_dsh_call`` 的
-code_blocks / events）确实走热读；register() 写全局的既有行为不回归。
+events / content）确实走热读；register() 写全局的既有行为不回归；残留旧键
+``collector.code_blocks`` 被忽略（content 取默认 true，不报错）。
 """
 
 import importlib.util
@@ -106,7 +107,7 @@ class HotReadTest(unittest.TestCase):
     def setUp(self):
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
-        _MODULE._CODE_BLOCKS = True
+        _MODULE._CONTENT = True
         _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
@@ -114,36 +115,36 @@ class HotReadTest(unittest.TestCase):
     def tearDown(self):
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
-        _MODULE._CODE_BLOCKS = True
+        _MODULE._CONTENT = True
         _MODULE._EVENTS = True
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
     # 1. _CTX 非 None：改 FakeCtx 配置后再次调用拿到新值（三键）。
     def test_read_switch_hot_reads_ctx_changes(self):
-        ctx = FakeCtx({"collector.enabled": True, "collector.code_blocks": True,
+        ctx = FakeCtx({"collector.enabled": True, "collector.content": True,
                        "collector.events": True})
         _MODULE._CTX = ctx
         self.assertIs(_MODULE._read_switch("collector.enabled", False), True)
-        self.assertIs(_MODULE._read_switch("collector.code_blocks", True), True)
+        self.assertIs(_MODULE._read_switch("collector.content", True), True)
         self.assertIs(_MODULE._read_switch("collector.events", True), True)
         # Dashboard 保存 = 改 config → 下一次读取点拿到新值。
         ctx.settings.update(
-            {"collector.enabled": False, "collector.code_blocks": False,
+            {"collector.enabled": False, "collector.content": False,
              "collector.events": False}
         )
         self.assertIs(_MODULE._read_switch("collector.enabled", False), False)
-        self.assertIs(_MODULE._read_switch("collector.code_blocks", True), False)
+        self.assertIs(_MODULE._read_switch("collector.content", True), False)
         self.assertIs(_MODULE._read_switch("collector.events", True), False)
 
     # 2. _CTX 为 None：回退模块级全局（测试后门），且跟随全局变更。
     def test_read_switch_ctx_none_falls_back_to_globals(self):
         _MODULE._CTX = None
         _MODULE._COLLECTOR_ENABLED = True
-        _MODULE._CODE_BLOCKS = False
+        _MODULE._CONTENT = False
         _MODULE._EVENTS = False
         self.assertIs(_MODULE._read_switch("collector.enabled", False), True)
-        self.assertIs(_MODULE._read_switch("collector.code_blocks", True), False)
+        self.assertIs(_MODULE._read_switch("collector.content", True), False)
         self.assertIs(_MODULE._read_switch("collector.events", True), False)
         _MODULE._COLLECTOR_ENABLED = False
         self.assertIs(_MODULE._read_switch("collector.enabled", False), False)
@@ -156,7 +157,7 @@ class HotReadTest(unittest.TestCase):
 
         _MODULE._CTX = BoomCtx()
         self.assertIs(_MODULE._read_switch("collector.enabled", False), False)
-        self.assertIs(_MODULE._read_switch("collector.code_blocks", True), True)
+        self.assertIs(_MODULE._read_switch("collector.content", True), True)
 
     # 4. 字符串布尔经 _to_bool 归一化（"false" → False）。
     def test_read_switch_normalizes_string_bools(self):
@@ -190,27 +191,29 @@ class HotReadTest(unittest.TestCase):
         self.assertEqual(result["action"], "block")
         self.assertEqual(spawns, [("hi", "feishu/oc_x")])
 
-    # 6. 读取点 _stream_dsh_call：热读 code_blocks / events（改配置 → 新任务拿新值）。
-    def test_stream_dsh_call_hot_reads_render_switches(self):
+    # 6. 读取点 _stream_dsh_call：热读 events / content（改配置 → 新任务拿新值）。
+    def test_stream_dsh_call_hot_reads_events_content_switches(self):
         _install_fake_hermes_cli({
             "a2a_agents": {"dsh": {"url": "http://127.0.0.1:8092",
                                    "auth": {"type": "bearer", "token": "t"}}}
         })
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
-        ctx = FakeCtx({"collector.code_blocks": False, "collector.events": False})
+        ctx = FakeCtx({"collector.content": False, "collector.events": False})
         _MODULE._CTX = ctx
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         call = consumer.consume_stream_calls[0]
-        self.assertIs(call["code_blocks"], False)
+        self.assertIs(call["content"], False)
         self.assertIs(call["events"], False)
-        # 直播 sender 也用热读值（结果送达 sender 恒 code_blocks=False，见第 1 个调用）。
-        self.assertIs(consumer.make_sender_calls[0][1], False)
+        # 直播 sender 固定 code_blocks=True（内部样式；结果送达 sender 恒
+        # code_blocks=False，见第 2 个调用）。
+        self.assertIs(consumer.make_sender_calls[0][1], True)
+        self.assertIs(consumer.make_sender_calls[1][1], False)
         # 改配置 → 下一个任务拿新值。
-        ctx.settings.update({"collector.code_blocks": True, "collector.events": True})
+        ctx.settings.update({"collector.content": True, "collector.events": True})
         _MODULE._stream_dsh_call("hi2", "feishu/oc_x")
         call = consumer.consume_stream_calls[1]
-        self.assertIs(call["code_blocks"], True)
+        self.assertIs(call["content"], True)
         self.assertIs(call["events"], True)
         self.assertIs(consumer.make_sender_calls[2][1], True)
 
@@ -233,25 +236,55 @@ class HotReadTest(unittest.TestCase):
         with mock.patch.object(_MODULE, "_read_switch", side_effect=recording):
             _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         self.assertEqual(
-            sorted(seen), ["collector.code_blocks", "collector.events"]
+            sorted(seen), ["collector.content", "collector.events"]
         )
 
     # 8. register() 仍把三开关写入全局（既有测试后门 / 回退值不回归）。
     def test_register_still_sets_globals_and_hot_read_wins(self):
-        ctx = FakeCtx({"collector.enabled": True, "collector.code_blocks": False,
+        ctx = FakeCtx({"collector.enabled": True, "collector.content": False,
                        "collector.events": False})
         _MODULE.register(ctx)
         self.assertIs(_MODULE._COLLECTOR_ENABLED, True)
-        self.assertIs(_MODULE._CODE_BLOCKS, False)
+        self.assertIs(_MODULE._CONTENT, False)
         self.assertIs(_MODULE._EVENTS, False)
         # register 后改配置：热读拿新值，全局（旧值）不参与。
-        ctx.settings.update({"collector.enabled": False, "collector.code_blocks": True,
+        ctx.settings.update({"collector.enabled": False, "collector.content": True,
                              "collector.events": True})
         self.assertIs(_MODULE._read_switch("collector.enabled", False), False)
-        self.assertIs(_MODULE._read_switch("collector.code_blocks", True), True)
+        self.assertIs(_MODULE._read_switch("collector.content", True), True)
         self.assertIs(_MODULE._read_switch("collector.events", True), True)
         # 但全局仍是 register 时的固化值。
         self.assertIs(_MODULE._COLLECTOR_ENABLED, True)
+
+    # 9. 配置文件残留旧键 collector.code_blocks → 无异常且 content 取默认 true
+    #    （旧键「缺省忽略」的直接证据）。
+    def test_register_ignores_legacy_code_blocks_key(self):
+        settings = {
+            "collector.enabled": True,
+            "collector.events": True,
+            "collector.code_blocks": False,  # 残留旧键：一律忽略
+        }
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return settings.get(key, default)
+
+            def register_hook(self, name, fn):
+                pass
+
+        _MODULE.register(FakeCtx())  # 不应抛异常
+        self.assertIs(_MODULE._COLLECTOR_ENABLED, True)
+        self.assertIs(_MODULE._EVENTS, True)
+        # 旧键不参与：content 取默认 true（若把旧 false 当 fallback 会静默全关）。
+        self.assertIs(_MODULE._CONTENT, True)
+        self.assertIs(_MODULE._read_switch("collector.content", True), True)
+
+    # 10. content 开关：_CTX=None 回退默认 True（未配置即显示内容）。
+    def test_read_switch_content_ctx_none_defaults_true(self):
+        _MODULE._CTX = None
+        _MODULE._CONTENT = True
+        self.assertIs(_MODULE._read_switch("collector.content", True), True)
+        self.assertIs(_MODULE._read_switch("collector.content", False), True)
 
 
 if __name__ == "__main__":

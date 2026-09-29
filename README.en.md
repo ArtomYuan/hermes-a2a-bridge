@@ -55,10 +55,12 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > Actual rendering depends on each gateway's client.
 
-Code-block rendering and intermediate-event push are both configurable
-(`collector.code_blocks` for code-block style, `collector.events` for the event
-stream; both on by default), and can be toggled from the "A2A live switches"
-panel on the Dashboard "Plugins" page (instant effect) — see
+Content display and intermediate-event push are both configurable
+(`collector.content` for content display — off hides tool output and narrative,
+leaving tool calls only; `collector.events` for the event stream; both on by
+default. Code-block rendering stays as the internal style when content is shown
+and is no longer a standalone switch), and can be toggled from the "A2A live
+switches" panel on the Dashboard "Plugins" page (instant effect) — see
 [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ## Architecture
@@ -114,13 +116,15 @@ hard-bound; combine them as needed:
 ## Live switches (Dashboard, instant effect)
 
 Once the plugin is loaded, the three live-stream switches — `collector.enabled`
-(master switch) / `collector.events` (intermediate events) / `collector.code_blocks`
-(code-block rendering) — can be toggled directly from the "A2A live switches"
-panel at the top of the Hermes Dashboard "Plugins" page; saving takes effect
-**immediately (no gateway restart — hot read)**. The backend endpoints
+(master switch) / `collector.events` (intermediate events) / `collector.content`
+(content display; off → tool calls only, hiding tool output and narrative) — can
+be toggled directly from the "A2A live switches" panel at the top of the Hermes
+Dashboard "Plugins" page; saving takes effect **immediately (no gateway restart
+— hot read)**. The backend endpoints
 `GET/POST /api/plugins/hermes-a2a-bridge/collector` strictly validate and write
 back `plugins.entries.hermes-a2a-bridge.settings.collector.*` (preserving the
-entry-level `allow_tool_override` and all other keys). First deployment needs one
+entry-level `allow_tool_override` and all other keys; POST tolerates the legacy
+`code_blocks` key as a deprecated alias of `content`). First deployment needs one
 dashboard-process restart for the panel to appear.
 See [CONFIGURATION.en.md](CONFIGURATION.en.md), "Live consumer".
 

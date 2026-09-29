@@ -466,6 +466,72 @@ class RenderLineCodeBlocksTest(unittest.TestCase):
         self.assertEqual(chunks, ["a\nb\nc"])
 
 
+class RenderLineContentTest(unittest.TestCase):
+    """content 开关：false 时 text/thinking → None、tool_result 只留完成标记，
+    其余（起止标记 / 工具调用）照常；默认（True）与现状等价。"""
+
+    def test_default_content_is_true(self):
+        self.assertIs(consumer.DEFAULT_CONTENT, True)
+
+    def test_content_false_text_returns_none(self):
+        self.assertIsNone(
+            consumer.render_line({"type": "text", "text": "正文", "final": False}, content=False)
+        )
+        self.assertIsNone(
+            consumer.render_line({"type": "text", "text": "最终结果", "final": True}, content=False)
+        )
+
+    def test_content_false_thinking_returns_none(self):
+        self.assertIsNone(
+            consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False)
+        )
+
+    def test_content_false_tool_result_marker_only(self):
+        line = consumer.render_line(
+            {"type": "tool_result", "name": "shell_exec", "text": "total 4\nSECRET-OUTPUT"},
+            content=False,
+        )
+        self.assertEqual(line, "📋 `shell_exec` 完成")
+        self.assertNotIn("total 4", line)
+        self.assertNotIn("SECRET-OUTPUT", line)
+
+    def test_content_false_tool_result_empty_name(self):
+        self.assertEqual(
+            consumer.render_line({"type": "tool_result", "name": "", "text": "x"}, content=False),
+            "📋 工具完成",
+        )
+
+    def test_content_false_keeps_control_events(self):
+        # 起止标记与工具调用是「非内容」，content=false 下照常渲染。
+        self.assertEqual(
+            consumer.render_line({"type": "turn_start", "turn": 2}, content=False),
+            "🚀 第 2 轮",
+        )
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, content=False),
+            "🔧 `bash`\n```bash\nls\n```",
+        )
+        self.assertEqual(
+            consumer.render_line({"type": "status", "state": "completed"}, content=False),
+            "✅ 完成",
+        )
+        self.assertIsNone(
+            consumer.render_line({"type": "turn_end", "turn": 1, "reason": "stop"}, content=False)
+        )
+
+    def test_content_default_true_matches_current(self):
+        # content 缺省（True）与显式 True 均与现状等价。
+        for event in (
+            {"type": "text", "text": "x", "final": False},
+            {"type": "thinking", "text": "x"},
+            {"type": "tool_result", "name": "t", "text": "body"},
+        ):
+            self.assertEqual(
+                consumer.render_line(event),
+                consumer.render_line(event, content=True),
+            )
+
+
 class ThrottlerTest(unittest.TestCase):
     def _run(self, events, min_interval=0.0):
         throttler = consumer.Throttler(min_interval=min_interval)
@@ -779,6 +845,150 @@ class ConsumeStreamEventsTest(unittest.TestCase):
         stats, sent = self._run(True)
         self.assertEqual(stats["messages_sent"], 6)
         self.assertEqual(sent, _EXPECTED_SENT)
+
+
+class ConsumeStreamContentTest(unittest.TestCase):
+    """consume_stream 的 content 开关：false 时只推工具调用条目与完成标记，
+    不推 text / thinking，且无 📖 行；stats 完整性不变。true 与现状一致。"""
+
+    def tearDown(self):
+        if hasattr(consumer, "_orig_iter_sse_data"):
+            consumer.iter_sse_data = consumer._orig_iter_sse_data
+            del consumer._orig_iter_sse_data
+
+    def _run(self, content=None):
+        results = _wire_sequence()
+        consumer._orig_iter_sse_data = consumer.iter_sse_data
+        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        sent = []
+
+        def sender(platform, chat_id, thread_id, text):
+            sent.append(text)
+            return {"ok": True}
+
+        kw = dict(
+            url="http://127.0.0.1:8092/",
+            token="fake-token",
+            message="列出当前目录",
+            context_id="feishu/oc_x",
+            platform="feishu",
+            chat_id="oc_x",
+            thread_id="",
+            sender=sender,
+            min_interval=0.0,
+        )
+        if content is not None:
+            kw["content"] = content
+        stats = consumer.consume_stream(**kw)
+        return stats, sent
+
+    def test_content_false_tool_calls_only(self):
+        stats, sent = self._run(False)
+        # 混合事件流（turn_start 类标记不在该序列 / tool_call + tool_result +
+        # 非 final text + final text + thinking + 终态 status）在 content=false
+        # 下只产出工具调用条目与完成标记。
+        self.assertEqual(
+            sent,
+            [
+                "🔧 `shell_exec`\n```bash\nls\n```",
+                "📋 `shell_exec` 完成",
+                "✅ 完成",
+            ],
+        )
+        # 不出现正文 / 输出文本，不出现 📖 行与 🧠 行（Throttler 未被喂入 text）。
+        for line in sent:
+            self.assertNotIn("📖", line)
+            self.assertNotIn("🧠", line)
+            self.assertNotIn("正在查看", line)
+            self.assertNotIn("total 4", line)
+            self.assertNotIn("目录下", line)
+        # stats 完整性不变：final_text / events_seen / states 仍完整统计。
+        self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
+        self.assertEqual(stats["events_seen"], 9)
+        self.assertEqual(stats["states"], ["submitted", "working", "completed"])
+        self.assertEqual(stats["messages_sent"], 3)
+
+    def test_content_false_turn_end_does_not_flush_book(self):
+        # 非 final text 被 content 门跳过（不喂 Throttler）→ turn_end / 终态
+        # flush 不产生 📖 聚合行。
+        results = [
+            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+            _artifact_update([_text_part("中间正文一")], last_chunk=False),
+            _artifact_update([_text_part("中间正文二")], last_chunk=False),
+            _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
+            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+        ]
+        consumer._orig_iter_sse_data = consumer.iter_sse_data
+        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        sent = []
+
+        def sender(platform, chat_id, thread_id, text):
+            sent.append(text)
+            return {"ok": True}
+
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+            min_interval=0.0, content=False,
+        )
+        self.assertEqual(sent, ["✅ 完成"])
+        self.assertEqual(stats["final_text"], "")
+        self.assertEqual(stats["events_seen"], 5)
+
+    def test_content_true_matches_current(self):
+        stats, sent = self._run(True)
+        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(sent, _EXPECTED_SENT)
+
+    def test_content_false_mixed_stream_with_turn_start(self):
+        # 任务书要求的混合流：turn_start + tool_call + tool_result + 非 final text
+        # + final text + thinking + 终态 status。content=false 下只产出起止标记 +
+        # 工具调用条目与完成标记；正文 / 输出 / thinking 不出现，无 📖 行。
+        results = [
+            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+            _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
+            _artifact_update([_data_part({"kind": "thinking", "turn": 1, "text": "思考"})], last_chunk=False),
+            _artifact_update([_data_part({"kind": "tool_call", "turn": 1, "name": "shell_exec", "arguments": "ls /tmp"})], last_chunk=False),
+            _artifact_update([_data_part({"kind": "tool_result", "turn": 1, "name": "shell_exec", "text": "输出正文 file1.txt"})], last_chunk=False),
+            _artifact_update([_text_part("中间叙述正文")], last_chunk=False),
+            _artifact_update([_text_part("最终结果正文")], last_chunk=True),
+            _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
+            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+        ]
+        consumer._orig_iter_sse_data = consumer.iter_sse_data
+        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        sent = []
+
+        def sender(platform, chat_id, thread_id, text):
+            sent.append(text)
+            return {"ok": True}
+
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+            min_interval=0.0, content=False,
+        )
+        self.assertEqual(
+            sent,
+            [
+                "🚀 第 1 轮",
+                "🔧 `shell_exec`\n```bash\nls /tmp\n```",
+                "📋 `shell_exec` 完成",
+                "✅ 完成",
+            ],
+        )
+        for line in sent:
+            self.assertNotIn("📖", line)
+            self.assertNotIn("🧠", line)
+            self.assertNotIn("思考", line)
+            self.assertNotIn("叙述", line)
+            self.assertNotIn("结果", line)
+            self.assertNotIn("file1.txt", line)
+        # stats 完整：final_text 仍记录（📬 送达依赖它）。
+        self.assertEqual(stats["final_text"], "最终结果正文")
+        self.assertEqual(stats["events_seen"], 9)
+        self.assertEqual(stats["states"], ["submitted", "completed"])
+        self.assertEqual(stats["messages_sent"], 4)
 
 
 class SplitFencedChunksTest(unittest.TestCase):

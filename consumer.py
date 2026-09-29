@@ -232,11 +232,14 @@ def _truncate(text: Any, limit: int) -> str:
 # 结果正文超过此长度（或含换行）时，final 文本以代码框输出（短结果保持普通行）。
 _FINAL_CODE_BLOCK_MIN_LEN = 120
 
-# 代码框渲染默认开（向后兼容：已部署副本不配置即保持代码框行为）。
+# 代码框渲染：内容显示时的内部样式（v0.3.0 起不再由配置开关控制，直播路径固定 True）。
 DEFAULT_CODE_BLOCKS = True
 
 # 事件流开关默认开（向后兼容：已部署副本不配置即保持推送中间事件）。
 DEFAULT_EVENTS = True
+
+# 内容开关默认开（向后兼容：已部署副本不配置即保持现状观感——直播全显）。
+DEFAULT_CONTENT = True
 
 
 def _escape_inner_fences(text: str) -> str:
@@ -369,17 +372,33 @@ def _is_final_event(event: Dict[str, Any]) -> bool:
     return False
 
 
-def render_line(event: Dict[str, Any], code_blocks: bool = True) -> Optional[str]:
+def render_line(
+    event: Dict[str, Any], code_blocks: bool = True, content: bool = True
+) -> Optional[str]:
     """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
 
     ``code_blocks=True``（默认）：操作内容（tool_call 命令 / tool_result 结果 /
     长 final 文本）以 ``` 代码框输出，让飞书渲染为可滚动代码框；短文本
-    （thinking / 普通 text）保持普通行。
+    （thinking / 普通 text）保持普通行。``code_blocks=False``：所有内容回退
+    纯文本行（不包围栏、不做围栏转义），内容完整，飞书 / QQ 按普通文本渲染。
+    v0.3.0 起 ``code_blocks`` 仅是「内容显示时」的内部渲染方式，不再由配置
+    开关控制。
 
-    ``code_blocks=False``：所有内容回退纯文本行（不包围栏、不做围栏转义），内容
-    完整，飞书 / QQ 按普通文本渲染。
+    ``content=True``（默认）：与现状等价（全显）。``content=False``（内容开关
+    关）：text（含 final）与 thinking 返回 None（不推），tool_result 只返回
+    ``📋 `name` 完成`` 完成标记（不带输出正文）；turn_start / tool_call / status
+    终态等起止标记事件照常渲染。
     """
     etype = event.get("type")
+    # 内容开关关：隐去正文 / 叙述 / 思考与工具输出正文，只保留完成标记。
+    if not content:
+        if etype == "text":
+            return None
+        if etype == "thinking":
+            return None
+        if etype == "tool_result":
+            name = event.get("name") or ""
+            return f"📋 `{name}` 完成" if name else "📋 工具完成"
     if etype == "turn_start":
         turn = event.get("turn")
         if turn is not None:
@@ -542,7 +561,9 @@ def make_sender(
     """返回 ``send(platform, chat_id, thread_id, text) -> dict``。
 
     ``code_blocks`` 控制长文本分块方式：``True``（默认）按代码块边界分块（围栏
-    感知）；``False`` 按纯文本换行边界分块（无围栏感知）。
+    感知）；``False`` 按纯文本换行边界分块（无围栏感知）。v0.3.0 起这是「内容
+    显示时」的内部样式 / 分块参数，不再由配置开关控制（直播路径固定 True，结果
+    送达路径固定 False）。
 
     发送前必做 redact。发送只走一条通路：从 gateway 主 loop 上的 adapter 发——用
     ``_gateway_runner_ref`` 弱引用拿到 runner，取 ``runner._gateway_loop``（gateway
@@ -649,13 +670,21 @@ def consume_stream(
     timeout: int = _DEFAULT_TIMEOUT,
     code_blocks: bool = DEFAULT_CODE_BLOCKS,
     events: bool = DEFAULT_EVENTS,
+    content: bool = DEFAULT_CONTENT,
 ) -> Dict[str, Any]:
     """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → 节流 → 发送，返回统计。
 
-    ``code_blocks`` 透传给 ``render_line``，控制操作内容是否以代码框渲染。
+    ``code_blocks`` 透传给 ``render_line``，控制操作内容是否以代码框渲染
+    （内部样式，直播路径固定 True）。
     ``events`` 控制「中间事件」是否推送：``False`` 时只推最终结果（final 文本 /
     终态 status），中间事件（工具调用 / 中间文本 / thinking / 状态行）跳过渲染与
     发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
+    ``content`` 控制「内容」是否推送：``False`` 时 text（含 final）与 thinking
+    事件不推（在 ``throttler.feed`` 之前跳过，避免非 final text 进缓冲后在
+    turn_end / 终态被 flush 成 📖 行），tool_result 仍 feed（由 ``render_line``
+    只产出 ``📋 `name` 完成`` 完成标记）；tool_call / turn_start / status 终态等
+    起止标记照常推送。stats 完整性不受 content 影响（final_text / events_seen /
+    states 仍完整统计，供上层「📬 最终结果送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
@@ -686,7 +715,15 @@ def consume_stream(
                 # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
                 if not events and not _is_final_event(event):
                     continue
-                line = render_line(event, code_blocks=code_blocks)
+                # 内容开关（content=false）：不推内容类事件（text 含 final / thinking）。
+                # 必须在 throttler.feed 之前 continue——否则非 final text 会进
+                # Throttler 缓冲，在 turn_end / 终态被 flush 成 📖 行，破坏「不显示
+                # 内容」。tool_result 仍走 feed（render_line 只产完成标记行）。
+                if not content and event.get("type") in ("text", "thinking"):
+                    continue
+                line = render_line(
+                    event, code_blocks=code_blocks, content=content
+                )
                 for text in throttler.feed(event, line):
                     res = sender(platform, chat_id, thread_id, text)
                     if isinstance(res, dict) and not res.get("ok"):

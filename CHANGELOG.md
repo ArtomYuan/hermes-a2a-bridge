@@ -11,7 +11,7 @@
 
 - Dashboard 扩展面：插件管理页顶部「A2A 直播开关 / A2A live switches」卡片
   （`dashboard/manifest.json` + 手写 IIFE 前端 + `dashboard/api.py` 后端），三个
-  开关（直播总开关 / 中间事件推送 / 代码框渲染）可视化点选；后端
+  开关（直播总开关 / 中间事件推送 / 内容显示）可视化点选；后端
   `GET/POST /api/plugins/hermes-a2a-bridge/collector` 严格校验（只接受布尔、
   拒绝多余键）后写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`，
   保留条目顶层 `allow_tool_override` 与其它所有键；面板同时注册隐藏路由
@@ -19,18 +19,36 @@
 - 三开关热读：读取点改为每次调用 `ctx.get_config`（Hermes 配置读取按文件 mtime
   签名缓存），Dashboard 点选或改 config.yaml 后**即时生效，无需重启网关**；
   模块级全局保留为默认值 / 单测回退值。
+- 内容开关 `collector.content`（默认 true）：关闭后中间直播**只显示工具调用**——
+  `text`（含 final）与 `thinking` 不推、`tool_result` 只留 `📋 \`name\` 完成`
+  完成标记（不带输出正文），`turn_start` / `status` 终态等起止标记保留；
+  stats（`final_text` / `events_seen` / `states`）仍完整统计，📬 最终结果
+  送达保持不变。与 `events` 同级热读（流式任务开始时读一次）。
 
 ### Changed
 
+- 「代码框渲染」开关替换为「内容开关」：面板第三行改为「内容显示」；代码框渲染
+  降级为内容显示时的**内部样式**（`render_line` 的 `code_blocks` 参数、fence 感知
+  分块与纯文本分块保留，直播路径固定 `code_blocks=True`），不再由配置控制。
+- collector 开关集合变为 `enabled` / `events` / `content`；dashboard GET/POST
+  与前端面板同步更新。
 - CONFIGURATION / README「直播消费者」节更新为「可在 Dashboard 改，改后即时
   生效（热读）」，并补充 Dashboard 面板部署注意（升级后需重启一次 dashboard
-  进程）。
+  进程）与内容开关语义（含旧键忽略、📬 送达不变说明）。
+
+### Deprecated
+
+- 配置键 `collector.code_blocks` 废弃并**一律忽略**（不读取、不报错、不迁移、
+  不当 fallback——旧 false 语义为纯文本行，当 fallback 会静默关闭全部内容，属
+  错误迁移）；配置文件残留该键无副作用。POST `/collector` 容忍它作为 `content`
+  的 deprecated 别名（升级窗口内已打开的旧面板不会报错），GET 永不返回该键。
 
 ### Tested
 
-- 单元测试 118 项：`test_consumer` 58、`test_origin_injection` 12、
-  `test_override` 17、`test_hot_read` 8（热读）、`test_dashboard_api` 23
-  （后端校验与写回）。
+- 单元测试 135 项：`test_consumer` 69（含内容开关渲染与编排）、
+  `test_origin_injection` 12、`test_override` 17、`test_hot_read` 10
+  （热读，含 content 与残留旧键忽略）、`test_dashboard_api` 27
+  （后端校验与写回，含旧键 deprecated 别名）。
 
 ## [0.1.1] - 2026-09-15
 

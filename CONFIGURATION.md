@@ -166,14 +166,13 @@ plugins:
 仅注入 origin，原 `a2a_call` 走同步 `SendMessage`（无直播、无双执行）；非 dsh 目标不受
 影响。
 
-### 代码框渲染开关（collector.code_blocks）
+### 内容开关（collector.content）
 
-完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.code_blocks`。
+完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.content`。
 
-直播内容是否以代码框渲染，可用该键单独开关（默认 `true`）。它与 `collector.enabled`
+直播是否显示**内容**可用该键单独开关（默认 `true`）。它与 `collector.enabled`
 的关系：`enabled` 是直播**总开关**（默认关，控制是否走单执行直播分支）；
-`code_blocks` 是**渲染子开关**（在直播已开启的前提下，控制操作内容以代码框还是
-纯文本渲染）。
+`content` 是**内容子开关**（在直播已开启的前提下，控制内容类事件是否推送）。
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -183,22 +182,47 @@ plugins:
       settings:
         collector:
           enabled: true
-          code_blocks: true       # 默认 true：工具命令/结果/长文本以代码框渲染
+          content: true        # 默认 true：直播全显（工具调用 + 输出 + 正文）
 ```
 
-- `true`（默认）：工具命令 / 执行结果 / 长最终文本以 ``` 代码框输出（围栏感知分块）。
-- `false`：上述内容回退纯文本行（不包围栏、不做围栏转义，内容完整），长文本分块
-  走普通换行边界分块（仍保留 `⏩ 续` 提示）。
+语义（与 `events` 正交，两键独立组合）：
 
-未配置时保持 `true`，向后兼容已部署副本的现有行为。
+| 事件类型 | `content: true`（默认） | `content: false` |
+| --- | --- | --- |
+| `turn_start`（🚀 第 N 轮） | 现状 | 保留（进度标记，非内容） |
+| `tool_call`（🔧 工具名 + 参数） | 现状 | 保留（工具名 + 参数摘要，渲染同现状） |
+| `tool_result`（📋） | 现状（含输出正文） | 只保留完成标记 `📋 \`name\` 完成`（不带输出正文） |
+| `text`（含 `final`） | 现状 | 不推（隐去 agent 正文/叙述） |
+| `thinking` | 现状 | 不推 |
+| `status` 终态（✅/❌/⚠️） | 现状 | 保留（起止标记） |
+| `turn_end` | 现状（渲染 None） | 现状 |
+
+- **生效时机**：与 `events` 同级——每个流式任务开始时热读一次，任务中途改配置
+  不影响进行中的任务；改后下一次任务即时生效（无需重启网关）。
+- **stats 完整性不变**：`content: false` 只是不推，`final_text` / `events_seen` /
+  `states` 仍完整统计（`_stream_dsh_call` 依赖 `final_text` 做结果送达）。
+- **📬 最终结果送达不变**：`content` 只作用于**中间直播**；任务完成时的最终结果
+  仍经 `_deliver_final_result` 主动送达（正文不隐去）。本轮需求按任务书解读为
+  「中间直播只显示工具调用」；若要求连最终送达的正文也隐去，那是一行开关的事，
+  属下一步决定。
+- **旧键忽略**：`collector.code_blocks` 自 v0.3.0 起废弃并**一律忽略**——不读取、
+  不报错、不迁移、不当 fallback。语义已变（旧 `false` = 纯文本行，若当 fallback
+  会静默把「内容」全关掉，属错误迁移）；配置文件里残留该键无副作用、无异常。
+- **代码框渲染保留为内部样式**：`content: true` 时操作内容（工具命令 / 执行结果 /
+  长最终文本）仍以 ``` 代码框渲染（围栏感知分块），不再单独暴露开关。
+
+未配置时保持 `true`，向后兼容已部署副本的现有观感（全显）。
 
 ### 事件流开关（collector.events）
 
 完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.events`。
 
-是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.code_blocks`
-正交：`code_blocks` 控制**渲染样式**（代码框还是纯文本），`events` 控制**推送范围**
-（中间事件 + 最终结果都推，还是只推最终结果）。
+是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.content`
+正交：`content` 控制**内容类事件是否显示**（开 = 工具调用 + 输出 + 正文全显，
+关 = 只显示工具调用与起止标记），`events` 控制**推送范围**（中间事件 + 最终结果
+都推，还是只推最终结果）。两键独立组合：`events: false` 时只有最终结果；
+`content: false` 时只有工具调用条目与起止标记；两者同时 `false` 时最终结果中
+的文本内容同样被隐去（只剩终态状态行），📬 送达不受影响。
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -214,7 +238,8 @@ plugins:
 - `true`（默认）：现状——中间事件（🔧 工具调用 / 📖 中间文本 / 🧠 thinking /
   状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
 - `false`（安静模式）：只推最终结果（📖 输出完成 + 终态状态行），中间事件不推
-  （不刷屏）。完成卡仍可含代码框，由 `code_blocks` 控制样式（两键正交）。
+  （不刷屏）。完成卡样式固定代码框（内部渲染方式，不再可配置；两键正交，
+  见「内容开关」节）。
 
 未配置时保持 `true`，向后兼容已部署副本的现有行为。
 
@@ -222,18 +247,20 @@ plugins:
 
 本插件自带 Dashboard 扩展面：插件管理页（9120「插件管理」）顶部显示
 「A2A 直播开关 / A2A live switches」卡片，三个开关（直播总开关 / 中间事件推送 /
-代码框渲染）可直接点选，保存**即时生效（无需重启网关）**——三开关在每次
+内容显示）可直接点选，保存**即时生效（无需重启网关）**——三开关在每次
 hook / 流式任务开始时热读 `ctx.get_config`（Hermes 配置读取按文件 mtime 签名
 缓存，改 config.yaml 后自动感知）。
 
 后端端点（挂在 dashboard 进程，与 gateway 解耦）：
 
 - `GET /api/plugins/hermes-a2a-bridge/collector` — 三开关当前值与默认值元数据
-  （**不返回任何密钥**）。
+  （`enabled` / `events` / `content`，**不返回任何密钥**，也永不返回已废弃的
+  `code_blocks` 键）。
 - `POST /api/plugins/hermes-a2a-bridge/collector` — 严格校验（只接受布尔、拒绝
   多余键）后原子写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`；
   写回保留条目顶层 `allow_tool_override` 与文件中其它所有键。失败返回 4xx/5xx
-  与明确 detail，不静默吞。
+  与明确 detail，不静默吞。升级窗口内旧面板 POST 的 `code_blocks` 被容忍为
+  `content` 的 deprecated 别名（写回的是 `content` 键）。
 
 部署注意：dashboard 插件后端路由与前端面板的发现都是一次性的——**升级插件后
 需重启一次 Hermes dashboard 进程**（或触发插件重扫）面板与 API 才会出现；
@@ -272,14 +299,17 @@ a2a_call（pre_tool_call hook）
 | `turn_start`（无 turn） | `🚀 开始执行` |
 | `turn_start`（含 turn N） | `🚀 第 N 轮` |
 | `thinking` | `🧠 思考中…` |
-| `tool_call` | `🔧 调用工具 \`{name}\`` |
-| `tool_result` | `📋 \`{name}\` 完成`（result 非空追加 ≤60 字符摘要） |
+| `tool_call` | `🔧 调用工具 \`{name}\``（带参数时命令进代码框） |
+| `tool_result` | `📋 \`{name}\` 完成`（result 非空时输出正文进代码框；空 result 仅标记） |
 | `text`（非 final） | `📖 {文本截断 ≤120}`（聚合到终态才 flush） |
 | `text`（final，lastChunk） | `📖 输出完成`（最终结果不整段刷屏） |
 | `status` completed | `✅ 完成` |
 | `status` failed | `❌ 失败` |
 | `status` canceled | `⚠️ 已取消` |
 | `status` working / submitted | （不单独发） |
+
+`collector.content: false` 时：`text`（含 final）与 `thinking` 行不推；
+`tool_result` 只保留 `📋 \`{name}\` 完成` 标记（无输出正文）；其余行不变。
 
 ### 节流与软上限
 
@@ -309,6 +339,11 @@ a2a_call（pre_tool_call hook）
    `~/.hermes/config.yaml` 的 `plugins.entries.hermes-a2a-bridge.settings.collector.*`
    同步变化（条目顶层 `allow_tool_override` 与其它键不丢）。首次部署面板需先重启
    一次 dashboard 进程（后端路由与插件发现是一次性的）。
+7. 内容开关确认：临时把 `collector.content` 关掉，下一个任务确认直播**只显示**
+   🔧 工具调用条目、📋 完成标记与 ✅/❌ 起止标记，**不显示**工具输出正文、
+   agent 正文/叙述与 thinking（无 📖 行）；任务结束时「📬 dsh 任务完成，结果
+   如下」仍照常送达。配置文件里残留的 `collector.code_blocks` 键无副作用
+   （被忽略，不报错）。
 
 ## 单元测试
 
@@ -325,7 +360,9 @@ python3 tests/test_dashboard_api.py
 一致的合成 SSE `data:` 串驱动 `parse_sse_lines` + `normalize_events` + `render_line`
 + `Throttler` + `make_sender`（mock sender 记录发送列表），覆盖归一化事件种类与顺序、
 渲染行 emoji 前缀、text 聚合只在终态 flush、高信号逐条、redact 调用、sender 两级
-回退（无 gateway → `no_gateway`）、异常事件不崩，并输出「事件序列 → 渲染消息样例」对照表。
+回退（无 gateway → `no_gateway`）、异常事件不崩，内容开关（`content=false` 只推
+工具调用条目与完成标记、text/thinking 不推、无 📖 行、stats 完整统计）、
+代码框渲染参数（内部样式），并输出「事件序列 → 渲染消息样例」对照表。
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
 dsh 目标（collector 开 + origin 非空 + message 非空）异步 spawn + 受理回执回传、
@@ -337,11 +374,13 @@ a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格�
 `test_hot_read.py` 覆盖三开关热读改造：`_read_switch` 改 FakeCtx 配置后再次调用
 拿到新值、`_CTX=None` 回退模块级全局、读取抛错回退 default、字符串布尔归一化，
 以及两个读取点（`_on_pre_tool_call` 的 enabled、`_stream_dsh_call` 的
-code_blocks / events）确实随配置变化切换行为、同一任务每键只热读一次、
-register() 写全局不回归。
+events / content）确实随配置变化切换行为、同一任务每键只热读一次、
+register() 写全局不回归、残留旧键 `collector.code_blocks` 被忽略（content 取
+默认 true）。
 
 `test_dashboard_api.py` 覆盖 Dashboard 后端（fake fastapi / hermes_cli）：
-POST body 严格校验（仅布尔 / 拒绝多余键 / 空对象 / 非对象）、collector partial
+POST body 严格校验（仅布尔 / 拒绝多余键 / 空对象 / 非对象）、旧键 `code_blocks`
+作为 `content` 的 deprecated 别名被接受并映射（GET 永不返回）、collector partial
 嵌套构造、写回姿势（`merge_existing=True` + `preserve_keys` 完整路径 + 损坏
 YAML fail-closed + managed 拒绝 + 失败 fail loud）、读取语义（settings →
 legacy config → 默认）、GET/POST handler 响应只含三键元数据（绝不带密钥）。

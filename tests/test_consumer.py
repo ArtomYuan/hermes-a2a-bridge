@@ -257,6 +257,79 @@ _EXPECTED_SENT = [
 ]
 
 
+class ToolCallSummaryTest(unittest.TestCase):
+    """`summarize_tool_call`：规则表 + 兜底截断（内容开关关时的工具调用摘要）。"""
+
+    def test_git_log_rule(self):
+        self.assertEqual(consumer.summarize_tool_call("git -C /x log --oneline -3"), "查看 git 提交记录")
+        self.assertEqual(consumer.summarize_tool_call("git log"), "查看 git 提交记录")
+        # 非 log 的 git 走兜底（保留命令首行）。
+        self.assertEqual(consumer.summarize_tool_call("git status"), "git status")
+
+    def test_file_read_rules(self):
+        self.assertEqual(
+            consumer.summarize_tool_call("sed -n '1,18p' /a/b/CHANGELOG.md"),
+            "读取文件（CHANGELOG.md）",
+        )
+        self.assertEqual(consumer.summarize_tool_call("head -12 CHANGELOG.md"), "读取文件（CHANGELOG.md）")
+        self.assertEqual(consumer.summarize_tool_call("cat /etc/hostname"), "读取文件（hostname）")
+        self.assertEqual(consumer.summarize_tool_call("tail -f /var/log/x.log"), "读取文件（x.log）")
+        # 没有文件参数时只报动作。
+        self.assertEqual(consumer.summarize_tool_call("head"), "读取文件")
+
+    def test_grep_rules(self):
+        self.assertEqual(consumer.summarize_tool_call('grep -rn "TODO" consumer.py'), "查找（TODO）")
+        self.assertEqual(consumer.summarize_tool_call("rg --hidden foo"), "查找（foo）")
+        # 无关键词 → 兜底短语。
+        self.assertEqual(consumer.summarize_tool_call("grep -rn"), "搜索文件内容")
+
+    def test_fixed_phrase_rules(self):
+        cases = {
+            "df -h /": "检查磁盘使用",
+            "free -h": "检查内存",
+            "du -sh /tmp/* | sort -rh | head -3": "统计目录占用",
+            "systemctl --user is-active x y": "检查服务状态",
+            "ls -la /tmp": "列出目录",
+            "ps aux | grep dsh": "查看进程",
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(consumer.summarize_tool_call(command), expected)
+
+    def test_wrapper_words_are_skipped(self):
+        self.assertEqual(consumer.summarize_tool_call("sudo df -h"), "检查磁盘使用")
+        self.assertEqual(consumer.summarize_tool_call("FOO=1 ls -l"), "列出目录")
+        self.assertEqual(consumer.summarize_tool_call("/usr/bin/df -h"), "检查磁盘使用")
+
+    def test_fallback_truncates_first_line(self):
+        summary = consumer.summarize_tool_call("wc -l /home/artom/.hermes/logs/gateway.log")
+        self.assertEqual(summary, "wc -l /home/artom/.hermes/logs/gateway.log")
+        long_command = "python3 -c 'print(1)' " + "--flag=" + "x" * 80
+        summary = consumer.summarize_tool_call(long_command)
+        self.assertLessEqual(len(summary), consumer._SUMMARY_FALLBACK_LIMIT)
+        self.assertTrue(summary.endswith("…"))
+        # 多行命令只取首行。
+        self.assertEqual(consumer.summarize_tool_call("wc -l a.txt\nrm -rf /"), "wc -l a.txt")
+
+    def test_json_arguments(self):
+        self.assertEqual(consumer.summarize_tool_call('{"command": "git status --short", "timeout": 30}'), "git status --short")
+        self.assertEqual(consumer.summarize_tool_call('{"path": "/home/artom/.hermes/config.yaml"}'), "读取文件（config.yaml）")
+        self.assertEqual(consumer.summarize_tool_call({"command": "df -h /"}), "检查磁盘使用")
+
+    def test_empty_arguments(self):
+        self.assertEqual(consumer.summarize_tool_call(""), "")
+        self.assertEqual(consumer.summarize_tool_call(None), "")
+        self.assertEqual(consumer.summarize_tool_call("   "), "")
+
+    def test_content_true_keeps_full_command(self):
+        # content=true 不受摘要逻辑影响：仍是工具名 + 命令代码框。
+        line = consumer.render_line(
+            {"type": "tool_call", "name": "bash", "arguments": "git log --oneline -3"},
+            content=True,
+        )
+        self.assertEqual(line, "🔧 `bash`\n```bash\ngit log --oneline -3\n```")
+
+
 class ParseAndNormalizeTest(unittest.TestCase):
     def setUp(self):
         self.results = _wire_sequence()
@@ -506,23 +579,28 @@ class RenderLineContentTest(unittest.TestCase):
         )
 
     def test_content_false_keeps_control_events(self):
-        # 起止标记照常渲染；工具调用只保留工具名（不带参数 / 命令正文）。
+        # 起止标记照常渲染；工具调用把命令换成人话摘要（不再是命令全文）。
         self.assertEqual(
             consumer.render_line({"type": "turn_start", "turn": 2}, content=False),
             "🚀 第 2 轮",
         )
         self.assertEqual(
             consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, content=False),
-            "🔧 `bash`",
+            "🔧 `bash` · 列出目录",
         )
+        # 无参数：只有工具名（没有摘要可给）。
         self.assertEqual(
             consumer.render_line({"type": "tool_call", "name": "bash"}, content=False),
             "🔧 `bash`",
         )
-        # name 缺失时的兜底措辞（不带参数）。
+        # name 缺失：退化为「🔧 <摘要>」/「🔧 工具调用」。
         self.assertEqual(
             consumer.render_line({"type": "tool_call", "arguments": "ls"}, content=False),
-            "🔧 调用工具",
+            "🔧 列出目录",
+        )
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call"}, content=False),
+            "🔧 工具调用",
         )
         self.assertEqual(
             consumer.render_line({"type": "status", "state": "completed"}, content=False),
@@ -897,30 +975,30 @@ class ConsumeStreamContentTest(unittest.TestCase):
 
     def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
-        # content=false 只收窄「操作内细节」：tool_call 无参数、tool_result 无输出；
-        # 操作流（🧠 thinking / 📖 叙述 / 📖 最终）+ 起止标记 ✅ 与 content=true 一致。
+        # content=false 把操作内细节换成人话摘要：tool_call 带摘要、tool_result 只有
+        # 完成标记；操作流（🧠 thinking / 📖 叙述 / 📖 最终）+ 起止标记 ✅ 与 true 一致。
         self.assertEqual(
             sent,
             [
                 "🧠 思考中…",
-                "🔧 `shell_exec`",
+                "🔧 `shell_exec` · 列出目录",
                 "📋 `shell_exec` 完成",
                 "📖 正在查看当前目录…",
                 "📖 输出完成",
                 "✅ 完成",
             ],
         )
-        # 细节不泄露：不出现工具参数 / 输出正文 / 任何代码框。
+        # 细节不泄露：不出现命令正文 / 输出正文 / 任何代码框。
         for line in sent:
+            self.assertNotIn("```", line)
             self.assertNotIn("ls\n", line)
             self.assertNotIn("total 4", line)
             self.assertNotIn("file1.txt", line)
-            self.assertNotIn("```", line)
-        # 与 content=true 的唯一差异就是被收窄的那两行。
+        # 与 content=true 的唯一差异就是被摘要化的那两行。
         self.assertEqual(len(sent), len(_EXPECTED_SENT))
         self.assertEqual(
             [line for line in sent if "🔧" in line or "📋" in line],
-            ["🔧 `shell_exec`", "📋 `shell_exec` 完成"],
+            ["🔧 `shell_exec` · 列出目录", "📋 `shell_exec` 完成"],
         )
         # stats 完整性不变：final_text / events_seen / states 仍完整统计。
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
@@ -988,13 +1066,13 @@ class ConsumeStreamContentTest(unittest.TestCase):
             min_interval=0.0, content=False,
         )
         # 操作流保留：🧠 thinking、📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；
-        # 只有工具调用的参数与工具输出正文被收窄掉。
+        # 工具调用把命令换成人话摘要，工具输出正文被隐去。
         self.assertEqual(
             sent,
             [
                 "🚀 第 1 轮",
                 "🧠 思考中…",
-                "🔧 `shell_exec`",
+                "🔧 `shell_exec` · 列出目录",
                 "📋 `shell_exec` 完成",
                 "📖 输出完成",
                 "📖 中间叙述正文",

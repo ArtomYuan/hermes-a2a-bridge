@@ -236,13 +236,33 @@ Semantics: `content` closes **operation details only; the operation flow stays**
 | Event type | `content: true` (default) | `content: false` |
 | --- | --- | --- |
 | `turn_start` (🚀 turn N) | current behavior | kept (operation-flow marker) |
-| `tool_call` (🔧 tool name + args) | current behavior (name + argument code block) | **tool name only** `🔧 \`name\`` (**no arguments / command body**, hence no code block) |
+| `tool_call` (🔧 tool name + args) | current behavior (name + argument code block) | tool name + **short summary** `🔧 \`name\` · <summary>` (command replaced by a plain-language phrase, see below) |
 | `tool_result` (📋) | current behavior (with output body) | completion marker only: `📋 \`name\` 完成` (no output body) |
 | `text` (incl. `final`, narrative) | current behavior | **kept** (operation flow, rendered exactly as with `true`) |
 | `thinking` | current behavior | **kept** (operation flow, rendered as `🧠 思考中…`) |
 | `status` terminal (✅/❌/⚠️) | current behavior | kept (start/end markers) |
 | `turn_end` | current behavior (renders None) | current behavior |
 
+- **Tool-call summary rules** (with `content: false`; generated heuristically in the
+  bridge, no extra field required from dsh): a matching rule yields a fixed phrase,
+  otherwise the command's first line is truncated to ~50 characters.
+
+  | Command | Summary |
+  | --- | --- |
+  | `git … log …` | 查看 git 提交记录 (view git log) |
+  | `sed` / `head` / `tail` / `cat` / `less` / `more` | 读取文件（文件名） (read file (name)) |
+  | `grep` / `rg` / `ag` | 查找（关键词） (find (keyword)); without a keyword → 搜索文件内容 (search file contents) |
+  | `df` | 检查磁盘使用 (check disk usage) |
+  | `free` | 检查内存 (check memory) |
+  | `du` | 统计目录占用 (measure directory usage) |
+  | `systemctl` | 检查服务状态 (check service status) |
+  | `ls` | 列出目录 (list directory) |
+  | `ps` | 查看进程 (view processes) |
+  | anything else | first line of the command, truncated (~50 chars) |
+
+  Leading `sudo` / `env` / `VAR=x` wrappers are skipped; when `arguments` is JSON the
+  `command` / `cmd` / `script` key wins, and a path-only object summarises as a file
+  read. The summaries themselves are Chinese, matching the plugin's other chat copy.
 - **When it takes effect**: same level as `events` — hot-read once at the start
   of each stream task; changing it mid-task does not affect the running task;
   the next task picks up the new value immediately (no gateway restart).
@@ -421,11 +441,12 @@ exactly as with `content: true`; all other lines are unchanged.
 7. Content-toggle confirmation: temporarily turn off `collector.content` and, on
    the next task, confirm the live stream still shows the full **operation flow**
    (🚀 turns, 🧠 thinking, 📖 narrative and final output, ✅/❌ start/end markers)
-   while the **operation details** narrow — 🔧 tool name only (e.g. `🔧 \`bash\``,
-   no arguments / command body, no code block) and 📋 the completion marker alone
-   (no output body); at task completion the "📬 dsh 任务完成，结果如下" message is
-   still delivered as usual. A residual `collector.code_blocks` key in the config
-   file has no side effects (ignored, no error).
+   while the **operation details** become summaries — 🔧 tool name + a plain-language
+   phrase (e.g. ``🔧 `bash` · 查看 git 提交记录``, no command body, no code block) and
+   📋 the completion marker alone (no output body); at task completion the
+   "📬 dsh 任务完成，结果如下" message is still delivered as usual. A residual
+   `collector.code_blocks` key in the config file has no side effects (ignored, no
+   error).
 
 ## Unit tests
 

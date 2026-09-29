@@ -9,6 +9,11 @@
 
 ### Changed
 
+- 内容开关的 tool_call 改为「简短摘要」（管理员最终取舍）：`content=false` 时不再
+  完全隐藏命令，而是渲染 `🔧 \`name\` · <摘要>`——命中规则表给固定人话短语
+  （git log / 读文件 / grep / df / free / du / systemctl / ls / ps），未命中取命令
+  首行截断到约 50 字符兜底；`content=true`（默认）仍显示命令全文/参数代码框。
+  `tool_result` 仍是完成标记、text/thinking 仍是操作流（不受影响）。
 - 内容开关边界修正（管理员最终澄清）：`content=false` 只关闭**操作内详细信息**
   （工具调用的参数 / 命令正文、工具输出正文），**不再关闭操作流**——`text`
   （叙述 / 说明，含 final）与 `thinking` 恢复渲染，与 `content=true` 同款；

@@ -241,6 +241,35 @@ DEFAULT_EVENTS = True
 # 内容开关默认开（向后兼容：已部署副本不配置即保持现状观感——直播全显）。
 DEFAULT_CONTENT = True
 
+# 内容开关关时 tool_call 的「简短摘要」：把命令换成人话短语（bridge 侧启发式，
+# 不依赖 dsh 提供额外字段）。规则表优先，未命中则取命令首行截断兜底。
+_SUMMARY_FALLBACK_LIMIT = 50
+
+# 首命令词 → 固定短语。
+_SUMMARY_PHRASES = {
+    "df": "检查磁盘使用",
+    "free": "检查内存",
+    "du": "统计目录占用",
+    "systemctl": "检查服务状态",
+    "ls": "列出目录",
+    "ps": "查看进程",
+}
+
+# 这些命令读文件：摘要里带上文件名（取最后一个位置参数）。
+_SUMMARY_FILE_COMMANDS = ("sed", "head", "tail", "cat", "less", "more")
+
+# 这些命令按「查找」语义摘要（带关键词时给出关键词）。
+_SUMMARY_SEARCH_COMMANDS = ("grep", "rg", "ag")
+
+# 命令前可跳过的包装词（不影响「首命令词」判定）。
+_SUMMARY_SKIP_WORDS = ("sudo", "env", "time", "nohup", "command", "exec")
+
+# tool_call 的 arguments 里，这些键承载可读命令文本。
+_SUMMARY_COMMAND_KEYS = ("command", "cmd", "script", "code", "shell")
+
+# 只带文件路径的工具（如 read_file）：按「读文件」语义摘要。
+_SUMMARY_PATH_KEYS = ("path", "file", "filename", "file_path", "target")
+
 
 def _escape_inner_fences(text: str) -> str:
     """把正文内的三层反引号围栏转义为不闭合外层代码框的形式。
@@ -372,6 +401,119 @@ def _is_final_event(event: Dict[str, Any]) -> bool:
     return False
 
 
+def _tool_argument_text(arguments: Any) -> str:
+    """把 tool_call 的 ``arguments`` 规范成可读的命令文本。
+
+    字符串直接返回；JSON 对象优先取 ``command`` / ``cmd`` / ``script`` 等命令键，
+    仅含 ``path`` / ``file`` 时映射为 ``cat <path>``（从而走「读取文件」规则），
+    其余对象退化为单行 JSON。
+
+    @param arguments - tool_call 事件的原始 ``arguments``。
+    @returns 单行命令文本（无内容时为空串）。
+    """
+    if isinstance(arguments, dict):
+        data: Any = arguments
+    else:
+        text = str(arguments or "").strip()
+        if not text:
+            return ""
+        data = None
+        if text.startswith("{") or text.startswith("["):
+            try:
+                data = json.loads(text)
+            except (ValueError, TypeError):
+                data = None
+        if data is None:
+            return text
+    if isinstance(data, dict):
+        for key in _SUMMARY_COMMAND_KEYS:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in _SUMMARY_PATH_KEYS:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"cat {value.strip()}"
+        return json.dumps(data, ensure_ascii=False)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _first_command_word(line: str) -> tuple:
+    """取一行的「首命令词」与其后的参数词（跳过 ``sudo`` / ``VAR=x`` 之类包装）。
+
+    @param line - 单行命令文本。
+    @returns ``(命令词, 其余词列表)``；整行都是包装词时命令词为空串。
+    """
+    words = line.split()
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in _SUMMARY_SKIP_WORDS:
+            index += 1
+            continue
+        if "=" in word and not word.startswith("-") and word.split("=", 1)[0].isidentifier():
+            index += 1
+            continue
+        break
+    if index >= len(words):
+        return "", []
+    return words[index].rsplit("/", 1)[-1], words[index + 1 :]
+
+
+def _summary_positional(words: list) -> list:
+    """过滤掉选项与 sed 脚本表达式，留下位置参数。
+
+    @param words - 命令词之后的原始词列表。
+    @returns 位置参数字符串列表（引号已剥离）。
+    """
+    out = []
+    for word in words:
+        stripped = word.strip("\"'")
+        if not stripped or stripped.startswith("-"):
+            continue
+        # sed 的脚本表达式（如 1,18p）不是文件。
+        if stripped.endswith(("p", "d")) and stripped[:-1].replace(",", "").isdigit():
+            continue
+        out.append(stripped)
+    return out
+
+
+def summarize_tool_call(arguments: Any) -> str:
+    """从 tool_call 的 ``arguments`` 生成「人话」摘要（内容开关关时使用）。
+
+    规则表优先（git log / sed·head·cat 等读文件 / grep / df / free / du /
+    systemctl / ls / ps），未命中时取命令首行截断到约 50 字符兜底；无法解析出
+    命令文本时返回空串。
+
+    @param arguments - tool_call 事件的原始 ``arguments``（字符串或对象）。
+    @returns 单行摘要；无可用信息时为空串。
+    """
+    text = _tool_argument_text(arguments).strip()
+    if not text:
+        return ""
+    line = text.splitlines()[0].strip()
+    if not line:
+        return ""
+    command, rest = _first_command_word(line)
+    positional = _summary_positional(rest)
+
+    if command == "git":
+        if any(word == "log" or word.startswith("log") for word in rest):
+            return "查看 git 提交记录"
+    elif command in _SUMMARY_FILE_COMMANDS:
+        if positional:
+            return f"读取文件（{positional[-1].rsplit('/', 1)[-1]}）"
+        return "读取文件"
+    elif command in _SUMMARY_SEARCH_COMMANDS:
+        if positional:
+            return f"查找（{_truncate(positional[0], 24)}）"
+        return "搜索文件内容"
+    elif command in _SUMMARY_PHRASES:
+        return _SUMMARY_PHRASES[command]
+
+    return _truncate(line, _SUMMARY_FALLBACK_LIMIT)
+
+
 def render_line(
     event: Dict[str, Any], code_blocks: bool = True, content: bool = True
 ) -> Optional[str]:
@@ -385,8 +527,9 @@ def render_line(
     开关控制。
 
     ``content=True``（默认）：与现状等价（全显）。``content=False``（内容开关
-    关）：只关闭**操作内细节**——tool_call 只保留工具名 ``🔧 `name```（不带参数 /
-    命令正文），tool_result 只返回 ``📋 `name` 完成`` 完成标记（不带输出正文）。
+    关）：把**操作内细节**换成人话摘要——tool_call 渲染为
+    ``🔧 `name` · <简短摘要>``（命令换短语，见 ``summarize_tool_call``），
+    tool_result 只返回 ``📋 `name` 完成`` 完成标记（不带输出正文）。
     **操作流不受影响**：text（含 final）与 thinking 与 ``content=True`` 同款渲染，
     turn_start / status 终态等起止标记照常。
     """
@@ -395,7 +538,14 @@ def render_line(
     if not content:
         if etype == "tool_call":
             name = event.get("name") or ""
-            return f"🔧 `{name}`" if name else "🔧 调用工具"
+            summary = summarize_tool_call(event.get("arguments"))
+            if name and summary:
+                return f"🔧 `{name}` · {summary}"
+            if name:
+                return f"🔧 `{name}`"
+            if summary:
+                return f"🔧 {summary}"
+            return "🔧 工具调用"
         if etype == "tool_result":
             name = event.get("name") or ""
             return f"📋 `{name}` 完成" if name else "📋 工具完成"

@@ -201,10 +201,13 @@ plugins:
   不影响进行中的任务；改后下一次任务即时生效（无需重启网关）。
 - **stats 完整性不变**：`content: false` 只是不推，`final_text` / `events_seen` /
   `states` 仍完整统计（`_stream_dsh_call` 依赖 `final_text` 做结果送达）。
-- **📬 最终结果送达不变**：`content` 只作用于**中间直播**；任务完成时的最终结果
-  仍经 `_deliver_final_result` 主动送达（正文不隐去）。本轮需求按任务书解读为
-  「中间直播只显示工具调用」；若要求连最终送达的正文也隐去，那是一行开关的事，
-  属下一步决定。
+- **边界：受理回执与最终结果送达不受本开关影响**（管理员明确）。`content` 只约束
+  **中间直播**的显示，两条「不静默」通路恒定：
+  - **① 秒回受理回执**：dsh 单执行分支在 `pre_tool_call` 里立刻返回
+    `{"action": "block", "message": "[dsh · context …] ⏳ 已受理——…"}`——它**只由
+    `collector.enabled` 门控**，`content` 取任何值回执均逐字节相同，受理速度不变。
+  - **② 完成时的最终结果送达**：任务完成后 `_deliver_final_result` 仍主动推
+    「📬 完成消息 + 结果全文」到同一消息面，**不因 `content: false` 省略正文**。
 - **旧键忽略**：`collector.code_blocks` 自 v0.3.0 起废弃并**一律忽略**——不读取、
   不报错、不迁移、不当 fallback。语义已变（旧 `false` = 纯文本行，若当 fallback
   会静默把「内容」全关掉，属错误迁移）；配置文件里残留该键无副作用、无异常。

@@ -85,6 +85,19 @@ def _install_fake_hermes_cli(config_dict):
     pkg.config = mod
 
 
+class _SettingsCtx:
+    """最小 ctx：``get_config`` 从字典读，让 ``_read_switch`` 走热读路径（非全局后门）。"""
+
+    def __init__(self, settings=None):
+        self.settings = dict(settings or {})
+
+    def get_config(self, key, default=None):
+        return self.settings.get(key, default)
+
+    def register_hook(self, *_args, **_kwargs):
+        """register() 兼容占位（本类只用于 _read_switch/流式路径）。"""
+
+
 class _FakeConsumer:
     """假 consumer 模块：记录 make_sender / consume_stream 调用。"""
 
@@ -310,6 +323,52 @@ class HookTest(unittest.TestCase):
         _MODULE._CONSUMER_MODULE = consumer
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         self.assertEqual(consumer.consume_stream_calls[0]["timeout"], 3600)
+
+    # 12b. 边界①：content 关不得影响「秒回受理回执」——回执只由 collector.enabled 门控。
+    def test_content_off_keeps_instant_receipt(self):
+        _install_fake_hermes_cli(_CONFIG)
+        _install_fake_gateway(
+            True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
+        )
+        spawned = []
+        _MODULE._spawn_stream_worker = lambda message, context_id: spawned.append(
+            (message, context_id)
+        )
+        receipts = {}
+        for content in (True, False):
+            _MODULE._CTX = _SettingsCtx(
+                {"collector.enabled": True, "collector.content": content}
+            )
+            receipts[content] = _MODULE._on_pre_tool_call(
+                "a2a_call", {"agent": "dsh", "message": "hi"}
+            )
+        _MODULE._CTX = None
+        self.assertEqual(receipts[True]["action"], "block")
+        self.assertEqual(receipts[True], receipts[False])  # 回执逐字节相同
+        self.assertIn("已受理", receipts[False]["message"])
+        self.assertEqual(spawned, [("hi", "feishu/oc_x"), ("hi", "feishu/oc_x")])
+
+    # 12c. 边界②：content 关不得影响「完成时最终结果送达」（📬 头行 + 全文）。
+    def test_content_off_still_delivers_final_result(self):
+        _install_fake_hermes_cli(_CONFIG)
+        consumer = _FakeConsumer()
+        _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._CTX = _SettingsCtx(
+            {"collector.content": False, "collector.events": True}
+        )
+        try:
+            result = _MODULE._stream_dsh_call("hi", "feishu/oc_x")
+        finally:
+            _MODULE._CTX = None
+        # 直播确实按内容开关渲染…
+        self.assertIs(consumer.consume_stream_calls[0]["content"], False)
+        # …但结果送达照旧：一条消息、📬 头行 + 最终全文、发到同一消息面。
+        delivered = consumer.senders[1][2]
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0][:3], ("feishu", "oc_x", ""))
+        self.assertIn("📬 **dsh 任务完成，结果如下**", delivered[0][3])
+        self.assertTrue(delivered[0][3].endswith("\n\n收到"))
+        self.assertIn("收到", result)
 
     # 13. register() 读 collector.enabled / content / events 配置。
     def test_register_reads_collector_settings(self):

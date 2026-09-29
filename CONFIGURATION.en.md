@@ -249,11 +249,16 @@ Semantics (orthogonal to `events`; the two keys compose independently):
 - **Stats stay complete**: `content: false` only suppresses pushes;
   `final_text` / `events_seen` / `states` are still fully recorded
   (`_stream_dsh_call` relies on `final_text` for result delivery).
-- **📬 final-result delivery unchanged**: `content` affects only the **live
-  stream**; the final result at task completion is still actively delivered via
-  `_deliver_final_result` (full body). This round's requirement is interpreted
-  as "the live stream shows tool calls only"; hiding the delivered final body
-  too would be a one-line change — a decision for the next step.
+- **Boundary: the receipt and the final-result delivery are unaffected by this
+  switch** (administrator's explicit requirement). `content` constrains only what
+  the **live stream** shows; the two never-silent paths are constant:
+  - **① Instant acceptance receipt**: the dsh single-execution branch returns
+    `{"action": "block", "message": "[dsh · context …] ⏳ accepted — …"}` straight
+    from `pre_tool_call`. It is gated by `collector.enabled` **alone**, so the
+    receipt is byte-identical for any `content` value and its latency is unchanged.
+  - **② Final-result delivery on completion**: `_deliver_final_result` still
+    pushes the "📬 task completed + full result" message to the same conversation;
+    `content: false` **never strips that body**.
 - **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
   **ignored entirely** — never read, never an error, never migrated, never a
   fallback. Its semantics changed (old `false` = plain-text lines; using it as a

@@ -36,10 +36,15 @@ boundaries; continuation chunks are joined with a `⏩ 续` marker, so code bloc
 never break across chunks.
 
 > The sample above is the `detailed` tier — tool commands and results go into code
-> blocks. By default `follow-dsh` follows dsh's current tier, and the dsh "Work
-> details" value in production today is `standard`, so the live stream is more
-> terse (tool lines keep the tool name + summary only); to get the look above, set
-> `collector.live_detail: detailed` (a one-line rollback).
+> blocks and thinking gets its own line (`🧠 思考中…`). By default `follow-dsh`
+> follows dsh's current tier, and the dsh "Work
+> details" value in production today is `standard`, so the live stream is **group
+> push**: each turn closes into one closed-state line (e.g.
+> `🔧 已读取文件并搜索代码` — "Read files and searched code"), `thinking` is **folded
+> into the group, never pushed on its own**, with a heartbeat line
+> `🔧 正在执行 · 第 N 步 · ...` every 6 steps, **no longer two lines per step**; to get
+> the per-step look above, set `collector.live_detail: detailed` (or `verbose`) — a
+> one-line rollback.
 
 ### Code blocks
 
@@ -64,12 +69,14 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 Progress display and intermediate-event push are both configurable
 (`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
 `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
-default `follow-dsh` to follow dsh's current tier; `collector.events` for the event
-stream — off is quiet mode, pushing the final result only, and it **outranks the
-tier**; code-block rendering stays as the internal style for a tier and is no
-longer a standalone switch), and can be toggled or selected from the "A2A live
-switches" panel on the Dashboard "Plugins" page (instant effect) — see
-[CONFIGURATION.en.md](CONFIGURATION.en.md).
+default `follow-dsh` to follow dsh's current tier; `standard` is **group push** — one
+closing line per turn (`thinking` folded into the group, never pushed on its own) plus a
+heartbeat every 6 steps, while `detailed` / `verbose` send
+per-step lines with code blocks; `collector.events` for the event stream — off is quiet
+mode, pushing the final result only, and it **outranks the tier**; code-block rendering
+stays as the internal style for a tier and is no longer a standalone switch), and can be
+toggled or selected from the "A2A live switches" panel on the Dashboard "Plugins" page
+(instant effect) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ## Architecture
 

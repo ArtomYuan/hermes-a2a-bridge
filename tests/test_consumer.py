@@ -542,7 +542,8 @@ class RenderLineCodeBlocksTest(unittest.TestCase):
 
 class RenderLineContentTest(unittest.TestCase):
     """content 开关：false 只关闭「操作内细节」（tool_call 参数 / tool_result 输出），
-    **操作流照常**——text（含 final）与 thinking 与 True 同款渲染。"""
+    **操作流照常**——text（含 final）照常渲染；thinking 在 standard（content=False）下
+    并入步骤组、不再单独渲染（对齐 ALIGN-FIX.md 修正 1）。"""
 
     def test_default_content_is_true(self):
         self.assertIs(consumer.DEFAULT_CONTENT, True)
@@ -558,10 +559,10 @@ class RenderLineContentTest(unittest.TestCase):
             "📖 输出完成",
         )
 
-    def test_content_false_keeps_thinking(self):
-        self.assertEqual(
-            consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False),
-            "🧠 思考中…",
+    def test_content_false_hides_thinking(self):
+        # standard（content=False）下思考并入步骤组，不再单独渲染一行（行为变更）。
+        self.assertIsNone(
+            consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False)
         )
 
     def test_content_false_tool_result_marker_only(self):
@@ -957,8 +958,9 @@ class ConsumeStreamEventsTest(unittest.TestCase):
 
 
 class ConsumeStreamContentTest(unittest.TestCase):
-    """consume_stream 的 content 开关：false 时只推工具调用条目与完成标记，
-    不推 text / thinking，且无 📖 行；stats 完整性不变。true 与现状一致。"""
+    """consume_stream 的 content 开关：false（standard 档）把工具步收敛为组推送
+    （每 6 步心跳 + turn_end/终态收口），操作流（thinking / 叙述 text / final /
+    起止标记）照常；stats 完整性不变。true（detailed 档）与现状一致。"""
 
     def tearDown(self):
         if hasattr(consumer, "_orig_iter_sse_data"):
@@ -993,14 +995,13 @@ class ConsumeStreamContentTest(unittest.TestCase):
 
     def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
-        # content=false 把操作内细节换成人话摘要：tool_call 带摘要、tool_result 只有
-        # 完成标记；操作流（🧠 thinking / 📖 叙述 / 📖 最终）+ 起止标记 ✅ 与 true 一致。
+        # content=false（standard 档）把工具步收敛为组推送：一轮的 tool_call +
+        # tool_result 不再逐条，收口为一条关闭态组行（🔧 <活动种类标题>）；操作流
+        # （📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常；思考并入组、不单独发「🧠 思考中…」。
         self.assertEqual(
             sent,
             [
-                "🧠 思考中…",
-                "🔧 `shell_exec` · 列出目录",
-                "📋 `shell_exec` 完成",
+                "🔧 已调用工具",
                 "📖 正在查看当前目录…",
                 "📖 输出完成",
                 "✅ 完成",
@@ -1012,17 +1013,19 @@ class ConsumeStreamContentTest(unittest.TestCase):
             self.assertNotIn("ls\n", line)
             self.assertNotIn("total 4", line)
             self.assertNotIn("file1.txt", line)
-        # 与 content=true 的唯一差异就是被摘要化的那两行。
-        self.assertEqual(len(sent), len(_EXPECTED_SENT))
+        # 工具步不再逐条：只有一条 🔧 关闭态组行，且无 📋 逐条完成行。
         self.assertEqual(
-            [line for line in sent if "🔧" in line or "📋" in line],
-            ["🔧 `shell_exec` · 列出目录", "📋 `shell_exec` 完成"],
+            [line for line in sent if "🔧" in line],
+            ["🔧 已调用工具"],
         )
+        self.assertFalse(any("📋" in line for line in sent))
+        # 思考全文不出现（并入组，不单独发）。
+        self.assertFalse(any("🧠" in line for line in sent))
         # stats 完整性不变：final_text / events_seen / states 仍完整统计。
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
-        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(stats["messages_sent"], 4)
 
     def test_content_false_turn_end_flushes_narrative(self):
         # 非 final text 仍被喂入 Throttler（操作流不关）→ turn_end 正常 flush 成 📖 行。
@@ -1056,9 +1059,10 @@ class ConsumeStreamContentTest(unittest.TestCase):
         self.assertEqual(sent, _EXPECTED_SENT)
 
     def test_content_false_mixed_stream_with_turn_start(self):
-        # 任务书要求的混合流：turn_start + tool_call + tool_result + 非 final text
-        # + final text + thinking + 终态 status。content=false 下只产出起止标记 +
-        # 工具调用条目与完成标记；正文 / 输出 / thinking 不出现，无 📖 行。
+        # 混合流：turn_start + thinking + tool_call + tool_result + 非 final text
+        # + final text + turn_end + 终态 status。content=false（standard 档）下
+        # 工具步收敛为一条关闭态组行（🔧 <活动种类标题>），正文 / 输出 / 思考全文
+        # 不出现；操作流（🚀 起止标记 / 📖 叙述与最终）照常；思考并入组、不发单独行。
         results = [
             {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
             _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
@@ -1083,15 +1087,14 @@ class ConsumeStreamContentTest(unittest.TestCase):
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
             min_interval=0.0, content=False,
         )
-        # 操作流保留：🧠 thinking、📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；
-        # 工具调用把命令换成人话摘要，工具输出正文被隐去。
+        # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；思考并入组、不单独发；
+        # 工具步收口为一条关闭态组行（shell_exec 未知 → tools 兜底 → 已调用工具），
+        # 组行先于触发的最终文本行发出。
         self.assertEqual(
             sent,
             [
                 "🚀 第 1 轮",
-                "🧠 思考中…",
-                "🔧 `shell_exec` · 列出目录",
-                "📋 `shell_exec` 完成",
+                "🔧 已调用工具",
                 "📖 输出完成",
                 "📖 中间叙述正文",
                 "✅ 完成",
@@ -1103,11 +1106,13 @@ class ConsumeStreamContentTest(unittest.TestCase):
             self.assertNotIn("file1.txt", line)
             self.assertNotIn("内部推理线索ALPHA", line)
             self.assertNotIn("```", line)
+        # 思考不单独发「🧠 思考中…」行。
+        self.assertFalse(any("🧠" in line for line in sent))
         # stats 完整：final_text 仍记录（📬 送达依赖它）。
         self.assertEqual(stats["final_text"], "最终结果正文")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "completed"])
-        self.assertEqual(stats["messages_sent"], 7)
+        self.assertEqual(stats["messages_sent"], 5)
 
 
 class LiveDetailLevelTest(unittest.TestCase):

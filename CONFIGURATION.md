@@ -6,7 +6,9 @@
 > SSE 流边把中间进度推回飞书 / QQ（`collector.enabled` 门控，默认关），结束时把最终
 > 结果以普通消息主动送达消息面——任务只跑一遍，「完成」之后不静默。
 > v0.4.0 起直播过程展示按**四档**裁剪（`collector.live_detail`，默认 `follow-dsh`
-> 跟随 dsh「工作步骤展示」；见「直播档位」）。
+> 跟随 dsh「工作步骤展示」；见「直播档位」）。v0.4.1 起 `standard` 档由「每步两条」
+> 改为**步骤组推送**（每轮一条收口行 + 每 6 步一条心跳，`thinking` **并入组、
+> 不再单独推送**）；想要逐条请用 `detailed` / `verbose`。
 > override 方案（`register_tool(override=True)`）因注册机制在真实 gateway 不可靠已弃用。
 
 ## 行为
@@ -201,15 +203,16 @@ plugins:
 > `normal` / `expanded` 一律读作 `detailed`。dsh 档位只影响其**客户端渲染**（事件流
 > 本身始终全量），桥按同一命名近似裁剪自己的直播行。
 
-四档 → 直播渲染（单调阶梯；`standard` / `detailed` 精确复刻 v0.3.3 的
-`content: false` / `content: true` 两条既有路径）：
+四档 → 逐事件渲染（`compact` / `detailed` / `verbose` 逐字不变，`detailed` 仍精确
+复刻 v0.3.3 的 `content: true`；`standard` 自 v0.4.1 起把工具事件改为**组推送**、
+`thinking` **并入组不单独推送**，见下文「中间事件推送密度与步骤组」）：
 
 | 事件 | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
 | `turn_start` | 🚀 轮次标记 | 同左 | 同左 | 同左 |
-| `tool_call` | **不发** | `🔧 \`name\` · <摘要>`（无代码框） | `🔧 \`name\`` + 参数**代码框**（全量） | = `detailed`（工具行两档相同） |
-| `tool_result` | **不发** | 仅 `📋 \`name\` 完成`（无正文） | `📋 \`name\` 完成` + 输出**代码框**（全量） | = `detailed`（工具结果两档相同） |
-| `thinking` | **不发** | `🧠 思考中…` | 同左 | 同左 |
+| `tool_call` | **不发** | **进组缓冲**（不逐条；收口时以组行呈现） | `🔧 \`name\`` + 参数**代码框**（全量） | = `detailed`（工具行两档相同） |
+| `tool_result` | **不发** | **进组缓冲**（不逐条；并计入组内步数） | `📋 \`name\` 完成` + 输出**代码框**（全量） | = `detailed`（工具结果两档相同） |
+| `thinking` | **不发** | **并入组**（不单独发；其存在经收口标题「已完成分析」体现） | `🧠 思考中…` | 同左 |
 | `text`（叙述 / 最终） | 发 | 发 | 发（非 final 截断 ≤120） | 发（非 final **不截断**） |
 | `status` 终态 / 错误 | **必发** | **必发** | **必发** | **必发** |
 
@@ -220,10 +223,12 @@ plugins:
 - `compact` 比旧 `content: false` **更严**（连工具行与思考行都不发）；`verbose` 与
   `detailed` 的唯一差异是**非 final 叙述文本不截断**——工具参数 / 结果在 `detailed`
   已是全量（v0.3.3 的 `content: true` 本就对它们不截断）。
-- **向后兼容锚点（逐字等价，有测试锁定）**：`standard` ≡ 旧 `content: false`；
-  `detailed` ≡ 旧 `content: true`。故升到新配置体系不会改变这两个既有档位的观感。
-- **`standard` 档的工具调用摘要规则**（bridge 侧启发式生成，不依赖 dsh 提供额外
-  字段）：命中规则表用固定短语，未命中取命令首行截断到约 50 字符。
+- **向后兼容锚点（逐字等价，有测试锁定）**：`detailed` ≡ 旧 `content: true`。**`standard`
+  自 v0.4.1 起不再逐条**，改为组推送（`thinking` 并入组、不单独推送），**不再**等价于
+  旧 `content: false`——想要旧的逐条观感请设 `detailed` / `verbose`。
+- **`standard` 档的步骤摘要规则**（bridge 侧启发式生成，不依赖 dsh 提供额外
+  字段）：心跳行的 `<最近一步摘要>` 命中规则表用固定短语，未命中取命令首行截断到
+  约 50 字符；参数为对象且无命令键时优先取标识性键 `key=value`（见「摘要小改进」）。
 
   | 命令 | 摘要 |
   | --- | --- |
@@ -243,6 +248,100 @@ plugins:
 - **生效时机**：与 `events` 同级——每个流式任务开始时热读一次（`follow-dsh` 同时解析
   dsh 文件）；任务中途改配置不影响进行中的任务，改后下一次任务即时生效（无需重启
   网关）。
+
+### 中间事件推送密度与步骤组（standard）
+
+四档在**中间事件推送密度**上的差异（v0.4.1 起）：
+
+| 档位 | 中间事件推送密度 |
+| --- | --- |
+| `compact` | **无工具行**（不变；连工具行与思考行都不发） |
+| `standard` | **组推送**：每个轮次收口为**一条**关闭态行（如 `🔧 已读取文件并搜索代码`；取 Top-3 类，1 类直出 / 2 类用「并」/ 3 类用「，」连接 / >3 类追加「等」，见下文对照表）；`thinking` **并入组、不单独发**；长任务每 **6 步**追加一条心跳行 `🔧 正在执行 · 第 N 步 · <最近一步摘要>`；**不再每步两条**（v0.4.1 改动） |
+| `detailed` | **逐条**（不变）：工具名 + 参数代码框、结果代码框 |
+| `verbose` | **逐条**（不变）：同 `detailed`，且非 final 叙述不截断 |
+
+`compact` / `detailed` / `verbose` 的逐条渲染逐字不变；`follow-dsh` 与优先级链（显式
+档 > `follow-dsh` > 遗留 `content` > 默认）不变。
+
+#### 组推送规则
+
+- **分组单位 = 一轮（turn）**：`standard` 档下 `tool_call` / `tool_result` 不再逐条
+  发出，只进组缓冲；`thinking` 作为**组成员**并入当前组（kind = `thinking`）、
+  **不单独发出一行**，且**不计入**心跳的步骤计数。
+- **发时机**：
+  1. **心跳**：组内累计每满 **6 步**发一条**开放态**行（长任务仍能看到「在做什么」）；
+  2. **收口**：`turn_end`、终态 `status`、final `text`（防御性），或轮次切换（新
+     `turn_start` 到达时上一轮组未收口）时，把该轮组收口为**一条关闭态行**；
+  3. 若整轮只有思考没有工具步，收口标题即为「已完成分析」；
+  4. 收口后同轮若继续有工具步，则开启新的一段（同一轮可能有多条组行，语义为
+     「该轮的若干片段」）。
+- **顺序**：组行永远**先于**触发它的那条叙述 `text` / 终态行 / 新轮 `turn_start`
+  发出（保持时间线可读）。
+- **行格式**：
+
+  | 形态 | 格式 |
+  | --- | --- |
+  | 开放态（心跳） | `🔧 正在执行 · 第 N 步 · <最近一步摘要>` |
+  | 关闭态（收口） | `🔧 <活动种类标题>`（取 Top-3 类，连接规则见下） |
+
+- **收口标题拼接规则**（逐字对齐 dsh `processTitle`）：
+
+  | 组内类别数 | 收口标题 | 对照例 |
+  | --- | --- | --- |
+  | 1 类 | 该类的落定文案 | `执行了命令`（`commands`） |
+  | 2 类 | `{第一类}并{第二类}`；两段都以「已」开头时第二段去掉「已」 | `已读取文件并搜索代码`（`read` + `search`） |
+  | 3 类 | 三段用 **`，`** 连接 | `已读取文件，已搜索代码，已写入文件`（`read` + `search` + `write`） |
+  | >3 类 | 取 Top-3 类按 3 类规则连接后追加 **`等`**（**不带计数**） | `已读取文件，已搜索代码，已写入文件等`（上述三类 + `commands` 等） |
+
+#### 活动种类词表
+
+工具名按 dsh `activity()` **原表**映射到活动种类（含前缀匹配；未知工具归 `tools`）：
+
+| 工具名（含前缀匹配） | kind | 关闭态文案（中文） | dsh 英文文案 |
+| --- | --- | --- | --- |
+| `read` | `read` | 已读取文件 | Read files |
+| `read_image` | `readImage` | 已读取图片 | Read images |
+| `grep` / `glob` / `*_inspect` | `search` | 已搜索代码 | Searched code |
+| `write` | `write` | 已写入文件 | Wrote files |
+| `edit` / `apply_patch` | `edit` | 修改了文件 | Edited files |
+| `bash` / `pwsh` / `exec_command` / `write_stdin` / `terminal_*` | `commands` | 执行了命令 | Ran commands |
+| `run_code` | `code` | 运行了代码 | Ran code |
+| `web_search` | `webSearch` | 已搜索网页 | Searched the web |
+| `web_fetch` | `webFetch` | 已访问网页 | Visited web pages |
+| `subagent` / `subagent_*` | `subagents` | 已协调子智能体 | Coordinated subagents |
+| `todo_write` / `create_goal` / `update_goal` / `get_goal` | `plan` | 更新了计划 | Updated the plan |
+| `ask_user_question` / `request_user_input` | `questions` | 向用户提出了问题 | Asked questions |
+| （`thinking` 思考成员） | `thinking` | 已完成分析 | Analysis completed |
+| 其它（兜底） | `tools` | 已调用工具 | Called tools |
+
+**桥侧扩展**：`spawn_teammate` / `send_message` / `wait_agent` / `list_agents` /
+`interrupt_agent` / `team_task_*` → `subagents`（dsh 无这些工具，归属桥侧扩展）。
+
+关闭态文案与 dsh 的步骤过程完成态文案（`message.stepProcess.done.*`）一致；
+`detailed` / `verbose` 的逐条渲染不受本表影响。
+
+#### 与 dsh 的对应关系（设计取舍）
+
+dsh 侧 `standard` 在 GUI 里把**整轮过程折叠成一行组头**，且该组头在运行中会**原地
+更新**显示当前步骤；桥是**只追加、不可更新**的聊天流，无法原地改写已发出的消息，
+故等价实现为**「每轮一条收口行 + 每 6 步一条心跳」**：用「先心跳、后收口」近似 dsh
+「原地更新的组头」，用「收口行」近似 dsh「落定后的关闭组头」。**这是只追加聊天流的
+必然取舍，不是缺陷**——过程信息不丢，密度与 dsh `standard` 同量级。
+
+#### 不变式
+
+- **终态与错误在任何档位都不受影响**：任务终态（✅ / ❌ / ⚠️）、错误信息、
+  `final_text` 送达与 stats（`events_seen` / `messages_sent` 等）**在任何档位都不变**。
+- **组缓冲在终态强制收口**：`turn_end` / 终态 `status` 时必定把未收口的组发出，
+  **绝不允许丢掉已发生的步骤信息**。
+- **`collector.events: false`（安静模式）优先于档位**（不变）。
+
+#### 摘要小改进
+
+当工具 `arguments` 是对象且**没有命令键**（`command` / `cmd` / `script`）时，`standard`
+档摘要优先取标识性键的 `key=value`，顺序为 `job_id` → `id` → `name` →
+`path` / `file_path` → `query` → `url`；仍无则退化为现有单行 JSON 截断。仅影响
+`standard` 档摘要文案，`detailed` / `verbose` 用原文，不受影响。
 
 ### follow-dsh 解析规则
 
@@ -269,13 +368,14 @@ plugins:
 | --- | --- |
 | `live_detail` 显式设为四档之一 | 该档位（不读 dsh 文件） |
 | `live_detail: follow-dsh` | 解析 dsh 文件；失败回落 `detailed` |
-| `live_detail` 未设置，`content` 已显式设置 | 沿用 `content` 映射（**既有部署行为不变**） |
+| `live_detail` 未设置，`content` 已显式设置 | 沿用 `content` 映射（档位选择不变；`standard` 档行为见下方 v0.4.1 说明） |
 | 两者都未设置 | `follow-dsh`（v0.4.0 新默认） |
 
 遗留 `collector.content`（布尔）**继续生效**：`true` → `detailed`、`false` → `standard`
-（精确保持 v0.3.3 行为）。升级后：已显式设置 `content` 的部署**行为逐字节不变**；
-两者都未设置的部署自动改为跟随 dsh。**注意**：dsh 当前生效档位是 `standard`，故
-「两者都未设置」的部署升级后会比 v0.3.3 更简洁——恢复 v0.3.3 观感只需一行
+（**映射不变**）。**v0.4.1 起 `standard` 档本身由逐条改为组推送**，故：`content: true`
+（→ `detailed`）的部署观感逐字节不变；`content: false`（→ `standard`）与两者都未设置
+的部署升级后都会变成**组推送**。**注意**：dsh 当前生效档位是 `standard`，故「两者都
+未设置」的部署直播为组推送；恢复 v0.3.3 的逐条观感只需一行
 `collector.live_detail: detailed`。
 
 - **stats 完整性不变**：档位不改变统计口径，`final_text` / `events_seen` / `states`
@@ -291,8 +391,9 @@ plugins:
   不报错、不迁移、不当 fallback。语义已变（旧 `false` = 纯文本行，若当 fallback
   会静默把「内容」全关掉，属错误迁移）；配置文件里残留该键无副作用、无异常。
 - **代码框渲染保留为内部样式**：操作内容（工具命令 / 执行结果 / 长最终文本）仍以
-  围栏代码块渲染（围栏感知分块），不再单独暴露开关；`standard` 下被收窄的只有工具
-  调用参数与工具输出正文，`compact` 则连工具行与思考行都不发。
+  围栏代码块渲染（围栏感知分块），不再单独暴露开关；`detailed` / `verbose` 逐条带
+  参数 / 输出代码框，`standard` 只保留组行摘要（无代码框），`compact` 则连工具行与
+  思考行都不发。
 
 未配置且未设置遗留 `content` 时使用 `follow-dsh`（v0.4.0 起的新默认）。
 
@@ -304,8 +405,9 @@ plugins:
 正交：`live_detail` 控制**过程行的展示粒度**（四档），`events` 控制**推送范围**
 （中间事件 + 最终结果都推，还是只推最终结果）。两键独立组合：`events: false` 时
 **安静模式优先于档位**——无论档位为何都只推最终结果；`live_detail: compact` 时
-工具行与思考行不发而 `text` / 终态照常；两者叠加时同样只推最终结果（其过程行按
-档位渲染），📬 送达不受影响。
+工具行与思考行不发而 `text` / 终态照常；`live_detail: standard` 时工具步骤改为
+**组推送**（心跳 + 收口，见「中间事件推送密度与步骤组」）而 `text` / 终态照常；
+两者叠加时同样只推最终结果（其过程行按档位渲染），📬 送达不受影响。
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -318,8 +420,8 @@ plugins:
           events: true            # 默认 true：中间事件 + 最终结果都推
 ```
 
-- `true`（默认）：现状——中间事件（🔧 工具调用 / 📖 中间文本 / 🧠 thinking /
-  状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
+- `true`（默认）：现状——中间事件（🔧 工具调用 / 📖 中间文本 / 🧠 thinking（`standard`
+  档并入组、不单独推送）/ 状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
 - `false`（安静模式）：只推最终结果（📖 输出完成 + 终态状态行），中间事件不推
   （不刷屏）。完成卡样式固定代码框（内部渲染方式，不再可配置；安静模式优先于
   档位，见「直播档位」节）。
@@ -368,7 +470,7 @@ a2a_call（pre_tool_call hook）
                         │
               render_line（T0 emoji 行语言）
                         │
-              Throttler（高信号逐条 / text 聚合 / 全局限速）
+              Throttler（standard 组缓冲 + 心跳/收口 / 其余高信号逐条 / text 聚合 / 全局限速）
                         │
               redact_sensitive_text(force=True)
                         │
@@ -395,13 +497,19 @@ a2a_call（pre_tool_call hook）
 | `status` working / submitted | （不单独发） |
 
 档位对上述行的影响见「直播档位」节的四档渲染表：`compact` 下 `tool_call` /
-`tool_result` / `thinking` 行不发；`standard` 下 `tool_call` 只留工具名 + 摘要、
-`tool_result` 只留完成标记；`detailed` / `verbose` 渲染方式不变，后者不截断。
-**终态行（✅ / ❌ / ⚠️）与错误在任何档位都必发。**
+`tool_result` / `thinking` 行不发；`standard` 下 `tool_call` / `tool_result` 不逐条
+成行，改为组推送（心跳 `🔧 正在执行 · 第 N 步 · <最近一步摘要>`、收口
+`🔧 <活动种类标题>`），且 `thinking` **并入组、不单独成行**——组行先于触发的
+`text` / 终态行发出（`thinking` 已不再是收口触发器）；`detailed` / `verbose` 渲染
+方式不变（仍发 `🧠 思考中…`），后者不截断。**终态行（✅ / ❌ / ⚠️）与错误在任何档位
+都必发**，组缓冲在终态强制收口、不丢步骤信息。
 
 ### 节流与软上限
 
-- 高信号（turn_start / thinking / tool_call / tool_result / status 终态）逐条放行。
+- 高信号（turn_start / thinking / tool_call / tool_result / status 终态）逐条放行；
+  **例外：`standard` 档把 `tool_call` / `tool_result` / `thinking` 收进组缓冲**
+  （`thinking` 并入组、不单独成行、不计步），按「每 6 步心跳 / 收口」成组发出
+  （见「中间事件推送密度与步骤组」）。
 - 低信号 `text`（非 final）只累积、不逐条发；在 `turn_end` 或 status 终态时 flush
   为一条 `📖` 行。
 - 全局限速：相邻两次 send 至少间隔 `min_interval` 秒（默认 2.0）。
@@ -415,8 +523,10 @@ a2a_call（pre_tool_call hook）
    `plugins.entries.hermes-a2a-bridge.settings`。
 3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察 ①agent
    立即（秒级）收到「已受理」回执、不再长阻塞；②对话收到
-   `🚀 开始执行` → `🧠 思考中…` → `🔧 …` → `📋 … 完成` → `📖 输出完成`
-   → `✅ 完成`（具体行样式随直播档位，默认 `follow-dsh` 跟随 dsh 当前档位），且
+   `🚀 开始执行` → 过程行 → `📖 输出完成` → `✅ 完成`（具体行样式随直播档位：
+   `standard` 为组推送，如收口行 `🔧 已读取文件并搜索代码` + 每 6 步一条心跳，且
+   `thinking` 并入组、不单独推送；`detailed` 逐条 `🧠 思考中…` / `🔧 …` /
+   `📋 … 完成`；默认 `follow-dsh` 跟随 dsh 当前档位），且
    **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
    ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 全文）。
 4. redact 确认：进度文本中的 token 不落明文。
@@ -430,17 +540,22 @@ a2a_call（pre_tool_call hook）
    同步变化（条目顶层 `allow_tool_override` 与其它键不丢）。首次部署面板需先重启
    一次 dashboard 进程（后端路由与插件发现是一次性的）。
 7. 直播档位确认：把 `collector.live_detail` 依次设为 `compact` / `standard` /
-   `detailed` / `verbose`，确认四档渲染与「直播档位」节的四档表一致（`compact` 不发
-   工具行与思考行；`standard` 工具行为「工具名 + 人话摘要」、结果只留完成标记；
-   `detailed` 带参数 / 输出代码框（全量）；`verbose` 唯一差异是非 final 叙述不截断），且**任务终态与错误
-   在任何档位都照常送达**、「📬 dsh 任务完成，结果如下」不受影响。设回 `follow-dsh`
-   后，确认档位跟随 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 中 `ui-chat`
-   条目的 `config.transcriptView`（旧值 `normal` / `expanded` 读作 `detailed`）；
-   再制造缺文件 / 坏 YAML / 无 `ui-chat` 条目 / 无该键 / 非法值之一，确认**回落
-   `detailed`**、只记一次日志且任务不阻塞。若保留了遗留 `collector.content` 且未设
-   `live_detail`，确认沿用 `content` 映射（`true` → `detailed`、`false` →
-   `standard`）。配置文件里残留的 `collector.code_blocks` 键无副作用（被忽略，
-   不报错）。
+   `detailed` / `verbose`，确认四档渲染与「直播档位」节一致（`compact` 不发
+   工具行与思考行；`standard` 为**组推送**——每轮一条收口行如
+   `🔧 已读取文件并搜索代码`、每 6 步一条心跳 `🔧 正在执行 · 第 N 步 · …`，
+   且 `thinking` **并入组、不单独推送**（其存在经收口标题「已完成分析」体现）、
+   组行先于触发的 `text` / 终态行，**不再每步两条**；
+   `detailed` 逐条带参数 / 输出代码框（全量）并仍发 `🧠 思考中…`；`verbose` 唯一
+   差异是非 final 叙述不截断），且**任务终态与错误在任何档位都照常送达**、
+   「📬 dsh 任务完成，结果如下」不受影响；另确认 `standard` 档在 `turn_end` /
+   终态强制收口、不丢步骤信息。设回
+   `follow-dsh` 后，确认档位跟随 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+   中 `ui-chat` 条目的 `config.transcriptView`（旧值 `normal` / `expanded` 读作
+   `detailed`）；再制造缺文件 / 坏 YAML / 无 `ui-chat` 条目 / 无该键 / 非法值之一，
+   确认**回落 `detailed`**、只记一次日志且任务不阻塞。若保留了遗留
+   `collector.content` 且未设 `live_detail`，确认沿用 `content` 映射（`true` →
+   `detailed`、`false` → `standard`；`false` 的观感同样为组推送）。配置文件里残留的
+   `collector.code_blocks` 键无副作用（被忽略，不报错）。
 
 ## 单元测试
 
@@ -458,10 +573,12 @@ python3 tests/test_dashboard_api.py
 + `Throttler` + `make_sender`（mock sender 记录发送列表），覆盖归一化事件种类与顺序、
 渲染行 emoji 前缀、text 聚合只在终态 flush、高信号逐条、redact 调用、sender 两级
 回退（无 gateway → `no_gateway`）、异常事件不崩，直播档位四档渲染（`compact` 不发
-工具行与思考行、`standard` 只留工具名 + 摘要与完成标记、`detailed` 带参数 / 输出
-代码框、`verbose` 不截断，逐事件断言）、遗留 `content` 映射（`true` → `detailed` /
-`false` → `standard`）、**终态与错误在任何档位都不丢**、
-代码框渲染参数（内部样式），并输出「事件序列 → 渲染消息样例」对照表。
+工具行与思考行；`standard` 组推送——逐事件断言 `thinking` 并入组不单独成行、心跳、
+收口、与 `text` / `turn_end` / 终态的顺序、活动种类映射与收口标题合成
+（1 / 2 / 3 / >3 类）、组缓冲在终态必收口、摘要小改进；`detailed` 带参数 /
+输出代码框、`verbose` 不截断）、遗留
+`content` 映射（`true` → `detailed` / `false` → `standard`）、**终态与错误在任何档位
+都不丢**、代码框渲染参数（内部样式），并输出「事件序列 → 渲染消息样例」对照表。
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
 dsh 目标（collector 开 + origin 非空 + message 非空）异步 spawn + 受理回执回传、

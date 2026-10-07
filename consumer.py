@@ -45,6 +45,40 @@ _HIGH_SIGNAL_TYPES = frozenset({"turn_start", "thinking", "tool_call", "tool_res
 # 触发 text 缓冲 flush 的终态（status 终态；turn_end 单独处理）。
 _TERMINAL_STATES = frozenset({"completed", "failed", "canceled"})
 
+# --------------------------------------------------------------------------
+# standard 档「步骤组」收敛：心跳步数、活动种类文案、工具名 → 种类映射。
+# 对齐 dsh message.stepProcess.done.* 措辞（见 ALIGN-FIX.md 修正 2/3）。
+# --------------------------------------------------------------------------
+
+# 组内累计每满这些步数发一条开放态心跳行。
+_GROUP_HEARTBEAT_STEPS = 6
+
+# 活动种类 → 关闭态中文文案（对齐 dsh message.stepProcess.done.*，逐字）。
+_TOOL_KIND_TEXT = {
+    "read": "已读取文件",
+    "readImage": "已读取图片",
+    "search": "已搜索代码",
+    "write": "已写入文件",
+    "edit": "修改了文件",
+    "commands": "执行了命令",
+    "code": "运行了代码",
+    "webSearch": "已搜索网页",
+    "webFetch": "已访问网页",
+    "subagents": "已协调子智能体",
+    "plan": "更新了计划",
+    "questions": "向用户提出了问题",
+    "thinking": "已完成分析",
+    "tools": "已调用工具",
+}
+
+# 桥侧扩展（dsh 无这些工具，按其语义就近归入 subagents；见 ALIGN-FIX.md 修正 3）。
+_SUBAGENT_TOOLS = frozenset(
+    {"spawn_teammate", "send_message", "wait_agent", "list_agents", "interrupt_agent"}
+)
+
+# 「更新计划」类工具（对齐 dsh activity()：todo_write / create_goal / update_goal / get_goal）。
+_PLAN_TOOLS = frozenset({"todo_write", "create_goal", "update_goal", "get_goal"})
+
 
 def _new_request_id() -> str:
     """生成一个对 dsh 无意义的 JSON-RPC request id（仅用于回包对齐）。"""
@@ -283,6 +317,9 @@ _SUMMARY_COMMAND_KEYS = ("command", "cmd", "script", "code", "shell")
 # 只带文件路径的工具（如 read_file）：按「读文件」语义摘要。
 _SUMMARY_PATH_KEYS = ("path", "file", "filename", "file_path", "target")
 
+# 摘要小改进：对象参数无命令键时，优先取这些标识性键的 ``key=value``（顺序即优先级）。
+_IDENTIFIER_KEYS = ("job_id", "id", "name", "path", "file_path", "query", "url")
+
 
 def _escape_inner_fences(text: str) -> str:
     """把正文内的三层反引号围栏转义为不闭合外层代码框的形式。
@@ -447,6 +484,12 @@ def _tool_argument_text(arguments: Any) -> str:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 return f"cat {value.strip()}"
+        # 无命令键：优先取标识性键的 key=value（job_id/id/name/path/... 等），
+        # 仍无则退化为单行 JSON（summarize_tool_call 会再截断）。
+        for key in _IDENTIFIER_KEYS:
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return f"{key}={value}"
         return json.dumps(data, ensure_ascii=False)
     return json.dumps(data, ensure_ascii=False)
 
@@ -525,6 +568,99 @@ def summarize_tool_call(arguments: Any) -> str:
         return _SUMMARY_PHRASES[command]
 
     return _truncate(line, _SUMMARY_FALLBACK_LIMIT)
+
+
+def tool_activity_kind(name: Any) -> str:
+    """把工具名映射为活动种类（对齐 dsh ``activity()`` 原表，见 ALIGN-FIX.md 修正 3）。
+
+    映射：``read``→read、``read_image``→readImage、``grep``/``glob``/``*_inspect``→search、
+    ``write``→write、``edit``/``apply_patch``→edit、``bash``/``pwsh``/``exec_command``/
+    ``write_stdin``/``terminal_*``→commands、``run_code``→code、``web_search``→webSearch、
+    ``web_fetch``→webFetch、``subagent``/``subagent_*``→subagents、``todo_write``/
+    ``create_goal``/``update_goal``/``get_goal``→plan、``ask_user_question``/
+    ``request_user_input``→questions，其它→tools（兜底）。
+
+    桥侧扩展（dsh 无这些工具）：``spawn_teammate`` / ``send_message`` / ``wait_agent`` /
+    ``list_agents`` / ``interrupt_agent`` / ``team_task_*`` → subagents。
+
+    @param name - tool_call / tool_result 事件的 ``name``。
+    @returns 活动种类 kind。
+    """
+    n = str(name or "").strip()
+    if n == "read":
+        return "read"
+    if n == "read_image":
+        return "readImage"
+    if n in ("grep", "glob") or n.endswith("_inspect"):
+        return "search"
+    if n == "write":
+        return "write"
+    if n in ("edit", "apply_patch"):
+        return "edit"
+    if n in ("bash", "pwsh", "exec_command", "write_stdin") or n.startswith("terminal_"):
+        return "commands"
+    if n == "run_code":
+        return "code"
+    if n == "web_search":
+        return "webSearch"
+    if n == "web_fetch":
+        return "webFetch"
+    if n == "subagent" or n.startswith("subagent_"):
+        return "subagents"
+    if n in _PLAN_TOOLS:
+        return "plan"
+    if n in ("ask_user_question", "request_user_input"):
+        return "questions"
+    # 桥侧扩展（dsh 无这些工具，就近归入 subagents）。
+    if n.startswith("team_task_") or n in _SUBAGENT_TOOLS:
+        return "subagents"
+    return "tools"
+
+
+def group_title(kinds: Iterable[str]) -> str:
+    """合成关闭态组行标题，逐字对齐 dsh ``processTitle``（见 ALIGN-FIX.md 修正 2）。
+
+    - 1 类 → 该类的 ``done.*`` 文案；
+    - 2 类 → ``{first}并{second}``，当两段都以「已」开头时第二段去掉「已」；
+    - 3 类 → ``，`` 连接（不去「已」）；
+    - >3 类 → 取前 3 类用 ``，`` 连接后追加 ``等``（不带计数）；
+    - 空序列 → ``已完成分析``（对齐 dsh ``processTitle`` 空 counts 的兜底）。
+
+    去重后按首次出现顺序取类；未知 kind 退化为 ``tools`` 文案。
+
+    @param kinds - 活动种类序列（可重复；函数内部去重）。
+    @returns 关闭态标题文本（无 🔧 前缀）。
+    """
+    seen: list = []
+    for kind in kinds:
+        if kind and kind not in seen:
+            seen.append(kind)
+    labels = [_TOOL_KIND_TEXT.get(k, _TOOL_KIND_TEXT["tools"]) for k in seen]
+    if not labels:
+        return _TOOL_KIND_TEXT["thinking"]
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        first, second = labels[0], labels[1]
+        if first.startswith("已") and second.startswith("已"):
+            second = second[1:]
+        return f"{first}并{second}"
+    title = "，".join(labels[:3])
+    if len(labels) > 3:
+        title += "等"
+    return title
+
+
+def render_group_heartbeat(step: int, summary: str = "") -> str:
+    """开放态组行（心跳）：``🔧 正在执行 · 第 N 步 · <最近一步摘要>``。"""
+    if summary:
+        return f"🔧 正在执行 · 第 {step} 步 · {summary}"
+    return f"🔧 正在执行 · 第 {step} 步"
+
+
+def render_group_close(kinds: Iterable[str]) -> str:
+    """关闭态组行（收口）：``🔧 <活动种类标题>``。"""
+    return "🔧 " + group_title(kinds)
 
 
 def _to_bool(value: Any) -> bool:
@@ -650,7 +786,7 @@ def render_line(
     | turn_start | 🚀 轮次标记 | 同左 | 同左 | 同左 |
     | tool_call | 不发 | 🔧 `name` · 摘要（无代码框） | 🔧 `name` + 参数代码框 | = detailed（不截断） |
     | tool_result | 不发 | 仅 📋 `name` 完成 | 📋 `name` 完成 + 输出代码框 | = detailed（不截断） |
-    | thinking | 不发 | 🧠 思考中… | 同左 | 同左 |
+    | thinking | 不发 | 不发（并入步骤组） | 🧠 思考中… | 同左 |
     | text（叙述/final） | 发 | 发 | 发 | 发（不截断） |
     | status 终态/错误 | 必发 | 必发 | 必发 | 必发 |
 
@@ -678,6 +814,9 @@ def render_line(
         if etype == "tool_result":
             name = event.get("name") or ""
             return f"📋 `{name}` 完成" if name else "📋 工具完成"
+        if etype == "thinking":
+            # 思考并入当前步骤组（由 Throttler 记为组成员），不再单独渲染一行。
+            return None
     if etype == "turn_start":
         turn = event.get("turn")
         if turn is not None:
@@ -742,11 +881,16 @@ def render_line(
 # --------------------------------------------------------------------------
 
 class Throttler:
-    """聚合低信号 text、逐条放行高信号、并做全局最小间隔限速。
+    """聚合低信号 text、逐条放行高信号、standard 档把工具步收敛为组推送，并做限速。
 
-    - 高信号（turn_start / thinking / tool_call / tool_result / status 终态）逐条放行。
+    - 高信号（turn_start / thinking / tool_call / tool_result / status 终态）逐条放行
+      （standard 档除外，见下）。
     - 低信号 ``text``（非 final）只累积，不逐条发；在 ``turn_end`` 或 status 终态时
       flush 为一条 ``📖`` 行。
+    - standard 档：``tool_call`` / ``tool_result`` 进组缓冲，``thinking`` 作为组成员
+      （kind=thinking）并入当前组（不单独发一行、不计步骤）；每满
+      ``_GROUP_HEARTBEAT_STEPS`` 步发一条心跳（开放态行），遇 ``turn_end`` / 终态
+      status / final text / 新 ``turn_start`` 时收口为一条关闭态行，且组行先于触发行发出。
     - 全局限速：相邻两次 send 至少间隔 ``min_interval`` 秒（默认 2.0）；不足则等待。
     - TODO(P2c): 软上限（单任务最多 30 条消息）本阶段不做。
     """
@@ -757,6 +901,11 @@ class Throttler:
         self.level = level if level in LIVE_DETAIL_MODES else None
         self._last_send = 0.0
         self._text_buf: list = []
+        # standard 档步骤组缓冲状态（其它档不使用）。
+        self._tool_steps = 0          # 本段累计工具步数（tool_call 计数，thinking 不计）。
+        self._tool_kinds: list = []   # 本段去重后的活动种类（首次出现顺序，仅工具步）。
+        self._has_thinking = False    # 本段是否出现过思考（空组收口时兜底为「已完成分析」）。
+        self._last_summary = ""       # 最近一步 tool_call 摘要（心跳用）。
 
     def _flush_text(self) -> Optional[str]:
         if not self._text_buf:
@@ -769,6 +918,37 @@ class Throttler:
             return "📖 " + joined
         return "📖 " + _truncate(joined, 120)
 
+    def _buffer_tool_event(self, event: Dict[str, Any]) -> Optional[str]:
+        """standard 档把 tool_call / tool_result 收进组缓冲；到阈值时返回心跳行。"""
+        kind = tool_activity_kind(event.get("name"))
+        if kind not in self._tool_kinds:
+            self._tool_kinds.append(kind)
+        if event.get("type") == "tool_call":
+            self._tool_steps += 1
+            self._last_summary = summarize_tool_call(event.get("arguments"))
+            if self._tool_steps % _GROUP_HEARTBEAT_STEPS == 0:
+                return render_group_heartbeat(self._tool_steps, self._last_summary)
+        return None
+
+    def _flush_tool_group(self) -> Optional[str]:
+        """收口当前步骤组（关闭态行），并清空组缓冲；空组（无工具且无思考）返回 None。
+
+        组内只有思考、没有工具步时，标题为「已完成分析」（对齐 dsh ``processTitle``
+        空 counts 的兜底）。
+        """
+        if not self._tool_kinds and not self._has_thinking:
+            return None
+        line = (
+            render_group_close(self._tool_kinds)
+            if self._tool_kinds
+            else render_group_close(["thinking"])
+        )
+        self._tool_kinds = []
+        self._tool_steps = 0
+        self._last_summary = ""
+        self._has_thinking = False
+        return line
+
     def _wait_interval(self) -> None:
         if self.min_interval <= 0:
             return
@@ -780,24 +960,48 @@ class Throttler:
         """返回此刻应当发送的行列表（已做聚合与限速）。
 
         ``event`` 用于判断信号高低与终态；``line`` 是该事件的 ``render_line`` 结果。
+        standard 档下 tool_call / tool_result / thinking 的 ``line`` 被忽略（进组缓冲）。
         """
         if not isinstance(event, dict):
             return []
         etype = event.get("type")
         candidates: list = []
+        standard = self.level == "standard"
 
-        if etype == "text":
+        if standard and etype in ("tool_call", "tool_result"):
+            # 工具步进组缓冲，不逐条发出；到阈值时产出心跳行。
+            heartbeat = self._buffer_tool_event(event)
+            if heartbeat:
+                candidates.append(heartbeat)
+        elif standard and etype == "thinking":
+            # 思考并入当前组（kind=thinking）：不断组、不单独发一行、不计步骤。
+            self._has_thinking = True
+        elif standard and etype == "turn_start":
+            # 轮次切换：新 turn 到达时，若上一轮组未收口则先收口（组行先于轮次标记行）。
+            closed = self._flush_tool_group()
+            if closed:
+                candidates.append(closed)
+            if line:
+                candidates.append(line)
+        elif etype == "text":
             if event.get("final"):
+                # 防御性收口：final 文本到达时残存组先收口，再发最终文本。
+                if standard:
+                    closed = self._flush_tool_group()
+                    if closed:
+                        candidates.append(closed)
                 if line:
                     candidates.append(line)
             else:
                 text = str(event.get("text") or "")
                 if text:
                     self._text_buf.append(text)
-        elif etype in _HIGH_SIGNAL_TYPES:
-            if line:
-                candidates.append(line)
         elif etype == "turn_end":
+            # turn_end 触发收口：组行先于 turn_end flush 出的叙述 text 行。
+            if standard:
+                closed = self._flush_tool_group()
+                if closed:
+                    candidates.append(closed)
             flushed = self._flush_text()
             if flushed:
                 candidates.append(flushed)
@@ -805,12 +1009,21 @@ class Throttler:
         elif etype == "status":
             state = event.get("state")
             if state in _TERMINAL_STATES:
+                # 终态强制收口：组行先于终态行；绝不丢步骤信息。
+                if standard:
+                    closed = self._flush_tool_group()
+                    if closed:
+                        candidates.append(closed)
                 flushed = self._flush_text()
                 if flushed:
                     candidates.append(flushed)
                 if line:
                     candidates.append(line)
             # working / submitted：line 为 None，不产生行
+        else:
+            # 非 standard 档的 turn_start / thinking / tool_call / tool_result：高信号逐条放行。
+            if etype in _HIGH_SIGNAL_TYPES and line:
+                candidates.append(line)
 
         out: list = []
         for c in candidates:
@@ -971,10 +1184,10 @@ def consume_stream(
     ``content``（遗留布尔）与 ``level``（四档，优先）经 ``resolve_live_detail`` 解析为
     渲染档位：``content=False`` ≡ ``standard``、``content=True`` ≡ ``detailed``；显式
     ``level``（compact/standard/detailed/verbose）优先于 ``content``。**操作流本身
-    不受档位影响**：text（含 final）与 thinking 照常渲染推送，turn_start / status 终态
-    等起止标记亦然（compact 档收窄 thinking/tool_call/tool_result 除外）。stats 完整性
-    不受档位影响（final_text / events_seen / states 仍完整统计，供上层「📬 最终结果
-    送达」使用）。
+    不受档位影响**：text（含 final）与 turn_start / status 终态等起止标记照常渲染推送；
+    thinking 在 compact / standard 档不发（standard 下并入步骤组、compact 下收窄），
+    detailed / verbose 照常逐条。stats 完整性不受档位影响（final_text / events_seen /
+    states 仍完整统计，供上层「📬 最终结果送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。

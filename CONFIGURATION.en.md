@@ -10,7 +10,11 @@
 > messaging surface as a normal message — the task runs only once, and there is
 > no silence after "done". As of v0.4.0 the live progress lines are trimmed by
 > **four tiers** (`collector.live_detail`, default `follow-dsh` to follow dsh's
-> "Work details"; see "Live-detail tier"). The override approach
+> "Work details"; see "Live-detail tier"); as of v0.4.1 the `standard` tier
+> replaces "two lines per step" with **step-group push** (one closing line per
+> turn plus a heartbeat every 6 steps; `thinking` is **folded into the group and
+> no longer pushed on its own**) — use `detailed` / `verbose` for per-step
+> lines. The override approach
 > (`register_tool(override=True)`)
 > was abandoned because the registration mechanism is unreliable on the real
 > gateway.
@@ -249,15 +253,18 @@ plugins:
 > **client-side rendering only** (the event stream itself is always complete); the
 > bridge trims its own live lines under the same names.
 
-Four tiers → live rendering (a monotonic ladder; `standard` / `detailed` exactly
-reproduce the two existing v0.3.3 paths `content: false` / `content: true`):
+Four tiers → per-event rendering (`compact` / `detailed` / `verbose` are
+byte-identical to before, and `detailed` still exactly reproduces v0.3.3's
+`content: true`; as of v0.4.1 `standard` routes tool events into **group push** and
+folds `thinking` into the group instead of pushing it on its own —
+see "Intermediate-event density and step groups" below):
 
 | Event | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
 | `turn_start` | 🚀 turn marker | same | same | same |
-| `tool_call` | **not sent** | `🔧 \`name\` · <summary>` (no code block) | `🔧 \`name\`` + argument **code block** (full) | = `detailed` (identical tool lines) |
-| `tool_result` | **not sent** | `📋 \`name\` 完成` only (no body) | `📋 \`name\` 完成` + output **code block** (full) | = `detailed` (identical results) |
-| `thinking` | **not sent** | `🧠 思考中…` | same | same |
+| `tool_call` | **not sent** | **into the group buffer** (not per step; surfaced as a group line on close) | `🔧 \`name\`` + argument **code block** (full) | = `detailed` (identical tool lines) |
+| `tool_result` | **not sent** | **into the group buffer** (not per step; counted as a group step) | `📋 \`name\` 完成` + output **code block** (full) | = `detailed` (identical results) |
+| `thinking` | **not sent** | **folded into the group** (never a line of its own; its presence shows as "Analysis completed" in the closing title) | `🧠 思考中…` | same |
 | `text` (narrative / final) | sent | sent | sent (non-final truncated to ≤120) | sent (non-final **not truncated**) |
 | `status` terminal / errors | **always sent** | **always sent** | **always sent** | **always sent** |
 
@@ -270,12 +277,17 @@ reproduce the two existing v0.3.3 paths `content: false` / `content: true`):
   thinking lines); the **only** difference between `verbose` and `detailed` is that
   non-final narrative text is not truncated — tool arguments and results are already
   full under `detailed` (v0.3.3's `content: true` never truncated them).
-- **Backward-compatibility anchors (byte-identical, locked by tests)**: `standard`
-  ≡ the old `content: false`; `detailed` ≡ the old `content: true`. Migrating to the
-  new keys therefore does not change either existing tier's look.
-- **Tool-call summary rules for the `standard` tier** (generated heuristically in the
-  bridge; no extra field required from dsh): a matching rule yields a fixed phrase,
-  otherwise the command's first line is truncated to ~50 characters.
+- **Backward-compatibility anchor (byte-identical, locked by tests)**: `detailed`
+  ≡ the old `content: true`. As of v0.4.1 **`standard` no longer sends per-step
+  lines** (it folds `thinking` into the group and never pushes it on its own); it
+  uses group push and therefore is **no longer** equivalent to the old
+  `content: false` — set `detailed` / `verbose` for the old per-step look.
+- **Step-summary rules for the `standard` tier** (generated heuristically in the
+  bridge; no extra field required from dsh): the heartbeat's
+  `<latest-step summary>` yields a fixed phrase when a rule matches, otherwise the
+  command's first line is truncated to ~50 characters; when the arguments are an
+  object with no command key, identifying-key `key=value` wins (see "Summary
+  improvement").
 
   | Command | Summary |
   | --- | --- |
@@ -297,6 +309,116 @@ reproduce the two existing v0.3.3 paths `content: false` / `content: true`):
   each stream task (with `follow-dsh`, the dsh file is resolved at the same time);
   changing it mid-task does not affect the running task, and the next task picks up
   the new value immediately (no gateway restart).
+
+### Intermediate-event density and step groups (standard)
+
+How the four tiers differ in **intermediate-event density** (as of v0.4.1):
+
+| Tier | Intermediate-event density |
+| --- | --- |
+| `compact` | **no tool lines** (unchanged; drops tool and thinking lines too) |
+| `standard` | **group push**: each turn closes into **one** closed-state line (e.g. `🔧 已读取文件并搜索代码` — "Read files and searched code"; top-3 kinds, 1 kind as-is / 2 joined by "并" / 3 joined by "，" / a trailing "等" beyond 3 — see the mapping table below); `thinking` is **folded into the group, never a separate line**; long tasks add one heartbeat line `🔧 正在执行 · 第 N 步 · <最近一步摘要>` ("Running · step N · <latest-step summary>") every **6 steps**; **no more two lines per step** (the v0.4.1 change) |
+| `detailed` | **per step** (unchanged): tool name + argument code block, result code block |
+| `verbose` | **per step** (unchanged): same as `detailed`, with non-final narrative untruncated |
+
+`compact` / `detailed` / `verbose` render byte-identically to before; `follow-dsh`
+and the priority chain (explicit tier > `follow-dsh` > legacy `content` > default)
+are unchanged.
+
+#### Group-push rules
+
+- **Unit = one turn**: under `standard`, `tool_call` / `tool_result` are no longer sent
+  per step; they only enter the group buffer. `thinking` joins the group as a
+  **member** (kind = `thinking`), is **never emitted as a line of its own**, and is
+  **not counted** toward the heartbeat's step count.
+- **Emit points**:
+  1. **Heartbeat**: every **6 steps** accumulated in a group emits one **open-state**
+     line (a long task still shows what is happening now);
+  2. **Close**: `turn_end`, a terminal `status`, a final `text` (defensive), or a turn
+     switch (a new `turn_start` arriving while the previous turn's group is still
+     open) closes the turn's group into **one closed-state line**;
+  3. if a turn has only thinking and no tool step, the closing title is
+     "Analysis completed";
+  4. if more tool steps arrive in the same turn after a close, a new segment opens
+     (a turn may therefore have several group lines — "segments of that turn").
+- **Order**: the group line is always sent **before** the narrative `text` /
+  terminal line / new-turn `turn_start` that triggered it (keeping the timeline
+  readable).
+- **Line formats**:
+
+  | Form | Format |
+  | --- | --- |
+  | Open state (heartbeat) | `🔧 正在执行 · 第 N 步 · <最近一步摘要>` |
+  | Closed state (close) | `🔧 <activity-kind title>` (top-3 kinds; joining rules below) |
+
+- **Closing-title composition** (byte-for-byte aligned with dsh `processTitle`):
+
+  | Kinds in the group | Closing title | Example |
+  | --- | --- | --- |
+  | 1 kind | that kind's done copy | `Ran commands` (`commands`) |
+  | 2 kinds | `{first} and {second}`; the second is lower-cased (dsh continuation) | `Read files and searched code` (`read` + `search`) |
+  | 3 kinds | the three joined by **`, `** | `Read files, searched code, wrote files` (`read` + `search` + `write`) |
+  | >3 kinds | top-3 joined as above plus a trailing **`, etc.`** (**no count**) | `Read files, searched code, wrote files, etc.` (the three above + `commands`, …) |
+
+#### Activity-kind vocabulary
+
+Tool names map to activity kinds via dsh's **original `activity()` table** (prefix
+matching included; unknown tools fall to `tools`). The closing copy follows dsh's
+`message.stepProcess.done.*`: the bridge's live chat copy is Chinese (the plugin's
+T0 line language), so the emitted column is Chinese, alongside dsh's official
+English wording for the same kind:
+
+| Tool name (prefix matching) | kind | Closing copy (Chinese, emitted) | dsh official English |
+| --- | --- | --- | --- |
+| `read` | `read` | 已读取文件 | Read files |
+| `read_image` | `readImage` | 已读取图片 | Read images |
+| `grep` / `glob` / `*_inspect` | `search` | 已搜索代码 | Searched code |
+| `write` | `write` | 已写入文件 | Wrote files |
+| `edit` / `apply_patch` | `edit` | 修改了文件 | Edited files |
+| `bash` / `pwsh` / `exec_command` / `write_stdin` / `terminal_*` | `commands` | 执行了命令 | Ran commands |
+| `run_code` | `code` | 运行了代码 | Ran code |
+| `web_search` | `webSearch` | 已搜索网页 | Searched the web |
+| `web_fetch` | `webFetch` | 已访问网页 | Visited web pages |
+| `subagent` / `subagent_*` | `subagents` | 已协调子智能体 | Coordinated subagents |
+| `todo_write` / `create_goal` / `update_goal` / `get_goal` | `plan` | 更新了计划 | Updated the plan |
+| `ask_user_question` / `request_user_input` | `questions` | 向用户提出了问题 | Asked questions |
+| (the `thinking` group member) | `thinking` | 已完成分析 | Analysis completed |
+| anything else (fallback) | `tools` | 已调用工具 | Called tools |
+
+**Bridge-side extensions**: `spawn_teammate` / `send_message` / `wait_agent` /
+`list_agents` / `interrupt_agent` / `team_task_*` → `subagents` (dsh has no such
+tools; this mapping is a bridge-side extension).
+
+The vocabulary does not affect the per-step rendering of `detailed` / `verbose`.
+
+#### Correspondence with dsh (a design trade-off)
+
+On the dsh side, `standard` folds the **whole turn** into **one group header** in the
+GUI, and that header **updates in place** while running to show the current step. The
+bridge is an **append-only, non-updatable** chat stream and cannot rewrite a message it
+has already sent, so the equivalent is **"one closing line per turn plus a heartbeat
+every 6 steps"**: "heartbeat first, close later" approximates dsh's in-place-updating
+header, and the closing line approximates dsh's closed group header once the turn
+settles. **This is an inherent trade-off of an append-only chat stream, not a defect**
+— no step information is lost, and the density is on the same order as dsh `standard`.
+
+#### Invariants
+
+- **Terminal states and errors are unaffected by any tier**: task terminal states
+  (✅ / ❌ / ⚠️), error messages, `final_text` delivery, and stats (`events_seen` /
+  `messages_sent`, etc.) are **unchanged under every tier**.
+- **The group buffer is force-closed at terminal state**: `turn_end` / a terminal
+  `status` always flushes any open group, and **step information already seen is never
+  dropped**.
+- **`collector.events: false` (quiet mode) still outranks the tier** (unchanged).
+
+#### Summary improvement
+
+When the tool `arguments` are an object with **no command key** (`command` / `cmd` /
+`script`), the `standard` summary prefers the identifying key's `key=value`, in the
+order `job_id` → `id` → `name` → `path` / `file_path` → `query` → `url`; if none is
+present it degrades to the existing single-line JSON truncation. This affects only the
+`standard` summary copy; `detailed` / `verbose` use the raw text and are unaffected.
 
 ### follow-dsh resolution rules
 
@@ -326,16 +448,16 @@ both the dsh Web default and the look of v0.3.3 `content: true`.
 | --- | --- |
 | `live_detail` explicitly set to one of the four tiers | that tier (the dsh file is not read) |
 | `live_detail: follow-dsh` | resolve the dsh file; `detailed` on failure |
-| `live_detail` unset, `content` explicitly set | the `content` mapping (**existing deployments unchanged**) |
+| `live_detail` unset, `content` explicitly set | the `content` mapping (the tier choice is unchanged; for `standard` see the v0.4.1 note below) |
 | both unset | `follow-dsh` (the new v0.4.0 default) |
 
 The legacy `collector.content` boolean **keeps working**: `true` → `detailed`,
-`false` → `standard` (exactly preserving v0.3.3 behavior). After the upgrade,
-deployments that explicitly set `content` behave **byte-for-byte the same**;
-deployments that set neither automatically follow dsh. **Note**: the dsh tier in
-production today is `standard`, so a "neither set" deployment becomes terser after
-upgrading than it was on v0.3.3 — one line (`collector.live_detail: detailed`) restores
-the v0.3.3 look.
+`false` → `standard` (the **mapping is unchanged**). **As of v0.4.1 the `standard` tier
+itself changed from per-step lines to group push**, so `content: true` (→ `detailed`)
+deployments look byte-for-byte the same, while `content: false` (→ `standard`) and
+"neither set" deployments both become **group push** after the upgrade. **Note**: the
+dsh tier in production today is `standard`, so a "neither set" deployment gets group
+push; one line (`collector.live_detail: detailed`) restores the v0.3.3 per-step look.
 
 - **Stats stay complete**: tiers never change what is counted; `final_text` /
   `events_seen` / `states` are still fully recorded (`_stream_dsh_call` relies on
@@ -357,9 +479,9 @@ the v0.3.3 look.
   the config file has no side effects and no exceptions.
 - **Code-block rendering stays as internal style**: operation content (tool commands /
   execution results / long final text) is still rendered as fenced code blocks
-  (fence-aware chunking) and is no longer a standalone switch; under `standard` only
-  tool-call arguments and tool output bodies narrow, and under `compact` tool and
-  thinking lines are not sent at all.
+  (fence-aware chunking) and is no longer a standalone switch; `detailed` / `verbose`
+  keep per-step argument / output code blocks, `standard` keeps only the group-line
+  summary (no code blocks), and `compact` does not send tool or thinking lines at all.
 
 When unset and the legacy `content` is also unset, `follow-dsh` is used (the new v0.4.0
 default).
@@ -375,8 +497,10 @@ the **granularity of progress lines** (four tiers), while `events` controls the
 result). The two keys compose independently: with `events: false` **quiet mode
 outranks the tier** — only the final result is pushed whatever the tier; with
 `live_detail: compact` tool and thinking lines are not sent while `text` / terminal
-lines still are; with both combined only the final result is pushed (its progress
-lines rendered per the tier) — the 📬 delivery is unaffected.
+lines still are; with `live_detail: standard` tool steps become **group push**
+(heartbeat + close, see "Intermediate-event density and step groups") while `text` /
+terminal lines still flow; with both combined only the final result is pushed (its
+progress lines rendered per the tier) — the 📬 delivery is unaffected.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -390,7 +514,8 @@ plugins:
 ```
 
 - `true` (default): current behavior — intermediate events (🔧 tool call /
-  📖 intermediate text / 🧠 thinking / status lines) and the final result
+  📖 intermediate text / 🧠 thinking (folded into the group under `standard`, never
+  pushed on its own) / status lines) and the final result
   (📖 output complete / ✅ done card) are all pushed.
 - `false` (quiet mode): push only the final result (📖 output complete + terminal
   status line); intermediate events are not pushed (no spam). The done card's
@@ -447,7 +572,7 @@ a2a_call (pre_tool_call hook)
                         |
               render_line (T0 line language)
                         |
-              Throttler (high-signal one by one / text aggregation / global rate limit)
+              Throttler (standard group buffer + heartbeat/close / other high-signal one by one / text aggregation / global rate limit)
                         |
               redact_sensitive_text(force=True)
                         |
@@ -475,15 +600,23 @@ a2a_call (pre_tool_call hook)
 
 How a tier affects those lines is given by the four-tier table under "Live-detail
 tier": under `compact` the `tool_call` / `tool_result` / `thinking` lines are not
-sent; under `standard` `tool_call` keeps the tool name + summary and `tool_result`
-keeps the completion marker only; `detailed` / `verbose` render as before, the
-latter without truncation. **Terminal lines (✅ / ❌ / ⚠️) and errors are always
-sent, whatever the tier.**
+sent; under `standard` `tool_call` / `tool_result` do not become lines of their own but
+use group push (heartbeat `🔧 正在执行 · 第 N 步 · <最近一步摘要>`, close
+`🔧 <activity-kind title>`), and `thinking` is **folded into the group, never a line
+of its own** — the group line precedes the `text` / terminal line that triggered it
+(`thinking` is no longer a close trigger); `detailed` / `verbose` render as before
+(the latter without truncation, both still sending `🧠 思考中…`). **Terminal lines
+(✅ / ❌ / ⚠️) and errors are always sent, whatever the tier**, and the group buffer
+is force-closed at terminal state without losing step information.
 
 ### Throttling and soft limits
 
 - High-signal events (turn_start / thinking / tool_call / tool_result / status
-  terminal states) are passed through one by one.
+  terminal states) are passed through one by one; **exception: under `standard` the
+  `tool_call` / `tool_result` / `thinking` events go into the group buffer**
+  (`thinking` is folded into the group, never a line of its own, and not counted),
+  and are emitted in groups ("heartbeat every 6 steps / close" — see
+  "Intermediate-event density and step groups").
 - Low-signal `text` (non-final) is only accumulated, not sent one by one; it is
   flushed as one `📖` line at `turn_end` or a status terminal state.
 - Global rate limit: adjacent sends are at least `min_interval` seconds apart
@@ -499,9 +632,12 @@ sent, whatever the tier.**
 3. Behavior confirmation: in a Feishu / QQ conversation, have the agent call
    `a2a_call(agent="dsh", ...)` and observe ① the agent receives the "accepted"
    receipt within seconds (no more long blocking); ② the conversation receives
-   `Starting execution` → `Thinking...` → `🔧 ...` → `... done` →
-   `Output complete` → `Done` (the exact line styles follow the live-detail tier;
-   by default `follow-dsh` follows dsh's current tier), and that **dsh executes
+   `Starting execution` → progress lines → `Output complete` → `Done` (the exact
+   line styles follow the live-detail tier: `standard` is group push, e.g. the
+   closing line `🔧 已读取文件并搜索代码` plus a heartbeat every 6 steps, with
+   `thinking` folded into the group and never pushed on its own; `detailed` sends
+   per-step `🧠 思考中…` / `🔧 ...` / `... done`; by default `follow-dsh` follows
+   dsh's current tier), and that **dsh executes
    only once** (the dsh-a2a-server log shows only one task submission); ③ when the
    task finishes, the conversation receives the "📬 dsh 任务完成，结果如下" result
    message (header + full text).
@@ -520,22 +656,29 @@ sent, whatever the tier.**
    and all other keys survive). First deployment needs one dashboard-process
    restart (backend mounting and plugin discovery are one-shot).
 7. Live-detail tier confirmation: set `collector.live_detail` to `compact` /
-   `standard` / `detailed` / `verbose` in turn and confirm the rendering matches
-   the four-tier table under "Live-detail tier" (`compact` sends no tool or
-   thinking lines; `standard` renders a tool name + plain-language summary and
-   keeps the completion marker only; `detailed` adds full argument / output code
-   blocks; `verbose` differs only in leaving non-final narrative text untruncated), and that **terminal states and
+   `standard` / `detailed` / `verbose` in turn and confirm the rendering matches the
+   "Live-detail tier" section (`compact` sends no tool or thinking lines; `standard`
+   is **group push** — one closing line per turn such as
+   `🔧 已读取文件并搜索代码`, one heartbeat
+   `🔧 正在执行 · 第 N 步 · ...` every 6 steps, with `thinking` **folded into the
+   group and never pushed on its own** (its presence shows as "Analysis completed"
+   in the closing title), the group line preceding the triggering `text` / terminal
+   line, and **no more two lines per step**;
+   `detailed` adds full per-step argument / output code blocks and still sends
+   `🧠 思考中…`; `verbose` differs only
+   in leaving non-final narrative text untruncated), and that **terminal states and
    errors are still delivered under every tier** and the "📬 dsh 任务完成，结果如下"
-   message is unaffected. Set it back to `follow-dsh` and confirm the tier follows
-   `config.transcriptView` of the `ui-chat` entry in
-   `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (legacy values `normal` /
+   message is unaffected; also confirm the `standard` group is force-closed at
+   `turn_end` / terminal state without losing step information. Set it back to
+   `follow-dsh` and confirm the tier follows `config.transcriptView` of the `ui-chat`
+   entry in `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (legacy values `normal` /
    `expanded` read as `detailed`); then force one of missing file / corrupt YAML /
    no `ui-chat` entry / no key / illegal value and confirm it **falls back to
    `detailed`**, logs once, and never blocks the task. If a legacy
    `collector.content` is kept while `live_detail` is unset, confirm the `content`
-   mapping is used (`true` → `detailed`, `false` → `standard`). A residual
-   `collector.code_blocks` key in the config file has no side effects (ignored, no
-   error).
+   mapping is used (`true` → `detailed`, `false` → `standard`; `false` likewise gets
+   group push). A residual `collector.code_blocks` key in the config file has no side
+   effects (ignored, no error).
 
 ## Unit tests
 
@@ -555,13 +698,15 @@ format (a mock sender records the send list), covering normalized event kinds an
 order, rendered-line emoji prefixes, text aggregation flushing only at terminal
 state, high-signal one-by-one sends, redact invocation, two-level sender fallback
 (no gateway → `no_gateway`), no crash on abnormal events, per-event four-tier
-rendering (`compact` sends no tool or thinking lines, `standard` keeps the tool
-name + summary and the completion marker, `detailed` adds argument / output code
-blocks, `verbose` does not truncate), the legacy `content` mapping (`true` →
-`detailed` / `false` → `standard`), **terminal states and errors surviving every
-tier**, the code-block rendering
-parameter (internal style), and outputs an "event sequence → rendered message
-sample" mapping table.
+rendering (`compact` sends no tool or thinking lines; `standard` group push —
+per-event assertions that `thinking` is folded into the group and never a line of
+its own, on the heartbeat, the close, their order relative to `text` / `turn_end` /
+terminal states, the activity-kind mapping and closing-title composition
+(1 / 2 / 3 / >3 kinds), forced close at terminal state, and the summary improvement;
+`detailed` adds argument / output code blocks; `verbose` does not truncate), the
+legacy `content` mapping (`true` → `detailed` / `false` → `standard`), **terminal
+states and errors surviving every tier**, the code-block rendering parameter (internal
+style), and outputs an "event sequence → rendered message sample" mapping table.
 
 `test_override.py` covers `_on_pre_tool_call`'s single-execution hook branch and
 `_stream_dsh_call`: dsh target (collector on + origin non-empty + message

@@ -31,10 +31,12 @@ Hermes 侧接入 dsh A2A server 的桥插件：把 dsh 任务的执行过程实�
 长文本超过网关单条上限时按代码块边界分块，块间以 `⏩ 续` 提示衔接，代码框不会
 跨块断裂。
 
-> 上例为 `detailed`（详细）档的效果——工具命令与结果进入代码框。默认 `follow-dsh`
-> 跟随 dsh 当前档位，而当前生产 dsh 的 Work details 为 `standard`（标准），直播会
-> 更简洁（工具行只留工具名 + 摘要）；想要上例观感，设 `collector.live_detail: detailed`
-> 即可（一行回退）。
+> 上例为 `detailed`（详细）档的效果——工具命令与结果进入代码框、思考单独成行
+> （`🧠 思考中…`）。默认 `follow-dsh` 跟随 dsh 当前档位，而当前生产 dsh 的 Work
+> details 为 `standard`（标准），直播为**组推送**：每个轮次收口为一条关闭态行
+> （如 `🔧 已读取文件并搜索代码`），`thinking` **并入组、不单独推送**，长任务
+> 每 6 步一条心跳行 `🔧 正在执行 · 第 N 步 · …`，**不再每步两条**；想要上例的逐条
+> 观感，设 `collector.live_detail: detailed`（或 `verbose`）即可（一行回退）。
 
 ### 代码框效果
 
@@ -57,10 +59,13 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 过程展示与中间事件推送均可调整：`collector.live_detail` 控制**直播过程展示的档位**
 （四档 `compact` / `standard` / `detailed` / `verbose`，与 dsh「工作步骤展示」
-一一对应；默认 `follow-dsh` 跟随 dsh 当前档位），`collector.events` 控制事件流开关
-（关 = 安静模式，只推最终结果，**优先于档位**）；代码框渲染保留为档位内部的样式，
-不再单独暴露开关。两者均可在 Dashboard「插件管理」页的「A2A 直播开关」面板点选
-或下拉（即时生效）——详见 [CONFIGURATION.md](CONFIGURATION.md)。
+一一对应；默认 `follow-dsh` 跟随 dsh 当前档位。其中 `standard` 为**组推送**——每轮
+一条收口行（`thinking` 并入组、不单独推送）+ 每 6 步一条心跳，`detailed` / `verbose`
+逐条带代码框），
+`collector.events` 控制事件流开关（关 = 安静模式，只推最终结果，**优先于档位**）；
+代码框渲染保留为档位内部的样式，不再单独暴露开关。两者均可在 Dashboard「插件管理」
+页的「A2A 直播开关」面板点选或下拉（即时生效）——详见
+[CONFIGURATION.md](CONFIGURATION.md)。
 
 ## 流程图
 

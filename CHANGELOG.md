@@ -5,6 +5,67 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-10-07
+
+> ⚠️ **行为变更（升级前必读）**：`standard`（标准）档**不再逐条推送工具步骤**，
+> 改为**步骤组推送**——每个轮次收口为**一条**关闭态行（如
+> `🔧 已读取文件并搜索代码`），长任务每 **6 步**追加一条心跳行
+> `🔧 正在执行 · 第 N 步 · <最近一步摘要>`；且 `thinking` **并入步骤组、不再单独
+> 推送**（不再出现 `🧠 思考中…` 行，其存在经收口标题「已完成分析」体现）。
+> 默认 `follow-dsh` 且当前生产 dsh 为 `standard`，故**升级后默认观感即为组推送**
+> （比 v0.4.0 少刷屏）。
+> **想要逐条请用 `detailed` / `verbose`**：把
+> `plugins.entries.hermes-a2a-bridge.settings.collector.live_detail` 设为
+> `detailed`（带参数 / 输出代码框）或 `verbose`（额外不截断非 final 叙述）即恢复
+> 逐条。
+
+### Changed
+
+- **`standard` 档改为组推送**：分组单位 = 一轮（`turn`）；`tool_call` /
+  `tool_result` 不再逐条发出，只进组缓冲；**`thinking` 并入组**（不单独成行、不计入
+  心跳步数），整轮只有思考时收口标题为「已完成分析」。**心跳**：组内累计每满 6 步发
+  一条开放态行 `🔧 正在执行 · 第 N 步 · <最近一步摘要>`；**收口**：`turn_end`、终态
+  `status`、final `text`（防御性）或轮次切换时把该轮组收口为一条关闭态行
+  `🔧 <活动种类标题>`；收口后同轮继续有工具步则开启新的一段。**顺序**：组行先于
+  触发它的叙述 `text` / 终态行 / 新轮 `turn_start` 发出。**收口标题逐字对齐 dsh
+  `processTitle`**：取 Top-3 类，1 类直出、2 类用「并」（两段都以「已」开头时第二段
+  去掉「已」，如 `已读取文件并搜索代码`）、3 类用 `，` 连接、>3 类追加 `等`（不带
+  计数）。活动种类映射改用 dsh `activity()` **原表**（`read` / `read_image` /
+  `grep`·`glob`·`*_inspect` / `write` / `edit`·`apply_patch` / `bash` 等命令工具 /
+  `run_code` / `web_search` / `web_fetch` / `subagent*` / 计划类 / 提问类；未知工具
+  兜底 `tools` →「已调用工具」）；桥侧扩展 `spawn_teammate` / `send_message` /
+  `wait_agent` / `list_agents` / `interrupt_agent` / `team_task_*` 归 `subagents`。
+  完整对照表见 CONFIGURATION「活动种类词表」与「组推送规则」。
+- **不变内容的档位不受影响**：`compact`（无工具行）、`detailed`（逐条 + 参数 / 结果
+  代码框）、`verbose`（同 `detailed` 且非 final 叙述不截断）逐字不变；`follow-dsh`
+  与优先级链（显式档 > `follow-dsh` > 遗留 `content` > 默认）不变。
+- **遗留 `content` 映射不变，观感随档位改变**：`true` → `detailed`（观感不变）、
+  `false` → `standard`（升级后同样变为组推送）。想要逐条请显式设
+  `collector.live_detail: detailed`。
+- **摘要小改进（`standard` 档）**：工具 `arguments` 是对象且无命令键时，摘要优先取
+  标识性键的 `key=value`（`job_id` → `id` → `name` → `path` / `file_path` →
+  `query` → `url`），仍无则退化为单行 JSON 截断；`detailed` / `verbose` 用原文，
+  不受影响。
+- CONFIGURATION / README 中英四份文档同步补「中间事件推送密度」一节、「收口标题
+  拼接规则」与「活动种类词表」，并写明与 dsh 的差异（dsh 组头可原地更新、桥只追加
+  不可更新，故以「每轮一条收口行 + 每 6 步一条心跳」等价实现，属设计取舍而非缺陷）。
+
+### Unchanged
+
+- **终态与错误在任何档位都不受影响**：任务终态（✅ / ❌ / ⚠️）、错误信息、
+  `final_text` 送达与 stats 完整性（`events_seen` / `messages_sent` 等）不变。
+- **组缓冲在终态强制收口**，绝不允许丢掉已发生的步骤信息。
+- `collector.events: false`（安静模式）仍**优先于档位**。
+- 秒回受理回执与「📬 完成消息 + 结果全文」送达不变。
+
+### Tested
+
+- 既有基线（0.4.0 的 177 项）不回归；新增 `standard` 组推送用例（逐事件断言
+  `thinking` 并入组不单独成行、心跳、收口、与 `text` / `turn_end` / 终态的顺序）、
+  活动种类映射与收口标题合成（1 / 2 / 3 / >3 类）、组缓冲在终态必收口、
+  `compact` / `detailed` / `verbose` 不回归、摘要小改进（见 CONFIGURATION
+  「单元测试」）。
+
 ## [0.4.0] - 2026-10-07
 
 > ⚠️ **行为变更（升级前必读）**：直播过程展示新增四档，**默认档为 `follow-dsh`**

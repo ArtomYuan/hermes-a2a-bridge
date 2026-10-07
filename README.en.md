@@ -35,6 +35,12 @@ Long text exceeding the gateway's per-message limit is split at code-block
 boundaries; continuation chunks are joined with a `⏩ 续` marker, so code blocks
 never break across chunks.
 
+> The sample above is the `detailed` tier — tool commands and results go into code
+> blocks. By default `follow-dsh` follows dsh's current tier, and the dsh "Work
+> details" value in production today is `standard`, so the live stream is more
+> terse (tool lines keep the tool name + summary only); to get the look above, set
+> `collector.live_detail: detailed` (a one-line rollback).
+
 ### Code blocks
 
 Operation content — tool commands, execution results, and final text — is
@@ -55,12 +61,13 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > Actual rendering depends on each gateway's client.
 
-Content display and intermediate-event push are both configurable
-(`collector.content` for operation details — off turns tool calls into a short
-human summary and keeps only the completion marker for tool results, while
-narrative and thinking stay visible; `collector.events` for the event stream; both on by
-default. Code-block rendering stays as the internal style when content is shown
-and is no longer a standalone switch), and can be toggled from the "A2A live
+Progress display and intermediate-event push are both configurable
+(`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
+`standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
+default `follow-dsh` to follow dsh's current tier; `collector.events` for the event
+stream — off is quiet mode, pushing the final result only, and it **outranks the
+tier**; code-block rendering stays as the internal style for a tier and is no
+longer a standalone switch), and can be toggled or selected from the "A2A live
 switches" panel on the Dashboard "Plugins" page (instant effect) — see
 [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
@@ -117,17 +124,17 @@ hard-bound; combine them as needed:
 ## Live switches (Dashboard, instant effect)
 
 Once the plugin is loaded, the three live-stream switches — `collector.enabled`
-(master switch) / `collector.events` (intermediate events) / `collector.content`
-(content display; off → tool calls become a short human summary and tool results
-keep the completion marker only; narrative and thinking are unaffected) — can
-be toggled directly from the "A2A live switches" panel at the top of the Hermes
+(master switch) / `collector.events` (intermediate events) / `collector.live_detail`
+(live-detail tier; a dropdown with 5 options: follow dsh / terse / standard /
+detailed / fully expanded) — can be toggled or selected directly from the "A2A
+live switches" panel at the top of the Hermes
 Dashboard "Plugins" page; saving takes effect **immediately (no gateway restart
 — hot read)**. The backend endpoints
 `GET/POST /api/plugins/hermes-a2a-bridge/collector` strictly validate and write
 back `plugins.entries.hermes-a2a-bridge.settings.collector.*` (preserving the
 entry-level `allow_tool_override` and all other keys; POST tolerates the legacy
-`code_blocks` key as a deprecated alias of `content`). First deployment needs one
-dashboard-process restart for the panel to appear.
+`code_blocks` key as a deprecated alias of the legacy `content`). First deployment
+needs one dashboard-process restart for the panel to appear.
 See [CONFIGURATION.en.md](CONFIGURATION.en.md), "Live consumer".
 
 ## Links

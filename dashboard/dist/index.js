@@ -1,12 +1,19 @@
 /**
  * hermes-a2a-bridge — Dashboard panel: A2A live switches.
  *
- * Three collector switches (collector.enabled / events / content) rendered
- * as one card at the top of the "Plugins" page (slot "plugins:top") and also
- * registered for the hidden tab route /hermes-a2a-bridge. Reads current values
- * from GET /api/plugins/hermes-a2a-bridge/collector; each toggle POSTs its own
- * key back. Changes take effect immediately (the gateway hot-reads
- * ctx.get_config on every hook / stream task) — no gateway restart needed.
+ * Collector settings rendered as one card at the top of the "Plugins" page
+ * (slot "plugins:top") and also registered for the hidden tab route
+ * /hermes-a2a-bridge. Two toggles (collector.enabled / collector.events) plus
+ * one detail-level dropdown (collector.live_detail: follow-dsh / compact /
+ * standard / detailed / verbose). Reads current values from
+ * GET /api/plugins/hermes-a2a-bridge/collector; each control POSTs its own key
+ * back. Changes take effect immediately (the gateway hot-reads ctx.get_config
+ * on every hook / stream task) — no gateway restart needed.
+ *
+ * The legacy collector.content boolean was removed from this panel (it is
+ * still honoured at the config layer for backward compatibility, mapped to
+ * live_detail); live_detail is a string dropdown whose GET response also
+ * carries the resolved "effective" level for the "follow dsh" mode.
  *
  * Plain IIFE classic script, no build step. All dependencies come from
  * window.__HERMES_PLUGIN_SDK__; bilingual zh/en copy is self-contained and
@@ -52,7 +59,10 @@
 
   var PLUGIN_NAME = "hermes-a2a-bridge";
   var API = "/api/plugins/hermes-a2a-bridge/collector";
-  var KEYS = ["enabled", "events", "content"];
+  var KEYS = ["enabled", "events", "live_detail"];
+
+  // live_detail 下拉选项（5 项，与后端 _LIVE_DETAIL_VALUES 一致）。
+  var LIVE_DETAIL_OPTIONS = ["follow-dsh", "compact", "standard", "detailed", "verbose"];
 
   var T = {
     zh: {
@@ -66,8 +76,16 @@
       enabledDesc: "collector.enabled：开 → dsh 任务走单执行直播；关 → 仅注入 origin。默认关。",
       eventsLabel: "中间事件推送",
       eventsDesc: "collector.events：开 → 中间事件 + 最终结果都推；关 → 安静模式只推最终结果。默认开。",
-      contentLabel: "内容显示",
-      contentDesc: "collector.content：开 → 工具调用带命令全文/参数、工具结果显示输出正文；关 → 工具调用换成简短摘要（如「查看 git 提交记录」）、工具结果只留完成标记。叙述与思考不受影响，默认开。",
+      liveDetailLabel: "工作步骤展示",
+      liveDetailDesc: "collector.live_detail：跟随 dsh / 简洁 / 标准 / 详细 / 完全展开，决定直播过程细节的多少。默认跟随 dsh。",
+      effectiveHint: "实际生效：",
+      liveDetailOptions: {
+        "follow-dsh": "跟随 dsh",
+        "compact": "简洁",
+        "standard": "标准",
+        "detailed": "详细",
+        "verbose": "完全展开",
+      },
       loadError: "加载开关状态失败：",
       saveError: "保存失败：",
     },
@@ -82,17 +100,25 @@
       enabledDesc: "collector.enabled: on → single-execution live stream for dsh tasks; off → origin injection only. Default off.",
       eventsLabel: "Intermediate events",
       eventsDesc: "collector.events: on → push intermediate events + final result; off → quiet mode, final result only. Default on.",
-      contentLabel: "Content display",
-      contentDesc: "collector.content: on → tool calls carry the full command/arguments and tool results carry their output; off → tool calls become a short human summary (e.g. \"view git log\") and tool results keep only the completion marker. Narrative and thinking are unaffected. Default on.",
+      liveDetailLabel: "Work details",
+      liveDetailDesc: "collector.live_detail: follow dsh / compact / standard / detailed / verbose — how much live process detail to show. Default follows dsh.",
+      effectiveHint: "Effective: ",
+      liveDetailOptions: {
+        "follow-dsh": "Follow dsh",
+        "compact": "Compact",
+        "standard": "Standard",
+        "detailed": "Detailed",
+        "verbose": "Verbose",
+      },
       loadError: "Failed to load switch state: ",
       saveError: "Failed to save: ",
     },
   };
 
   var SWITCH_META = [
-    { key: "enabled", label: "enabledLabel", desc: "enabledDesc" },
-    { key: "events", label: "eventsLabel", desc: "eventsDesc" },
-    { key: "content", label: "contentLabel", desc: "contentDesc" },
+    { key: "enabled", kind: "toggle", label: "enabledLabel", desc: "enabledDesc" },
+    { key: "events", kind: "toggle", label: "eventsLabel", desc: "eventsDesc" },
+    { key: "live_detail", kind: "select", label: "liveDetailLabel", desc: "liveDetailDesc" },
   ];
 
   function errText(err) {
@@ -101,6 +127,16 @@
       try { return JSON.stringify(err); } catch (e) { /* ignore */ }
     }
     return String(err);
+  }
+
+  function readState(res) {
+    var ld = res && res.live_detail;
+    return {
+      enabled: !!(res && res.enabled && res.enabled.value),
+      events: !!(res && res.events && res.events.value),
+      live_detail: (ld && ld.value) || "follow-dsh",
+      effective: (ld && ld.effective) || "",
+    };
   }
 
   function Panel() {
@@ -130,12 +166,7 @@
       var cancelled = false;
       SDK.fetchJSON(API).then(function (res) {
         if (cancelled) return;
-        var next = {};
-        KEYS.forEach(function (k) {
-          var item = res && res[k];
-          next[k] = !!(item && item.value);
-        });
-        setValues(next);
+        setValues(readState(res));
       }).catch(function (err) {
         if (cancelled) return;
         setError(t.loadError + errText(err));
@@ -143,39 +174,69 @@
       return function () { cancelled = true; };
     }, []);
 
-    function onToggle(key) {
-      return function (checked) {
-        if (saving) return;
-        setSaving(true);
-        setError(null);
+    function onChange(key, value) {
+      if (saving) return;
+      setSaving(true);
+      setError(null);
+      setSaved(false);
+      var body = {};
+      body[key] = value;
+      SDK.fetchJSON(API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(function (res) {
+        // 响应是写后从磁盘读回的完整状态，直接回填（含 live_detail.effective）。
+        setValues(readState(res));
+        setSaving(false);
+        setSaved(true);
+        showToast(t.saved, "success");
+      }).catch(function (err) {
+        setSaving(false);
         setSaved(false);
-        var body = {};
-        body[key] = !!checked;
-        SDK.fetchJSON(API, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }).then(function () {
-          var next = {};
-          KEYS.forEach(function (k) {
-            next[k] = values ? !!values[k] : false;
-          });
-          next[key] = !!checked;
-          setValues(next);
-          setSaving(false);
-          setSaved(true);
-          showToast(t.saved, "success");
-        }).catch(function (err) {
-          setSaving(false);
-          setSaved(false);
-          setError(t.saveError + errText(err));
-          showToast(t.saveError + errText(err), "error");
-        });
-      };
+        setError(t.saveError + errText(err));
+        showToast(t.saveError + errText(err), "error");
+      });
     }
 
     var rows = SWITCH_META.map(function (meta) {
+      var isSelect = meta.kind === "select";
       var checked = values ? !!values[meta.key] : false;
+      var value = values ? values[meta.key] : (isSelect ? "follow-dsh" : false);
+      var control;
+
+      if (isSelect) {
+        control = h("select", {
+          className: "h2ab-switch-select",
+          value: String(value || "follow-dsh"),
+          disabled: !values || saving,
+          "data-testid": "a2a-bridge-select-" + meta.key,
+          style: { minWidth: "150px", fontSize: "13px", padding: "4px 6px", marginTop: "3px" },
+          onChange: function (e) { onChange(meta.key, e.target.value); },
+        }, LIVE_DETAIL_OPTIONS.map(function (opt) {
+          return h("option", { key: opt, value: opt }, t.liveDetailOptions[opt] || opt);
+        }));
+      } else {
+        control = h(Checkbox, {
+          checked: checked,
+          disabled: !values || saving,
+          onCheckedChange: function (next) { onChange(meta.key, !!next); },
+        });
+      }
+
+      var infoChildren = [
+        h("div", { className: "h2ab-switch-label" }, t[meta.label]),
+        h("div", { className: "h2ab-switch-desc" }, t[meta.desc]),
+      ];
+      if (isSelect && values && values.live_detail === "follow-dsh" && values.effective) {
+        infoChildren.push(
+          h("div", {
+            className: "h2ab-switch-effective",
+            style: { fontSize: "12px", opacity: 0.72, marginTop: "2px" },
+          }, t.effectiveHint + (t.liveDetailOptions[values.effective] || values.effective))
+        );
+      }
+
       return h("div", {
         key: meta.key,
         className: "h2ab-switch-row",
@@ -183,15 +244,9 @@
         // users of assistive tech: the row names the switch and its state.
         "data-testid": "a2a-bridge-switch-" + meta.key,
         "data-key": meta.key,
-        "data-checked": checked ? "true" : "false",
-      }, h("div", { className: "h2ab-switch-info" },
-        h("div", { className: "h2ab-switch-label" }, t[meta.label]),
-        h("div", { className: "h2ab-switch-desc" }, t[meta.desc])),
-        h(Checkbox, {
-          checked: checked,
-          disabled: !values || saving,
-          onCheckedChange: onToggle(meta.key),
-        }));
+        "data-checked": isSelect ? null : (checked ? "true" : "false"),
+        "data-value": isSelect ? String(value || "follow-dsh") : null,
+      }, h("div", { className: "h2ab-switch-info" }, infoChildren), control);
     });
 
     return h(Card, { className: "h2ab-card" },

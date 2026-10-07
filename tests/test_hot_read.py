@@ -106,17 +106,21 @@ class _FakeConsumer:
 class HotReadTest(unittest.TestCase):
     def setUp(self):
         _restore_modules()
+        self._orig_read_live_detail = _MODULE._read_live_detail
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CONTENT = True
         _MODULE._EVENTS = True
+        _MODULE._LIVE_DETAIL = "follow-dsh"
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
     def tearDown(self):
+        _MODULE._read_live_detail = self._orig_read_live_detail
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CONTENT = True
         _MODULE._EVENTS = True
+        _MODULE._LIVE_DETAIL = "follow-dsh"
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
@@ -191,29 +195,32 @@ class HotReadTest(unittest.TestCase):
         self.assertEqual(result["action"], "block")
         self.assertEqual(spawns, [("hi", "feishu/oc_x")])
 
-    # 6. 读取点 _stream_dsh_call：热读 events / content（改配置 → 新任务拿新值）。
-    def test_stream_dsh_call_hot_reads_events_content_switches(self):
+    # 6. 读取点 _stream_dsh_call：热读 events + live_detail（改配置 → 新任务拿新值）。
+    def test_stream_dsh_call_hot_reads_events_and_level(self):
         _install_fake_hermes_cli({
             "a2a_agents": {"dsh": {"url": "http://127.0.0.1:8092",
                                    "auth": {"type": "bearer", "token": "t"}}}
         })
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
-        ctx = FakeCtx({"collector.content": False, "collector.events": False})
+        ctx = FakeCtx({"collector.events": False})
         _MODULE._CTX = ctx
+        # 每次任务开始各读一次 live_detail；模拟热读：第一次 standard、第二次 detailed。
+        levels = iter(["standard", "detailed"])
+        _MODULE._read_live_detail = lambda: next(levels)
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         call = consumer.consume_stream_calls[0]
-        self.assertIs(call["content"], False)
+        self.assertEqual(call["level"], "standard")
         self.assertIs(call["events"], False)
         # 直播 sender 固定 code_blocks=True（内部样式；结果送达 sender 恒
         # code_blocks=False，见第 2 个调用）。
         self.assertIs(consumer.make_sender_calls[0][1], True)
         self.assertIs(consumer.make_sender_calls[1][1], False)
         # 改配置 → 下一个任务拿新值。
-        ctx.settings.update({"collector.content": True, "collector.events": True})
+        ctx.settings.update({"collector.events": True})
         _MODULE._stream_dsh_call("hi2", "feishu/oc_x")
         call = consumer.consume_stream_calls[1]
-        self.assertIs(call["content"], True)
+        self.assertEqual(call["level"], "detailed")
         self.assertIs(call["events"], True)
         self.assertIs(consumer.make_sender_calls[2][1], True)
 
@@ -228,6 +235,8 @@ class HotReadTest(unittest.TestCase):
         _MODULE._CTX = FakeCtx({})
         seen = []
         original = _MODULE._read_switch
+        level_calls = []
+        _MODULE._read_live_detail = lambda: level_calls.append("level") or "detailed"
 
         def recording(key, default):
             seen.append(key)
@@ -235,9 +244,8 @@ class HotReadTest(unittest.TestCase):
 
         with mock.patch.object(_MODULE, "_read_switch", side_effect=recording):
             _MODULE._stream_dsh_call("hi", "feishu/oc_x")
-        self.assertEqual(
-            sorted(seen), ["collector.content", "collector.events"]
-        )
+        self.assertEqual(seen, ["collector.events"])
+        self.assertEqual(level_calls, ["level"])
 
     # 8. register() 仍把三开关写入全局（既有测试后门 / 回退值不回归）。
     def test_register_still_sets_globals_and_hot_read_wins(self):
@@ -285,6 +293,75 @@ class HotReadTest(unittest.TestCase):
         _MODULE._CONTENT = True
         self.assertIs(_MODULE._read_switch("collector.content", True), True)
         self.assertIs(_MODULE._read_switch("collector.content", False), True)
+
+    # 11. _to_level：四档归一 + 非法值返回 None。
+    def test_to_level_normalizes_modes(self):
+        self.assertEqual(_MODULE._to_level("verbose"), "verbose")
+        self.assertEqual(_MODULE._to_level("  DETAILED  "), "detailed")
+        self.assertEqual(_MODULE._to_level("compact"), "compact")
+        self.assertIsNone(_MODULE._to_level("banana"))
+        self.assertIsNone(_MODULE._to_level(None))
+        self.assertIsNone(_MODULE._to_level("normal"))  # 旧值不在 live_detail 值域
+        self.assertIsNone(_MODULE._to_level(123))
+
+    # 12. _read_live_detail：读四个配置键并委托 consumer.resolve_collector_level。
+    def test_read_live_detail_delegates_to_consumer(self):
+        captured = {}
+
+        class FakeConsumer:
+            DSH_HOME_DEFAULT = "/home/artom/.dsh"
+            DSH_PROFILE_DEFAULT = "web"
+
+            def resolve_collector_level(self, live_detail_raw, content_raw,
+                                        dsh_home, dsh_profile):
+                captured["args"] = (live_detail_raw, content_raw, dsh_home, dsh_profile)
+                return "compact"
+
+        _MODULE._CONSUMER_MODULE = FakeConsumer()
+        _MODULE._CTX = FakeCtx({
+            "collector.live_detail": "follow-dsh",
+            "collector.content": True,
+            "collector.dsh_home": "/tmp/dsh",
+            "collector.dsh_profile": "cli",
+        })
+        self.assertEqual(_MODULE._read_live_detail(), "compact")
+        self.assertEqual(
+            captured["args"],
+            ("follow-dsh", True, "/tmp/dsh", "cli"),
+        )
+
+    # 13. _read_live_detail：缺省 dsh_home / dsh_profile 走 consumer 默认值。
+    def test_read_live_detail_defaults_dsh_paths(self):
+        captured = {}
+
+        class FakeConsumer:
+            DSH_HOME_DEFAULT = "/home/artom/.dsh"
+            DSH_PROFILE_DEFAULT = "web"
+
+            def resolve_collector_level(self, live_detail_raw, content_raw,
+                                        dsh_home, dsh_profile):
+                captured["args"] = (live_detail_raw, content_raw, dsh_home, dsh_profile)
+                return "detailed"
+
+        _MODULE._CONSUMER_MODULE = FakeConsumer()
+        _MODULE._CTX = FakeCtx({})
+        _MODULE._read_live_detail()
+        self.assertEqual(
+            captured["args"],
+            (None, None, "/home/artom/.dsh", "web"),
+        )
+
+    # 14. register() 固化 live_detail 全局（原始值，解析在任务开始经 _read_live_detail）。
+    def test_register_sets_live_detail_global(self):
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return {"collector.live_detail": "verbose"}.get(key, default)
+
+            def register_hook(self, name, fn):
+                pass
+
+        _MODULE.register(FakeCtx())
+        self.assertEqual(_MODULE._LIVE_DETAIL, "verbose")
 
 
 if __name__ == "__main__":

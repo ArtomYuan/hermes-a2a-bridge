@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -680,6 +681,23 @@ class ThrottlerTest(unittest.TestCase):
         sent = self._run(events, min_interval=0.0)
         self.assertEqual(len(sent), 5)
 
+    def test_verbose_flush_does_not_truncate(self):
+        # verbose 档：非 final text 聚合 flush 不截断；其余档截断 120。
+        long_text = "x" * 300
+        events = [
+            {"type": "text", "text": long_text, "final": False},
+            {"type": "status", "state": "completed"},
+        ]
+        verbose = consumer.Throttler(min_interval=0.0, level="verbose")
+        detailed = consumer.Throttler(min_interval=0.0, level="detailed")
+        sent_v = []
+        sent_d = []
+        for event in events:
+            sent_v += verbose.feed(event, consumer.render_line(event, level="verbose"))
+            sent_d += detailed.feed(event, consumer.render_line(event, level="detailed"))
+        self.assertEqual(sent_v[0], "📖 " + long_text)
+        self.assertLessEqual(len(sent_d[0]), len("📖 ") + 120)
+
 
 class SenderTest(unittest.TestCase):
     def tearDown(self):
@@ -1090,6 +1108,184 @@ class ConsumeStreamContentTest(unittest.TestCase):
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "completed"])
         self.assertEqual(stats["messages_sent"], 7)
+
+
+class LiveDetailLevelTest(unittest.TestCase):
+    """四档渲染（render_line 的 level 参数）：逐事件断言 + 与旧 content 的等价性 + 终态不丢。"""
+
+    def test_level_parameter_overrides_content(self):
+        # level 显式给定时忽略 content（content=False 也不影响 detailed 档）。
+        self.assertEqual(
+            consumer.render_line(
+                {"type": "tool_call", "name": "bash", "arguments": "ls"},
+                content=False, level="detailed",
+            ),
+            "🔧 `bash`\n```bash\nls\n```",
+        )
+
+    def test_standard_equals_content_false(self):
+        events = (
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_call", "name": "bash"},
+            {"type": "tool_call", "arguments": "ls"},
+            {"type": "tool_call"},
+            {"type": "tool_result", "name": "bash", "text": "total 4\nx"},
+            {"type": "tool_result", "name": "", "text": "x"},
+            {"type": "thinking", "text": "x"},
+            {"type": "text", "text": "正文", "final": False},
+            {"type": "text", "text": "最终", "final": True},
+            {"type": "turn_start", "turn": 2},
+            {"type": "status", "state": "completed"},
+            {"type": "status", "state": "failed"},
+            {"type": "status", "state": "canceled"},
+        )
+        for event in events:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    consumer.render_line(event, level="standard"),
+                    consumer.render_line(event, content=False),
+                )
+
+    def test_detailed_equals_content_true(self):
+        events = (
+            {"type": "tool_call", "name": "bash", "arguments": "git log"},
+            {"type": "tool_call", "name": "bash"},
+            {"type": "tool_result", "name": "bash", "text": "total 4\nx"},
+            {"type": "thinking", "text": "x"},
+            {"type": "text", "text": "正文", "final": False},
+            {"type": "text", "text": "最终", "final": True},
+            {"type": "turn_start", "turn": 3},
+            {"type": "status", "state": "completed"},
+        )
+        for event in events:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    consumer.render_line(event, level="detailed"),
+                    consumer.render_line(event, content=True),
+                )
+
+    def test_compact_suppresses_process_details(self):
+        # compact 不发 thinking / tool_call / tool_result。
+        self.assertIsNone(consumer.render_line({"type": "thinking", "text": "x"}, level="compact"))
+        self.assertIsNone(consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, level="compact"))
+        self.assertIsNone(consumer.render_line({"type": "tool_result", "name": "bash", "text": "x"}, level="compact"))
+        # 仍保留 turn_start / text / status。
+        self.assertEqual(consumer.render_line({"type": "turn_start", "turn": 1}, level="compact"), "🚀 第 1 轮")
+        self.assertEqual(consumer.render_line({"type": "text", "text": "正文", "final": False}, level="compact"), "📖 正文")
+        self.assertEqual(consumer.render_line({"type": "status", "state": "completed"}, level="compact"), "✅ 完成")
+
+    def test_standard_tool_call_summary_no_code_block(self):
+        line = consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, level="standard")
+        self.assertEqual(line, "🔧 `bash` · 列出目录")
+        self.assertNotIn("```", line)
+
+    def test_detailed_tool_call_full_code_block(self):
+        line = consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "git log"}, level="detailed")
+        self.assertEqual(line, "🔧 `bash`\n```bash\ngit log\n```")
+
+    def test_verbose_text_not_truncated(self):
+        long = "x" * 300
+        self.assertEqual(
+            consumer.render_line({"type": "text", "text": long, "final": False}, level="verbose"),
+            "📖 " + long,
+        )
+        # detailed 仍截断到 120。
+        detailed = consumer.render_line({"type": "text", "text": long, "final": False}, level="detailed")
+        self.assertLessEqual(len(detailed), len("📖 ") + 120)
+        self.assertTrue(detailed.endswith("…"))
+
+    def test_verbose_tool_call_equals_detailed(self):
+        args = "x" * 200
+        self.assertEqual(
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="verbose"),
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="detailed"),
+        )
+
+    def test_terminal_and_final_always_sent_all_levels(self):
+        # 终态（✅/❌/⚠️）、错误与 final_text 在任何档位都不丢。
+        for level in consumer.LIVE_DETAIL_MODES:
+            with self.subTest(level=level):
+                self.assertEqual(consumer.render_line({"type": "status", "state": "completed"}, level=level), "✅ 完成")
+                self.assertEqual(consumer.render_line({"type": "status", "state": "failed"}, level=level), "❌ 失败")
+                self.assertEqual(consumer.render_line({"type": "status", "state": "canceled"}, level=level), "⚠️ 已取消")
+                self.assertEqual(consumer.render_line({"type": "text", "text": "最终结果", "final": True}, level=level), "📖 输出完成")
+
+
+class FollowDshResolutionTest(unittest.TestCase):
+    """consumer.read_dsh_transcript_view / resolve_collector_level：正常四档 + 旧值 + 全部回落分支。"""
+
+    def _write_patch(self, dsh_home, profile, entries):
+        d = os.path.join(dsh_home, "profiles", profile)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "cordis.patch.yml")
+        import yaml
+
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(entries, fh, allow_unicode=True, sort_keys=False)
+        return path
+
+    def test_normal_four_modes(self):
+        with tempfile.TemporaryDirectory() as home:
+            for mode in consumer.LIVE_DETAIL_MODES:
+                with self.subTest(mode=mode):
+                    self._write_patch(home, "web", [{"id": "ui-chat", "config": {"transcriptView": mode}}])
+                    self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), mode)
+
+    def test_legacy_normal_expanded_map_to_detailed(self):
+        with tempfile.TemporaryDirectory() as home:
+            for legacy in ("normal", "expanded"):
+                with self.subTest(legacy=legacy):
+                    self._write_patch(home, "web", [{"id": "ui-chat", "config": {"transcriptView": legacy}}])
+                    self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_missing_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_bad_yaml(self):
+        with tempfile.TemporaryDirectory() as home:
+            d = os.path.join(home, "profiles", "web")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "cordis.patch.yml"), "w", encoding="utf-8") as fh:
+                fh.write("- id: [unbalanced\n  config:\n")
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_non_array_yaml(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", {"id": "ui-chat", "config": {"transcriptView": "verbose"}})
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_no_ui_chat_entry(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", [{"id": "other", "config": {"transcriptView": "verbose"}}])
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_no_key(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", [{"id": "ui-chat", "config": {}}])
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_fallback_illegal_value(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", [{"id": "ui-chat", "config": {"transcriptView": "banana"}}])
+            self.assertEqual(consumer.read_dsh_transcript_view(home, "web"), "detailed")
+
+    def test_resolve_collector_level_priority(self):
+        # 显式 live_detail 四档优先（即便 dsh 文件缺失）。
+        self.assertEqual(consumer.resolve_collector_level("verbose", None, "/nonexistent", "web"), "verbose")
+        self.assertEqual(consumer.resolve_collector_level("compact", True, "/nonexistent", "web"), "compact")
+        # 遗留 content 映射（live_detail 未设置）。
+        self.assertEqual(consumer.resolve_collector_level(None, True, "/nonexistent", "web"), "detailed")
+        self.assertEqual(consumer.resolve_collector_level(None, False, "/nonexistent", "web"), "standard")
+        # follow-dsh：live_detail="follow-dsh" 或两者都未设置 → 读文件。
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", [{"id": "ui-chat", "config": {"transcriptView": "compact"}}])
+            self.assertEqual(consumer.resolve_collector_level("follow-dsh", None, home, "web"), "compact")
+            self.assertEqual(consumer.resolve_collector_level(None, None, home, "web"), "compact")
+        # live_detail="follow-dsh" 且 content 显式 → follow-dsh 优先于 content 映射。
+        with tempfile.TemporaryDirectory() as home:
+            self._write_patch(home, "web", [{"id": "ui-chat", "config": {"transcriptView": "verbose"}}])
+            self.assertEqual(consumer.resolve_collector_level("follow-dsh", False, home, "web"), "verbose")
 
 
 class SplitFencedChunksTest(unittest.TestCase):

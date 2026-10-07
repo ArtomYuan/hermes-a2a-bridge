@@ -5,6 +5,8 @@
 > 只发**一条** `SendStreamingMessage`：hook 秒回「已受理」回执，任务在后台线程边消费
 > SSE 流边把中间进度推回飞书 / QQ（`collector.enabled` 门控，默认关），结束时把最终
 > 结果以普通消息主动送达消息面——任务只跑一遍，「完成」之后不静默。
+> v0.4.0 起直播过程展示按**四档**裁剪（`collector.live_detail`，默认 `follow-dsh`
+> 跟随 dsh「工作步骤展示」；见「直播档位」）。
 > override 方案（`register_tool(override=True)`）因注册机制在真实 gateway 不可靠已弃用。
 
 ## 行为
@@ -166,13 +168,21 @@ plugins:
 仅注入 origin，原 `a2a_call` 走同步 `SendMessage`（无直播、无双执行）；非 dsh 目标不受
 影响。
 
-### 内容开关（collector.content）
+### 直播档位（collector.live_detail）
 
-完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.content`。
+完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.live_detail`。
 
-直播是否显示**内容**可用该键单独开关（默认 `true`）。它与 `collector.enabled`
-的关系：`enabled` 是直播**总开关**（默认关，控制是否走单执行直播分支）；
-`content` 是**内容子开关**（在直播已开启的前提下，控制内容类事件是否推送）。
+直播的**过程展示粒度**由该键控制（默认 `follow-dsh`：跟随 dsh 当前档位）。四档与
+dsh 的「工作步骤展示（Work details）」——即 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+中 `- id: ui-chat` 条目的 `config.transcriptView`——**一一对应**：
+
+| `collector.live_detail` | 含义 | 对应 dsh `transcriptView` |
+| --- | --- | --- |
+| `follow-dsh`（默认） | 跟随 dsh 当前档位（解析失败回落 `detailed`） | 读该文件的当前值 |
+| `compact` | 简洁 | `compact` |
+| `standard` | 标准 | `standard` |
+| `detailed` | 详细 | `detailed` |
+| `verbose` | 完全展开 | `verbose` |
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -182,23 +192,38 @@ plugins:
       settings:
         collector:
           enabled: true
-          content: true        # 默认 true：直播全显（工具调用 + 输出 + 正文）
+          live_detail: follow-dsh   # 默认：跟随 dsh 当前档位
+                                     # 亦可固定为 compact / standard / detailed / verbose
 ```
 
-语义：`content` **只把「操作内详细信息」换成人话摘要，不动「操作流」**（与 `events` 正交）。
+> dsh 侧该配置是 **YAML 条目数组**（不是点路径）：在 `profiles/<profile>/cordis.patch.yml`
+> 顶层数组里找 `id: ui-chat` 的条目，取其 `config.transcriptView`；dsh 旧值
+> `normal` / `expanded` 一律读作 `detailed`。dsh 档位只影响其**客户端渲染**（事件流
+> 本身始终全量），桥按同一命名近似裁剪自己的直播行。
 
-| 事件类型 | `content: true`（默认） | `content: false` |
-| --- | --- | --- |
-| `turn_start`（🚀 第 N 轮） | 现状 | 保留（操作流标记） |
-| `tool_call`（🔧 工具名 + 参数） | 现状（工具名 + 参数代码框） | 工具名 + **简短摘要** `🔧 \`name\` · <摘要>`（命令换短语，见下） |
-| `tool_result`（📋） | 现状（含输出正文） | 只保留完成标记 `📋 \`name\` 完成`（不带输出正文） |
-| `text`（含 `final`，叙述/说明） | 现状 | **保留**（操作流，与 true 同款渲染） |
-| `thinking`（思考） | 现状 | **保留**（操作流，渲染 `🧠 思考中…`） |
-| `status` 终态（✅/❌/⚠️） | 现状 | 保留（起止标记） |
-| `turn_end` | 现状（渲染 None） | 现状 |
+四档 → 直播渲染（单调阶梯；`standard` / `detailed` 精确复刻 v0.3.3 的
+`content: false` / `content: true` 两条既有路径）：
 
-- **工具调用摘要规则**（`content: false` 时；bridge 侧启发式生成，不依赖 dsh 提供
-  额外字段）：命中规则表用固定短语，未命中取命令首行截断到约 50 字符。
+| 事件 | `compact` | `standard` | `detailed` | `verbose` |
+| --- | --- | --- | --- | --- |
+| `turn_start` | 🚀 轮次标记 | 同左 | 同左 | 同左 |
+| `tool_call` | **不发** | `🔧 \`name\` · <摘要>`（无代码框） | `🔧 \`name\`` + 参数**代码框**（全量） | = `detailed`（工具行两档相同） |
+| `tool_result` | **不发** | 仅 `📋 \`name\` 完成`（无正文） | `📋 \`name\` 完成` + 输出**代码框**（全量） | = `detailed`（工具结果两档相同） |
+| `thinking` | **不发** | `🧠 思考中…` | 同左 | 同左 |
+| `text`（叙述 / 最终） | 发 | 发 | 发（非 final 截断 ≤120） | 发（非 final **不截断**） |
+| `status` 终态 / 错误 | **必发** | **必发** | **必发** | **必发** |
+
+- **恒定不变（任何档位都不吞）**：任务终态（✅ / ❌ / ⚠️）、错误信息、
+  `final_text` 送达与 stats 完整性（`events_seen` / `states` 等）。
+- **正交开关**：`collector.events: false`（安静模式）仍**优先于档位**——安静模式只推
+  最终结果，与档位选择无关。
+- `compact` 比旧 `content: false` **更严**（连工具行与思考行都不发）；`verbose` 与
+  `detailed` 的唯一差异是**非 final 叙述文本不截断**——工具参数 / 结果在 `detailed`
+  已是全量（v0.3.3 的 `content: true` 本就对它们不截断）。
+- **向后兼容锚点（逐字等价，有测试锁定）**：`standard` ≡ 旧 `content: false`；
+  `detailed` ≡ 旧 `content: true`。故升到新配置体系不会改变这两个既有档位的观感。
+- **`standard` 档的工具调用摘要规则**（bridge 侧启发式生成，不依赖 dsh 提供额外
+  字段）：命中规则表用固定短语，未命中取命令首行截断到约 50 字符。
 
   | 命令 | 摘要 |
   | --- | --- |
@@ -215,36 +240,72 @@ plugins:
 
   命令前的 `sudo` / `env` / `VAR=x` 包装会被跳过；`arguments` 是 JSON 时优先取
   `command` / `cmd` / `script` 键，只带 `path` / `file` 时按「读取文件」摘要。
-- **生效时机**：与 `events` 同级——每个流式任务开始时热读一次，任务中途改配置
-  不影响进行中的任务；改后下一次任务即时生效（无需重启网关）。
-- **stats 完整性不变**：`content` 不改变统计口径，`final_text` / `events_seen` /
-  `states` 始终完整（`_stream_dsh_call` 依赖 `final_text` 做结果送达）。
-- **边界：受理回执与最终结果送达不受本开关影响**（管理员明确）。`content` 只约束
-  **直播里的操作细节**，两条「不静默」通路恒定：
+- **生效时机**：与 `events` 同级——每个流式任务开始时热读一次（`follow-dsh` 同时解析
+  dsh 文件）；任务中途改配置不影响进行中的任务，改后下一次任务即时生效（无需重启
+  网关）。
+
+### follow-dsh 解析规则
+
+`live_detail: follow-dsh` 时，桥在每个流式任务开始时（与既有开关同节奏）读一次
+`<dsh_home>/profiles/<dsh_profile>/cordis.patch.yml`，定位 `id: ui-chat` 条目取
+`config.transcriptView`，并归一旧值（`normal` / `expanded` → `detailed`）。
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `collector.dsh_home` | string | `/home/artom/.dsh` | dsh 数据根路径 |
+| `collector.dsh_profile` | string | `web` | 活动 profile 名 |
+
+**回落**：以下任一情况都**安全回落 `detailed`**（记一次日志，不抛异常、不阻塞任务）——
+文件不存在 / YAML 解析失败 / 无 `ui-chat` 条目 / 无 `transcriptView` 键 / 值非法（不在
+四档内）。`detailed` 既是 dsh Web 默认，也是 v0.3.3 `content: true` 的观感。
+
+> 读取 dsh 文件是新增耦合（桥此前无读 dsh 文件的先例），故路径**可配置**、失败
+> **安全回落**到今天的观感；宿主若想与 dsh 解耦，把 `collector.live_detail` 固定为
+> 任一档即可（一行回退）。
+
+### 向后兼容与迁移
+
+| 场景 | 生效档位 |
+| --- | --- |
+| `live_detail` 显式设为四档之一 | 该档位（不读 dsh 文件） |
+| `live_detail: follow-dsh` | 解析 dsh 文件；失败回落 `detailed` |
+| `live_detail` 未设置，`content` 已显式设置 | 沿用 `content` 映射（**既有部署行为不变**） |
+| 两者都未设置 | `follow-dsh`（v0.4.0 新默认） |
+
+遗留 `collector.content`（布尔）**继续生效**：`true` → `detailed`、`false` → `standard`
+（精确保持 v0.3.3 行为）。升级后：已显式设置 `content` 的部署**行为逐字节不变**；
+两者都未设置的部署自动改为跟随 dsh。**注意**：dsh 当前生效档位是 `standard`，故
+「两者都未设置」的部署升级后会比 v0.3.3 更简洁——恢复 v0.3.3 观感只需一行
+`collector.live_detail: detailed`。
+
+- **stats 完整性不变**：档位不改变统计口径，`final_text` / `events_seen` / `states`
+  始终完整（`_stream_dsh_call` 依赖 `final_text` 做结果送达）。
+- **边界：受理回执与最终结果送达不受档位影响**（管理员明确）。档位只约束**直播里的
+  过程行**，两条「不静默」通路恒定：
   - **① 秒回受理回执**：dsh 单执行分支在 `pre_tool_call` 里立刻返回
     `{"action": "block", "message": "[dsh · context …] ⏳ 已受理——…"}`——它**只由
-    `collector.enabled` 门控**，`content` 取任何值回执均逐字节相同，受理速度不变。
+    `collector.enabled` 门控**，档位取任何值回执均逐字节相同，受理速度不变。
   - **② 完成时的最终结果送达**：任务完成后 `_deliver_final_result` 仍主动推
-    「📬 完成消息 + 结果全文」到同一消息面，**不因 `content: false` 省略正文**。
+    「📬 完成消息 + 结果全文」到同一消息面，**任何档位都不省略正文**。
 - **旧键忽略**：`collector.code_blocks` 自 v0.3.0 起废弃并**一律忽略**——不读取、
   不报错、不迁移、不当 fallback。语义已变（旧 `false` = 纯文本行，若当 fallback
   会静默把「内容」全关掉，属错误迁移）；配置文件里残留该键无副作用、无异常。
 - **代码框渲染保留为内部样式**：操作内容（工具命令 / 执行结果 / 长最终文本）仍以
-  ``` 代码框渲染（围栏感知分块），不再单独暴露开关；`content: false` 下被收窄的
-  只有工具调用参数与工具输出正文，叙述与思考照常按该样式渲染。
+  围栏代码块渲染（围栏感知分块），不再单独暴露开关；`standard` 下被收窄的只有工具
+  调用参数与工具输出正文，`compact` 则连工具行与思考行都不发。
 
-未配置时保持 `true`，向后兼容已部署副本的现有观感（全显）。
+未配置且未设置遗留 `content` 时使用 `follow-dsh`（v0.4.0 起的新默认）。
 
 ### 事件流开关（collector.events）
 
 完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.events`。
 
-是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.content`
-正交：`content` 控制**操作细节是否显示**（开 = 工具调用参数 + 工具输出正文也显示，
-关 = 只留工具名与完成标记；叙述 / 思考等操作流不受影响），`events` 控制**推送
-范围**（中间事件 + 最终结果都推，还是只推最终结果）。两键独立组合：
-`events: false` 时只有最终结果；`content: false` 时工具细节被收窄而操作流照常；
-两者同时 `false` 时只推最终结果（其工具细节同样被收窄），📬 送达不受影响。
+是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.live_detail`
+正交：`live_detail` 控制**过程行的展示粒度**（四档），`events` 控制**推送范围**
+（中间事件 + 最终结果都推，还是只推最终结果）。两键独立组合：`events: false` 时
+**安静模式优先于档位**——无论档位为何都只推最终结果；`live_detail: compact` 时
+工具行与思考行不发而 `text` / 终态照常；两者叠加时同样只推最终结果（其过程行按
+档位渲染），📬 送达不受影响。
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -260,8 +321,8 @@ plugins:
 - `true`（默认）：现状——中间事件（🔧 工具调用 / 📖 中间文本 / 🧠 thinking /
   状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
 - `false`（安静模式）：只推最终结果（📖 输出完成 + 终态状态行），中间事件不推
-  （不刷屏）。完成卡样式固定代码框（内部渲染方式，不再可配置；两键正交，
-  见「内容开关」节）。
+  （不刷屏）。完成卡样式固定代码框（内部渲染方式，不再可配置；安静模式优先于
+  档位，见「直播档位」节）。
 
 未配置时保持 `true`，向后兼容已部署副本的现有行为。
 
@@ -269,20 +330,23 @@ plugins:
 
 本插件自带 Dashboard 扩展面：插件管理页（9120「插件管理」）顶部显示
 「A2A 直播开关 / A2A live switches」卡片，三个开关（直播总开关 / 中间事件推送 /
-内容显示）可直接点选，保存**即时生效（无需重启网关）**——三开关在每次
-hook / 流式任务开始时热读 `ctx.get_config`（Hermes 配置读取按文件 mtime 签名
-缓存，改 config.yaml 后自动感知）。
+直播档位——下拉选择，5 项：跟随 dsh / 简洁 / 标准 / 详细 / 完全展开）可直接点选，
+保存**即时生效（无需重启网关）**——三开关在每次 hook / 流式任务开始时热读
+`ctx.get_config`（Hermes 配置读取按文件 mtime 签名缓存，改 config.yaml 后自动
+感知）。
 
 后端端点（挂在 dashboard 进程，与 gateway 解耦）：
 
 - `GET /api/plugins/hermes-a2a-bridge/collector` — 三开关当前值与默认值元数据
-  （`enabled` / `events` / `content`，**不返回任何密钥**，也永不返回已废弃的
-  `code_blocks` 键）。
-- `POST /api/plugins/hermes-a2a-bridge/collector` — 严格校验（只接受布尔、拒绝
-  多余键）后原子写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`；
-  写回保留条目顶层 `allow_tool_override` 与文件中其它所有键。失败返回 4xx/5xx
-  与明确 detail，不静默吞。升级窗口内旧面板 POST 的 `code_blocks` 被容忍为
-  `content` 的 deprecated 别名（写回的是 `content` 键）。
+  （`enabled` / `events` / `live_detail`），并回显 `live_detail` 的**实际生效档位**
+  （`follow-dsh` 时给出解析结果）；**不返回任何密钥**，也永不返回已废弃的
+  `code_blocks` 键。
+- `POST /api/plugins/hermes-a2a-bridge/collector` — 严格校验（`enabled` / `events`
+  只接受布尔，`live_detail` 只接受 5 个字符串枚举值，非法值与多余键一律拒绝）后
+  原子写回 `plugins.entries.hermes-a2a-bridge.settings.collector.*`；写回保留条目
+  顶层 `allow_tool_override` 与文件中其它所有键。失败返回 4xx/5xx 与明确 detail，
+  不静默吞。升级窗口内旧面板 POST 的 `code_blocks` 被容忍为遗留 `content` 的
+  deprecated 别名（`content` 键本身在配置层继续兼容）。
 
 部署注意：dashboard 插件后端路由与前端面板的发现都是一次性的——**升级插件后
 需重启一次 Hermes dashboard 进程**（或触发插件重扫）面板与 API 才会出现；
@@ -323,15 +387,17 @@ a2a_call（pre_tool_call hook）
 | `thinking` | `🧠 思考中…` |
 | `tool_call` | `🔧 调用工具 \`{name}\``（带参数时命令进代码框） |
 | `tool_result` | `📋 \`{name}\` 完成`（result 非空时输出正文进代码框；空 result 仅标记） |
-| `text`（非 final） | `📖 {文本截断 ≤120}`（聚合到终态才 flush） |
+| `text`（非 final） | `📖 {文本截断 ≤120}`（聚合到终态才 flush；`verbose` 不截断） |
 | `text`（final，lastChunk） | `📖 输出完成`（最终结果不整段刷屏） |
 | `status` completed | `✅ 完成` |
 | `status` failed | `❌ 失败` |
 | `status` canceled | `⚠️ 已取消` |
 | `status` working / submitted | （不单独发） |
 
-`collector.content: false` 时：`text`（含 final）与 `thinking` 行不推；
-`tool_result` 只保留 `📋 \`{name}\` 完成` 标记（无输出正文）；其余行不变。
+档位对上述行的影响见「直播档位」节的四档渲染表：`compact` 下 `tool_call` /
+`tool_result` / `thinking` 行不发；`standard` 下 `tool_call` 只留工具名 + 摘要、
+`tool_result` 只留完成标记；`detailed` / `verbose` 渲染方式不变，后者不截断。
+**终态行（✅ / ❌ / ⚠️）与错误在任何档位都必发。**
 
 ### 节流与软上限
 
@@ -349,24 +415,32 @@ a2a_call（pre_tool_call hook）
    `plugins.entries.hermes-a2a-bridge.settings`。
 3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察 ①agent
    立即（秒级）收到「已受理」回执、不再长阻塞；②对话收到
-   `🚀 开始执行` → `🧠 思考中…` → `🔧 调用工具 …` → `📋 … 完成` → `📖 输出完成`
-   → `✅ 完成`，且 **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
+   `🚀 开始执行` → `🧠 思考中…` → `🔧 …` → `📋 … 完成` → `📖 输出完成`
+   → `✅ 完成`（具体行样式随直播档位，默认 `follow-dsh` 跟随 dsh 当前档位），且
+   **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
    ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 全文）。
 4. redact 确认：进度文本中的 token 不落明文。
 5. 降级确认：临时把 `collector.enabled` 关掉（Dashboard 面板点选或改 config），
    确认 dsh 目标仅注入 origin、走原同步 `a2a_call`（无直播、无双执行）——且
    **无需重启网关**（热读即时生效）。
-6. Dashboard 面板确认：插件管理页顶部出现「A2A 直播开关」卡片，三开关与
+6. Dashboard 面板确认：插件管理页顶部出现「A2A 直播开关」卡片，三开关（含直播档位
+   下拉的 5 个选项，以及 `follow-dsh` 时的实际生效档位回显）与
    config.yaml 当前值一致；点选改动后 `GET /collector` 与
    `~/.hermes/config.yaml` 的 `plugins.entries.hermes-a2a-bridge.settings.collector.*`
    同步变化（条目顶层 `allow_tool_override` 与其它键不丢）。首次部署面板需先重启
    一次 dashboard 进程（后端路由与插件发现是一次性的）。
-7. 内容开关确认：临时把 `collector.content` 关掉，下一个任务确认直播仍然完整
-   呈现**操作流**（🚀 轮次、🧠 思考、📖 叙述与最终输出、✅/❌ 起止标记），而
-   **操作细节换成摘要**——🔧 显示工具名 + 人话短语（如 ``🔧 `bash` · 查看 git
-   提交记录``，无命令正文 / 无代码框）、📋 只有完成标记（无输出正文）；任务结束时
-   「📬 dsh 任务完成，结果如下」仍照常送达。配置文件里残留的
-   `collector.code_blocks` 键无副作用（被忽略，不报错）。
+7. 直播档位确认：把 `collector.live_detail` 依次设为 `compact` / `standard` /
+   `detailed` / `verbose`，确认四档渲染与「直播档位」节的四档表一致（`compact` 不发
+   工具行与思考行；`standard` 工具行为「工具名 + 人话摘要」、结果只留完成标记；
+   `detailed` 带参数 / 输出代码框（全量）；`verbose` 唯一差异是非 final 叙述不截断），且**任务终态与错误
+   在任何档位都照常送达**、「📬 dsh 任务完成，结果如下」不受影响。设回 `follow-dsh`
+   后，确认档位跟随 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 中 `ui-chat`
+   条目的 `config.transcriptView`（旧值 `normal` / `expanded` 读作 `detailed`）；
+   再制造缺文件 / 坏 YAML / 无 `ui-chat` 条目 / 无该键 / 非法值之一，确认**回落
+   `detailed`**、只记一次日志且任务不阻塞。若保留了遗留 `collector.content` 且未设
+   `live_detail`，确认沿用 `content` 映射（`true` → `detailed`、`false` →
+   `standard`）。配置文件里残留的 `collector.code_blocks` 键无副作用（被忽略，
+   不报错）。
 
 ## 单元测试
 
@@ -383,8 +457,10 @@ python3 tests/test_dashboard_api.py
 一致的合成 SSE `data:` 串驱动 `parse_sse_lines` + `normalize_events` + `render_line`
 + `Throttler` + `make_sender`（mock sender 记录发送列表），覆盖归一化事件种类与顺序、
 渲染行 emoji 前缀、text 聚合只在终态 flush、高信号逐条、redact 调用、sender 两级
-回退（无 gateway → `no_gateway`）、异常事件不崩，内容开关（`content=false` 只推
-工具调用条目与完成标记、text/thinking 不推、无 📖 行、stats 完整统计）、
+回退（无 gateway → `no_gateway`）、异常事件不崩，直播档位四档渲染（`compact` 不发
+工具行与思考行、`standard` 只留工具名 + 摘要与完成标记、`detailed` 带参数 / 输出
+代码框、`verbose` 不截断，逐事件断言）、遗留 `content` 映射（`true` → `detailed` /
+`false` → `standard`）、**终态与错误在任何档位都不丢**、
 代码框渲染参数（内部样式），并输出「事件序列 → 渲染消息样例」对照表。
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
@@ -397,13 +473,15 @@ a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格�
 `test_hot_read.py` 覆盖三开关热读改造：`_read_switch` 改 FakeCtx 配置后再次调用
 拿到新值、`_CTX=None` 回退模块级全局、读取抛错回退 default、字符串布尔归一化，
 以及两个读取点（`_on_pre_tool_call` 的 enabled、`_stream_dsh_call` 的
-events / content）确实随配置变化切换行为、同一任务每键只热读一次、
-register() 写全局不回归、残留旧键 `collector.code_blocks` 被忽略（content 取
-默认 true）。
+events / live_detail）确实随配置变化切换行为、同一任务每键只热读一次、
+register() 写全局不回归、`follow-dsh` 解析及其**全部回落分支**（缺文件 / 坏 YAML /
+无 `ui-chat` 条目 / 无 `transcriptView` 键 / 非法值 → `detailed`；旧值
+`normal` / `expanded` 归一为 `detailed`）、残留旧键 `collector.code_blocks` 被忽略。
 
 `test_dashboard_api.py` 覆盖 Dashboard 后端（fake fastapi / hermes_cli）：
-POST body 严格校验（仅布尔 / 拒绝多余键 / 空对象 / 非对象）、旧键 `code_blocks`
-作为 `content` 的 deprecated 别名被接受并映射（GET 永不返回）、collector partial
+POST body 严格校验（`enabled` / `events` 仅布尔、`live_detail` 仅 5 个枚举值，
+非法值与多余键 / 空对象 / 非对象被拒）、旧键 `code_blocks` 作为遗留 `content` 的
+deprecated 别名被接受并映射（GET 永不返回）、collector partial
 嵌套构造、写回姿势（`merge_existing=True` + `preserve_keys` 完整路径 + 损坏
 YAML fail-closed + managed 拒绝 + 失败 fail loud）、读取语义（settings →
 legacy config → 默认）、GET/POST handler 响应只含三键元数据（绝不带密钥）。

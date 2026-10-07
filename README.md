@@ -31,6 +31,11 @@ Hermes 侧接入 dsh A2A server 的桥插件：把 dsh 任务的执行过程实�
 长文本超过网关单条上限时按代码块边界分块，块间以 `⏩ 续` 提示衔接，代码框不会
 跨块断裂。
 
+> 上例为 `detailed`（详细）档的效果——工具命令与结果进入代码框。默认 `follow-dsh`
+> 跟随 dsh 当前档位，而当前生产 dsh 的 Work details 为 `standard`（标准），直播会
+> 更简洁（工具行只留工具名 + 摘要）；想要上例观感，设 `collector.live_detail: detailed`
+> 即可（一行回退）。
+
 ### 代码框效果
 
 操作内容——工具命令、执行结果、最终文本——会自动以代码框渲染：
@@ -50,12 +55,12 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > 实际效果以各网关客户端渲染为准。
 
-内容显示与中间事件推送均可调整（`collector.content` 控制操作细节显示——关闭后工具
-调用换成**简短摘要**（如 ``🔧 `bash` · 查看 git 提交记录``）、工具结果只留完成标记，
-**叙述与思考照常显示**；`collector.events` 控制事件流开关；两者均默认开启。
-代码框渲染保留为内容显示时的内部样式，不再单独暴露开关），可在 Dashboard「插件管理」
-页的「A2A 直播开关」面板点选（即时生效）——详见
-[CONFIGURATION.md](CONFIGURATION.md)。
+过程展示与中间事件推送均可调整：`collector.live_detail` 控制**直播过程展示的档位**
+（四档 `compact` / `standard` / `detailed` / `verbose`，与 dsh「工作步骤展示」
+一一对应；默认 `follow-dsh` 跟随 dsh 当前档位），`collector.events` 控制事件流开关
+（关 = 安静模式，只推最终结果，**优先于档位**）；代码框渲染保留为档位内部的样式，
+不再单独暴露开关。两者均可在 Dashboard「插件管理」页的「A2A 直播开关」面板点选
+或下拉（即时生效）——详见 [CONFIGURATION.md](CONFIGURATION.md)。
 
 ## 流程图
 
@@ -109,15 +114,14 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 ## 直播开关（Dashboard 即时生效）
 
 插件加载后，直播的三个开关——`collector.enabled`（总开关）/ `collector.events`
-（中间事件推送）/ `collector.content`（内容显示，关 → 工具调用换成简短摘要（如
-``🔧 `bash` · 查看 git 提交记录``）、工具结果只留完成标记；叙述与 thinking 不受
-影响）——可在 Hermes
+（中间事件推送）/ `collector.live_detail`（直播档位，下拉 5 选项：跟随 dsh / 简洁 /
+标准 / 详细 / 完全展开）——可在 Hermes
 Dashboard「插件管理」页顶部的「A2A 直播开关」面板直接
-点选，保存**即时生效（无需重启网关，热读）**。后端端点
+点选或下拉，保存**即时生效（无需重启网关，热读）**。后端端点
 `GET/POST /api/plugins/hermes-a2a-bridge/collector` 严格校验后写回
 `plugins.entries.hermes-a2a-bridge.settings.collector.*`（保留条目顶层
-`allow_tool_override` 与其它所有键；POST 容忍旧键 `code_blocks` 作为 `content`
-的 deprecated 别名）。首次部署面板需重启一次 dashboard 进程。
+`allow_tool_override` 与其它所有键；POST 容忍旧键 `code_blocks` 作为遗留
+`content` 的 deprecated 别名）。首次部署面板需重启一次 dashboard 进程。
 详见 [CONFIGURATION.md](CONFIGURATION.md)「直播消费者」。
 
 ## 链接

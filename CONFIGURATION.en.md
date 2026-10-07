@@ -8,7 +8,10 @@
 > intermediate progress back to Feishu / QQ (gated by `collector.enabled`, off by
 > default); when the task finishes, the final result is actively delivered to the
 > messaging surface as a normal message — the task runs only once, and there is
-> no silence after "done". The override approach (`register_tool(override=True)`)
+> no silence after "done". As of v0.4.0 the live progress lines are trimmed by
+> **four tiers** (`collector.live_detail`, default `follow-dsh` to follow dsh's
+> "Work details"; see "Live-detail tier"). The override approach
+> (`register_tool(override=True)`)
 > was abandoned because the registration mechanism is unreliable on the real
 > gateway.
 
@@ -210,15 +213,22 @@ When `collector.enabled` is absent / explicitly `false`, the dsh target does
 the original `a2a_call` runs the synchronous `SendMessage` (no live output, no
 double execution); non-dsh targets are unaffected.
 
-### Content toggle (collector.content)
+### Live-detail tier (collector.live_detail)
 
-Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.content`.
+Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.live_detail`.
 
-Whether live output shows **content** is controlled separately by this key
-(default `true`). Relationship to `collector.enabled`: `enabled` is the live
-**master switch** (off by default, controls whether the single-execution live
-branch runs); `content` is the **content sub-switch** (once live streaming is
-enabled, controls whether content events are pushed).
+This key controls the **granularity of live progress**. Its four tiers map **one-to-one**
+onto dsh's "Work details" — the `config.transcriptView` of the `- id: ui-chat` entry in
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` (default `follow-dsh`: follow dsh's
+current tier):
+
+| `collector.live_detail` | Meaning | dsh `transcriptView` |
+| --- | --- | --- |
+| `follow-dsh` (default) | follow dsh's current tier (falls back to `detailed` on failure) | read from that file |
+| `compact` | terse | `compact` |
+| `standard` | standard | `standard` |
+| `detailed` | detailed | `detailed` |
+| `verbose` | fully expanded | `verbose` |
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -228,23 +238,43 @@ plugins:
       settings:
         collector:
           enabled: true
-          content: true        # default true: full live display (tool calls + output + narrative)
+          live_detail: follow-dsh   # default: follow dsh's current tier
+                                     # or pin compact / standard / detailed / verbose
 ```
 
-Semantics: `content` closes **operation details only; the operation flow stays** (orthogonal to `events`).
+> On the dsh side this setting is a **YAML entry array** (not a dotted path): find the
+> entry with `id: ui-chat` in the top-level array of
+> `profiles/<profile>/cordis.patch.yml` and read its `config.transcriptView`. dsh's
+> legacy values `normal` / `expanded` are read as `detailed`. A dsh tier affects
+> **client-side rendering only** (the event stream itself is always complete); the
+> bridge trims its own live lines under the same names.
 
-| Event type | `content: true` (default) | `content: false` |
-| --- | --- | --- |
-| `turn_start` (🚀 turn N) | current behavior | kept (operation-flow marker) |
-| `tool_call` (🔧 tool name + args) | current behavior (name + argument code block) | tool name + **short summary** `🔧 \`name\` · <summary>` (command replaced by a plain-language phrase, see below) |
-| `tool_result` (📋) | current behavior (with output body) | completion marker only: `📋 \`name\` 完成` (no output body) |
-| `text` (incl. `final`, narrative) | current behavior | **kept** (operation flow, rendered exactly as with `true`) |
-| `thinking` | current behavior | **kept** (operation flow, rendered as `🧠 思考中…`) |
-| `status` terminal (✅/❌/⚠️) | current behavior | kept (start/end markers) |
-| `turn_end` | current behavior (renders None) | current behavior |
+Four tiers → live rendering (a monotonic ladder; `standard` / `detailed` exactly
+reproduce the two existing v0.3.3 paths `content: false` / `content: true`):
 
-- **Tool-call summary rules** (with `content: false`; generated heuristically in the
-  bridge, no extra field required from dsh): a matching rule yields a fixed phrase,
+| Event | `compact` | `standard` | `detailed` | `verbose` |
+| --- | --- | --- | --- | --- |
+| `turn_start` | 🚀 turn marker | same | same | same |
+| `tool_call` | **not sent** | `🔧 \`name\` · <summary>` (no code block) | `🔧 \`name\`` + argument **code block** (full) | = `detailed` (identical tool lines) |
+| `tool_result` | **not sent** | `📋 \`name\` 完成` only (no body) | `📋 \`name\` 完成` + output **code block** (full) | = `detailed` (identical results) |
+| `thinking` | **not sent** | `🧠 思考中…` | same | same |
+| `text` (narrative / final) | sent | sent | sent (non-final truncated to ≤120) | sent (non-final **not truncated**) |
+| `status` terminal / errors | **always sent** | **always sent** | **always sent** | **always sent** |
+
+- **Constant across tiers (never swallowed)**: task terminal states (✅ / ❌ / ⚠️),
+  error messages, `final_text` delivery, and stats completeness (`events_seen` /
+  `states`, etc.).
+- **Orthogonal switch**: `collector.events: false` (quiet mode) still **outranks the
+  tier** — quiet mode pushes the final result only, whatever the tier.
+- `compact` is **stricter** than the old `content: false` (it also drops tool and
+  thinking lines); the **only** difference between `verbose` and `detailed` is that
+  non-final narrative text is not truncated — tool arguments and results are already
+  full under `detailed` (v0.3.3's `content: true` never truncated them).
+- **Backward-compatibility anchors (byte-identical, locked by tests)**: `standard`
+  ≡ the old `content: false`; `detailed` ≡ the old `content: true`. Migrating to the
+  new keys therefore does not change either existing tier's look.
+- **Tool-call summary rules for the `standard` tier** (generated heuristically in the
+  bridge; no extra field required from dsh): a matching rule yields a fixed phrase,
   otherwise the command's first line is truncated to ~50 characters.
 
   | Command | Summary |
@@ -263,48 +293,90 @@ Semantics: `content` closes **operation details only; the operation flow stays**
   Leading `sudo` / `env` / `VAR=x` wrappers are skipped; when `arguments` is JSON the
   `command` / `cmd` / `script` key wins, and a path-only object summarises as a file
   read. The summaries themselves are Chinese, matching the plugin's other chat copy.
-- **When it takes effect**: same level as `events` — hot-read once at the start
-  of each stream task; changing it mid-task does not affect the running task;
-  the next task picks up the new value immediately (no gateway restart).
-- **Stats stay complete**: `content` never changes what is counted;
-  `final_text` / `events_seen` / `states` are still fully recorded
-  (`_stream_dsh_call` relies on `final_text` for result delivery).
-- **Boundary: the receipt and the final-result delivery are unaffected by this
-  switch** (administrator's explicit requirement). `content` constrains only the
-  **operation details in the live stream**; the two never-silent paths are constant:
-  - **① Instant acceptance receipt**: the dsh single-execution branch returns
-    `{"action": "block", "message": "[dsh · context …] ⏳ accepted — …"}` straight
-    from `pre_tool_call`. It is gated by `collector.enabled` **alone**, so the
-    receipt is byte-identical for any `content` value and its latency is unchanged.
-  - **② Final-result delivery on completion**: `_deliver_final_result` still
-    pushes the "📬 task completed + full result" message to the same conversation;
-    `content: false` **never strips that body**.
-- **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
-  **ignored entirely** — never read, never an error, never migrated, never a
-  fallback. Its semantics changed (old `false` = plain-text lines; using it as a
-  fallback would silently turn all content off — a wrong migration); a residual
-  `code_blocks` key in the config file has no side effects and no exceptions.
-- **Code-block rendering stays as internal style**: with `content: true`,
-  operation content (tool commands / execution results / long final text) is
-  still rendered as ``` code blocks (fence-aware chunking); it is no longer a
-  standalone switch.
+- **When it takes effect**: same level as `events` — hot-read once at the start of
+  each stream task (with `follow-dsh`, the dsh file is resolved at the same time);
+  changing it mid-task does not affect the running task, and the next task picks up
+  the new value immediately (no gateway restart).
 
-When unset it stays `true`, keeping existing deployments' behavior unchanged
-(full display).
+### follow-dsh resolution rules
+
+With `live_detail: follow-dsh`, the bridge reads
+`<dsh_home>/profiles/<dsh_profile>/cordis.patch.yml` once at the start of each stream
+task (the same cadence as the existing switches), locates the `id: ui-chat` entry, takes
+its `config.transcriptView`, and normalizes legacy values (`normal` / `expanded` →
+`detailed`).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `collector.dsh_home` | string | `/home/artom/.dsh` | dsh data root |
+| `collector.dsh_profile` | string | `web` | active profile name |
+
+**Fallback**: any of the following **safely falls back to `detailed`** (one log line, no
+exception, never blocks the task) — file missing / YAML parse failure / no `ui-chat`
+entry / no `transcriptView` key / illegal value (outside the four tiers). `detailed` is
+both the dsh Web default and the look of v0.3.3 `content: true`.
+
+> Reading dsh files is new coupling (the bridge had no precedent for it), so the path is
+> **configurable** and failure **safely falls back** to today's look; to decouple from
+> dsh, pin `collector.live_detail` to any fixed tier (a one-line rollback).
+
+### Backward compatibility and migration
+
+| Scenario | Effective tier |
+| --- | --- |
+| `live_detail` explicitly set to one of the four tiers | that tier (the dsh file is not read) |
+| `live_detail: follow-dsh` | resolve the dsh file; `detailed` on failure |
+| `live_detail` unset, `content` explicitly set | the `content` mapping (**existing deployments unchanged**) |
+| both unset | `follow-dsh` (the new v0.4.0 default) |
+
+The legacy `collector.content` boolean **keeps working**: `true` → `detailed`,
+`false` → `standard` (exactly preserving v0.3.3 behavior). After the upgrade,
+deployments that explicitly set `content` behave **byte-for-byte the same**;
+deployments that set neither automatically follow dsh. **Note**: the dsh tier in
+production today is `standard`, so a "neither set" deployment becomes terser after
+upgrading than it was on v0.3.3 — one line (`collector.live_detail: detailed`) restores
+the v0.3.3 look.
+
+- **Stats stay complete**: tiers never change what is counted; `final_text` /
+  `events_seen` / `states` are still fully recorded (`_stream_dsh_call` relies on
+  `final_text` for result delivery).
+- **Boundary: the receipt and the final-result delivery are unaffected by the tier**
+  (administrator's explicit requirement). A tier constrains only the **progress lines in
+  the live stream**; the two never-silent paths are constant:
+  - **① Instant acceptance receipt**: the dsh single-execution branch returns
+    `{"action": "block", "message": "[dsh · context …] ⏳ accepted — …"}` straight from
+    `pre_tool_call`. It is gated by `collector.enabled` **alone**, so the receipt is
+    byte-identical for any tier value and its latency is unchanged.
+  - **② Final-result delivery on completion**: `_deliver_final_result` still pushes the
+    "📬 task completed + full result" message to the same conversation; **no tier ever
+    strips that body**.
+- **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
+  **ignored entirely** — never read, never an error, never migrated, never a fallback.
+  Its semantics changed (old `false` = plain-text lines; using it as a fallback would
+  silently turn all content off — a wrong migration); a residual `code_blocks` key in
+  the config file has no side effects and no exceptions.
+- **Code-block rendering stays as internal style**: operation content (tool commands /
+  execution results / long final text) is still rendered as fenced code blocks
+  (fence-aware chunking) and is no longer a standalone switch; under `standard` only
+  tool-call arguments and tool output bodies narrow, and under `compact` tool and
+  thinking lines are not sent at all.
+
+When unset and the legacy `content` is also unset, `follow-dsh` is used (the new v0.4.0
+default).
 
 ### Event-stream toggle (collector.events)
 
 Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.events`.
 
 Whether "intermediate events" are pushed is controlled separately by this key
-(default `true`). It is orthogonal to `collector.content`: `content` controls
-**whether content events are shown** (on = tool calls + output + narrative all
-shown, off = tool calls and start/end markers only), while `events` controls the
+(default `true`). It is orthogonal to `collector.live_detail`: `live_detail` controls
+the **granularity of progress lines** (four tiers), while `events` controls the
 **push scope** (push intermediate events + final result, or push only the final
-result). The two keys compose independently: with `events: false` only the final
-result is pushed; with `content: false` tool details narrow while the operation
-flow stays; with both `false` only the final result is pushed (its tool details
-narrowed as well) — the 📬 delivery is unaffected.
+result). The two keys compose independently: with `events: false` **quiet mode
+outranks the tier** — only the final result is pushed whatever the tier; with
+`live_detail: compact` tool and thinking lines are not sent while `text` / terminal
+lines still are; with both combined only the final result is pushed (its progress
+lines rendered per the tier) — the 📬 delivery is unaffected.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -322,8 +394,8 @@ plugins:
   (📖 output complete / ✅ done card) are all pushed.
 - `false` (quiet mode): push only the final result (📖 output complete + terminal
   status line); intermediate events are not pushed (no spam). The done card's
-  style stays code blocks (internal rendering, no longer configurable; the two
-  keys are orthogonal — see "Content toggle").
+  style stays code blocks (internal rendering, no longer configurable; quiet mode
+  outranks the tier — see "Live-detail tier").
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
@@ -331,7 +403,8 @@ When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
 This plugin ships a Dashboard extension: the "Plugins" page (port 9120) shows an
 "A2A live switches / A2A 直播开关" card at the top with the three switches (master
-switch / intermediate events / content display). Toggling any of them takes
+switch / intermediate events / live-detail tier — a dropdown with 5 options: follow
+dsh / terse / standard / detailed / fully expanded). Toggling any of them takes
 effect **immediately (no gateway restart)** — the three switches are hot-read via
 `ctx.get_config` at the start of every hook / stream task (Hermes' config reader
 caches by file mtime signature and picks up config.yaml changes automatically).
@@ -339,15 +412,19 @@ caches by file mtime signature and picks up config.yaml changes automatically).
 Backend endpoints (mounted in the dashboard process, decoupled from the gateway):
 
 - `GET /api/plugins/hermes-a2a-bridge/collector` — current values + default
-  metadata for the three switches (`enabled` / `events` / `content`; **never
-  returns any secrets**, and never returns the deprecated `code_blocks` key).
-- `POST /api/plugins/hermes-a2a-bridge/collector` — strict validation (booleans
-  only, unknown keys rejected), then atomically writes back
+  metadata for the three switches (`enabled` / `events` / `live_detail`), plus the
+  **effective tier** for `live_detail` (the resolved value when it is
+  `follow-dsh`); **never returns any secrets**, and never returns the deprecated
+  `code_blocks` key.
+- `POST /api/plugins/hermes-a2a-bridge/collector` — strict validation (`enabled` /
+  `events` accept booleans only; `live_detail` accepts only the 5 string enum
+  values; illegal values and unknown keys are rejected), then atomically writes back
   `plugins.entries.hermes-a2a-bridge.settings.collector.*`; the write preserves
   the entry-level `allow_tool_override` and every other key in the file. Failures
   return 4xx/5xx with a concrete detail — never silently swallowed. During the
   upgrade window, a `code_blocks` key POSTed by an already-open old panel is
-  tolerated as a deprecated alias of `content` (the `content` key is written).
+  tolerated as a deprecated alias of the legacy `content` (the `content` key itself
+  stays config-compatible).
 
 Deployment note: dashboard plugin discovery and backend route mounting are
 one-shot — **after upgrading the plugin, restart the Hermes dashboard process
@@ -389,18 +466,19 @@ a2a_call (pre_tool_call hook)
 | `thinking` | `Thinking...` |
 | `tool_call` | `Calling tool \`{name}\`` (with args, the command goes into a code block) |
 | `tool_result` | `\`{name}\` done` (with non-empty result, the output body goes into a code block; empty result = marker only) |
-| `text` (non-final) | `{text truncated to <=120}` (flush only at terminal state) |
+| `text` (non-final) | `{text truncated to <=120}` (flush only at terminal state; no truncation under `verbose`) |
 | `text` (final, lastChunk) | `Output complete` (the final result is not dumped in full) |
 | `status` completed | `Done` |
 | `status` failed | `Failed` |
 | `status` canceled | `Canceled` |
 | `status` working / submitted | (not sent separately) |
 
-With `collector.content: false`: only the **operation details** narrow —
-`tool_call` keeps the tool name alone (`🔧 \`{name}\``, no arguments) and
-`tool_result` keeps only the `📋 \`{name}\` 完成` marker (no output body).
-`text` (incl. final) and `thinking` are part of the operation flow and render
-exactly as with `content: true`; all other lines are unchanged.
+How a tier affects those lines is given by the four-tier table under "Live-detail
+tier": under `compact` the `tool_call` / `tool_result` / `thinking` lines are not
+sent; under `standard` `tool_call` keeps the tool name + summary and `tool_result`
+keeps the completion marker only; `detailed` / `verbose` render as before, the
+latter without truncation. **Terminal lines (✅ / ❌ / ⚠️) and errors are always
+sent, whatever the tier.**
 
 ### Throttling and soft limits
 
@@ -421,30 +499,41 @@ exactly as with `content: true`; all other lines are unchanged.
 3. Behavior confirmation: in a Feishu / QQ conversation, have the agent call
    `a2a_call(agent="dsh", ...)` and observe ① the agent receives the "accepted"
    receipt within seconds (no more long blocking); ② the conversation receives
-   `Starting execution` → `Thinking...` → `Calling tool ...` → `... done` →
-   `Output complete` → `Done`, and that **dsh executes only once** (the
-   dsh-a2a-server log shows only one task submission); ③ when the task finishes,
-   the conversation receives the "📬 dsh 任务完成，结果如下" result message
-   (header + full text).
+   `Starting execution` → `Thinking...` → `🔧 ...` → `... done` →
+   `Output complete` → `Done` (the exact line styles follow the live-detail tier;
+   by default `follow-dsh` follows dsh's current tier), and that **dsh executes
+   only once** (the dsh-a2a-server log shows only one task submission); ③ when the
+   task finishes, the conversation receives the "📬 dsh 任务完成，结果如下" result
+   message (header + full text).
 4. redact confirmation: tokens in progress text do not appear in plaintext.
 5. Degradation confirmation: temporarily turn off `collector.enabled` (Dashboard
    toggle or a config edit) and confirm the dsh target only injects origin and
    runs the original synchronous `a2a_call` (no live output, no double execution)
    — with **no gateway restart** (hot-read takes effect immediately).
 6. Dashboard panel confirmation: the "A2A live switches" card appears at the top
-   of the "Plugins" page with all three switches matching the current
+   of the "Plugins" page with all three switches (including the live-detail tier
+   dropdown with its 5 options and the effective-tier echo when it is
+   `follow-dsh`) matching the current
    config.yaml values; after toggling, `GET /collector` and
    `plugins.entries.hermes-a2a-bridge.settings.collector.*` in
    `~/.hermes/config.yaml` change in step (the entry-level `allow_tool_override`
    and all other keys survive). First deployment needs one dashboard-process
    restart (backend mounting and plugin discovery are one-shot).
-7. Content-toggle confirmation: temporarily turn off `collector.content` and, on
-   the next task, confirm the live stream still shows the full **operation flow**
-   (🚀 turns, 🧠 thinking, 📖 narrative and final output, ✅/❌ start/end markers)
-   while the **operation details** become summaries — 🔧 tool name + a plain-language
-   phrase (e.g. ``🔧 `bash` · 查看 git 提交记录``, no command body, no code block) and
-   📋 the completion marker alone (no output body); at task completion the
-   "📬 dsh 任务完成，结果如下" message is still delivered as usual. A residual
+7. Live-detail tier confirmation: set `collector.live_detail` to `compact` /
+   `standard` / `detailed` / `verbose` in turn and confirm the rendering matches
+   the four-tier table under "Live-detail tier" (`compact` sends no tool or
+   thinking lines; `standard` renders a tool name + plain-language summary and
+   keeps the completion marker only; `detailed` adds full argument / output code
+   blocks; `verbose` differs only in leaving non-final narrative text untruncated), and that **terminal states and
+   errors are still delivered under every tier** and the "📬 dsh 任务完成，结果如下"
+   message is unaffected. Set it back to `follow-dsh` and confirm the tier follows
+   `config.transcriptView` of the `ui-chat` entry in
+   `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (legacy values `normal` /
+   `expanded` read as `detailed`); then force one of missing file / corrupt YAML /
+   no `ui-chat` entry / no key / illegal value and confirm it **falls back to
+   `detailed`**, logs once, and never blocks the task. If a legacy
+   `collector.content` is kept while `live_detail` is unset, confirm the `content`
+   mapping is used (`true` → `detailed`, `false` → `standard`). A residual
    `collector.code_blocks` key in the config file has no side effects (ignored, no
    error).
 
@@ -465,9 +554,12 @@ a fake `gateway.session_context` via `sys.modules`). `test_consumer.py` drives
 format (a mock sender records the send list), covering normalized event kinds and
 order, rendered-line emoji prefixes, text aggregation flushing only at terminal
 state, high-signal one-by-one sends, redact invocation, two-level sender fallback
-(no gateway → `no_gateway`), no crash on abnormal events, the content switch
-(`content=false` pushes only tool-call entries and completion markers; no
-text/thinking, no 📖 lines, stats fully recorded), the code-block rendering
+(no gateway → `no_gateway`), no crash on abnormal events, per-event four-tier
+rendering (`compact` sends no tool or thinking lines, `standard` keeps the tool
+name + summary and the completion marker, `detailed` adds argument / output code
+blocks, `verbose` does not truncate), the legacy `content` mapping (`true` →
+`detailed` / `false` → `standard`), **terminal states and errors surviving every
+tier**, the code-block rendering
 parameter (internal style), and outputs an "event sequence → rendered message
 sample" mapping table.
 
@@ -484,15 +576,18 @@ on missing dsh config.
 value after changing a FakeCtx's config, falls back to the module-level globals
 when `_CTX is None`, falls back to the passed default when the read raises,
 normalizes string booleans, and proves both read sites (`_on_pre_tool_call`'s
-enabled check, `_stream_dsh_call`'s events / content) switch behavior with the
+enabled check, `_stream_dsh_call`'s events / live_detail) switch behavior with the
 config, read each key only once per task, keep register()'s global writes
-intact, and ignore a residual legacy `collector.code_blocks` key (content keeps
-its default of true).
+intact, cover `follow-dsh` resolution and **all of its fallback branches**
+(missing file / corrupt YAML / no `ui-chat` entry / no `transcriptView` key /
+illegal value → `detailed`; legacy values `normal` / `expanded` normalized to
+`detailed`), and ignore a residual legacy `collector.code_blocks` key.
 
 `test_dashboard_api.py` covers the Dashboard backend (fake fastapi /
-hermes_cli): strict POST body validation (booleans only / unknown keys / empty /
+hermes_cli): strict POST body validation (`enabled` / `events` booleans only,
+`live_detail` limited to the 5 enum values; illegal values / unknown keys / empty /
 non-object rejected), the legacy `code_blocks` key accepted and mapped as a
-deprecated alias of `content` (GET never returns it), collector-partial nesting,
+deprecated alias of the legacy `content` (GET never returns it), collector-partial nesting,
 the write posture (`merge_existing=True` + full-path `preserve_keys` +
 fail-closed on corrupt YAML + managed rejection + fail-loud on write errors),
 read semantics (settings → legacy config → defaults), and GET/POST handler

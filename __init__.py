@@ -84,18 +84,29 @@ _COLLECTOR_ENABLED = False
 # 事件流开关：register() 读 ``collector.events``（默认 true）后写入全局；
 # false 时安静模式只推最终结果（中间事件不推）。运行期同样经 ``_read_switch`` 热读。
 _EVENTS = True
-# 内容开关：register() 读 ``collector.content``（默认 true）后写入全局；
-# false 时直播隐去内容类事件（text / thinking 不推、tool_result 只留完成标记），
-# 只显示工具调用与起止标记。运行期同样经 ``_read_switch`` 热读。
+# 内容开关（遗留）：register() 读 ``collector.content``（默认 true）后写入全局；
+# false 时直播只收窄「操作内细节」（tool_call 换摘要、tool_result 只留完成标记），
+# 操作流（text / thinking）与起止标记不受影响。运行期经 ``_read_live_detail`` 参与
+# 档位解析（content=true→detailed / false→standard）；``collector.live_detail`` 显式
+# 设置时优先于 content。
 # 旧键 ``collector.code_blocks`` 已废弃并一律忽略（不读取、不迁移、不当 fallback）。
 _CONTENT = True
+# live_detail 档位配置：register() 读 ``collector.live_detail``（默认 follow-dsh）后写入
+# 全局，作为初始值与无 ``_CTX`` 时的回退值；运行期每次流式任务开始时经
+# ``_read_live_detail`` 解析为四档之一（compact/standard/detailed/verbose，
+# follow-dsh 读 dsh profile patch，失败回落 detailed）。
+_LIVE_DETAIL = "follow-dsh"
 _CTX: Optional[Any] = None
+
+# 直播档位（有序，对齐 dsh TRANSCRIPT_VIEW_MODES / consumer.LIVE_DETAIL_MODES）。
+_LIVE_DETAIL_MODES = ("compact", "standard", "detailed", "verbose")
 
 # ``_read_switch`` 无 ``_CTX`` 回退时用的全局名映射（键 → 模块级全局变量名）。
 _SWITCH_GLOBAL_BY_KEY = {
     "collector.enabled": "_COLLECTOR_ENABLED",
     "collector.events": "_EVENTS",
     "collector.content": "_CONTENT",
+    "collector.live_detail": "_LIVE_DETAIL",
 }
 # consumer 模块缓存（惰性 import，见 _import_consumer）。
 _CONSUMER_MODULE: Optional[Any] = None
@@ -111,8 +122,21 @@ def _to_bool(value: Any) -> bool:
     return text in {"1", "true", "yes", "on", "enabled"}
 
 
-def _read_switch(key: str, default: bool) -> bool:
-    """热读一个 collector 开关（Dashboard 改 config 后即时生效，无需重启网关）。
+def _to_level(value: Any) -> Optional[str]:
+    """把 live_detail 档位值归一为四档之一；非法 / None / 非四档返回 None。
+
+    只接受四档字面量（大小写不敏感）；dsh 旧值 ``normal`` / ``expanded`` 的归一由
+    consumer.read_dsh_transcript_view 负责，保证 ``collector.live_detail`` 值域严格。
+    """
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _LIVE_DETAIL_MODES:
+            return text
+    return None
+
+
+def _read_switch_raw(key: str, default: Any) -> Any:
+    """热读一个 collector 配置项，返回**原始值**（不做 bool 归一化）。
 
     优先 ``_CTX.get_config(key, default)``——Hermes 的 config 读取按
     ``(mtime_ns, size)`` 签名缓存，每次调用都感知 config.yaml 变更（官方热读通道）。
@@ -121,11 +145,33 @@ def _read_switch(key: str, default: bool) -> bool:
     """
     if _CTX is not None:
         try:
-            return _to_bool(_CTX.get_config(key, default))
+            return _CTX.get_config(key, default)
         except Exception as exc:  # 读配置失败不阻断工具调用
             logger.warning("hermes-a2a-bridge: hot-read %s failed: %s", key, exc)
-            return bool(default)
-    return bool(globals().get(_SWITCH_GLOBAL_BY_KEY.get(key, ""), default))
+            return default
+    return globals().get(_SWITCH_GLOBAL_BY_KEY.get(key, ""), default)
+
+
+def _read_switch(key: str, default: bool) -> bool:
+    """热读一个布尔 collector 开关，返回 bool（Dashboard 改 config 后即时生效）。"""
+    return _to_bool(_read_switch_raw(key, default))
+
+
+def _read_live_detail() -> str:
+    """热读 live_detail / content / dsh_home / dsh_profile 并解析为四档之一。
+
+    每次流式任务开始时读一次（与 ``events`` 同节奏）；任务中途改配置不影响进行中任务。
+    解析优先级（见 consumer.resolve_collector_level）：显式 live_detail 四档 >
+    follow-dsh 读文件（失败回落 detailed）> 遗留 content 映射 > 默认。
+    """
+    consumer = _import_consumer()
+    live_detail_raw = _read_switch_raw("collector.live_detail", None)
+    content_raw = _read_switch_raw("collector.content", None)
+    dsh_home = _read_switch_raw("collector.dsh_home", consumer.DSH_HOME_DEFAULT)
+    dsh_profile = _read_switch_raw("collector.dsh_profile", consumer.DSH_PROFILE_DEFAULT)
+    return consumer.resolve_collector_level(
+        live_detail_raw, content_raw, dsh_home, dsh_profile
+    )
 
 
 def _clean_segment(seg: str) -> str:
@@ -262,11 +308,12 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     thread_id = parts[2] if len(parts) > 2 else ""
 
     consumer = _import_consumer()
-    # 热读事件/内容两开关（本任务开始时各读一次，任务中途改配置不影响进行中任务，
-    # 与历史语义一致）。enabled 总开关在 hook 入口已热读。渲染样式（code_blocks）
-    # 不再由配置控制：直播路径固定 True（内容显示时以代码框渲染的内部样式）。
+    # 热读事件开关 + live_detail 档位（本任务开始时各读一次，任务中途改配置不影响
+    # 进行中任务，与历史语义一致）。enabled 总开关在 hook 入口已热读。渲染样式
+    # （code_blocks）不再由配置控制：直播路径固定 True（内容显示时以代码框渲染）。
+    # live_detail 经 _read_live_detail 解析为四档之一（含 follow-dsh 读文件）。
     events = _read_switch("collector.events", True)
-    content = _read_switch("collector.content", True)
+    level = _read_live_detail()
     # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
     # 直播 sender 固定 code_blocks=True（内部样式）；结果送达 sender 固定 False
     # （普通消息，见 _deliver_final_result）。
@@ -297,7 +344,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         timeout=timeout,
         code_blocks=True,
         events=events,
-        content=content,
+        level=level,
     )
     logger.info(
         "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
@@ -485,24 +532,26 @@ def _on_post_tool_call(
 def register(ctx) -> None:
     """插件入口：读 collector 门控、注册 pre/post 钩子（单执行走 pre_tool_call hook）。
 
-    三开关仍在此读一次写入模块级全局（作为初始值 / ``_CTX=None`` 时的回退值）；
-    运行期读取点已改热读（``_read_switch``），此处的值不再固化生效。
-    旧键 ``collector.code_blocks`` 已废弃：此处不读取（一律忽略）。
+    开关仍在此读一次写入模块级全局（作为初始值 / ``_CTX=None`` 时的回退值）；
+    运行期读取点已改热读（``_read_switch`` / ``_read_live_detail``），此处的值不再
+    固化生效。旧键 ``collector.code_blocks`` 已废弃：此处不读取（一律忽略）。
     """
-    global _COLLECTOR_ENABLED, _EVENTS, _CONTENT, _CTX
+    global _COLLECTOR_ENABLED, _EVENTS, _CONTENT, _LIVE_DETAIL, _CTX
     _CTX = ctx
     try:
         _COLLECTOR_ENABLED = _to_bool(ctx.get_config("collector.enabled", False))
         # 事件流开关默认 true（向后兼容）；显式 false 才安静模式（只推最终结果）。
         _EVENTS = _to_bool(ctx.get_config("collector.events", True))
-        # 内容开关默认 true（向后兼容）；显式 false 才隐去内容类事件
-        # （只显示工具调用与起止标记）。
+        # 内容开关默认 true（遗留）；显式 false 才收窄操作内细节。live_detail 显式设置时优先。
         _CONTENT = _to_bool(ctx.get_config("collector.content", True))
+        # live_detail 默认 follow-dsh；存原始值（解析在每次任务开始经 _read_live_detail）。
+        _LIVE_DETAIL = ctx.get_config("collector.live_detail", "follow-dsh")
     except Exception as exc:  # 读配置失败按默认处理，绝不阻断插件加载
         logger.warning("hermes-a2a-bridge: read collector settings failed: %s", exc)
         _COLLECTOR_ENABLED = False
         _EVENTS = True
         _CONTENT = True
+        _LIVE_DETAIL = "follow-dsh"
 
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)

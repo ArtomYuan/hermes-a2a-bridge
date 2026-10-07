@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -40,8 +41,34 @@ _PREEXISTING = {
 }
 
 _PLUGIN_ID = "hermes-a2a-bridge"
-_SWITCH_KEYS = ("enabled", "events", "content")
-_DEFAULTS = {"enabled": False, "events": True, "content": True}
+_SWITCH_KEYS = ("enabled", "events", "live_detail")
+_DEFAULTS = {"enabled": False, "events": True, "live_detail": "follow-dsh"}
+# 不存在的 dsh_home（follow-dsh 解析时确定性回落 detailed，避免依赖真实 dsh 文件）。
+_DSH_HOME_NONEXISTENT = os.path.join(
+    tempfile.gettempdir(), "hermes-a2a-bridge-nonexistent-dsh"
+)
+
+# 真实 consumer（仅复用 resolve_collector_level 的确定性解析逻辑；测试用 spec 加载）。
+_consumer_spec = importlib.util.spec_from_file_location(
+    "hermes_a2a_bridge_consumer_dash", os.path.join(_WORKTREE, "consumer.py")
+)
+_REAL_CONSUMER = importlib.util.module_from_spec(_consumer_spec)
+_consumer_spec.loader.exec_module(_REAL_CONSUMER)
+
+
+class _StubConsumer:
+    """确定性 consumer 桩：DSH_HOME 默认指向不存在路径，follow-dsh 恒回落 detailed。"""
+
+    DSH_HOME_DEFAULT = _DSH_HOME_NONEXISTENT
+    DSH_PROFILE_DEFAULT = "web"
+
+    @staticmethod
+    def resolve_collector_level(live_detail_raw, content_raw, dsh_home=None, dsh_profile=None):
+        return _REAL_CONSUMER.resolve_collector_level(
+            live_detail_raw, content_raw,
+            dsh_home if dsh_home is not None else _DSH_HOME_NONEXISTENT,
+            dsh_profile if dsh_profile is not None else "web",
+        )
 
 
 class FakeHTTPException(Exception):
@@ -194,6 +221,8 @@ def _switch_path(key):
 class DashboardApiTest(unittest.TestCase):
     def setUp(self):
         self.api, self.config = _install_fake_modules()
+        # 确定性 consumer：DSH_HOME 默认不存在 → follow-dsh 恒回落 detailed。
+        self.api._import_consumer = lambda: _StubConsumer
 
     def tearDown(self):
         _restore_modules()
@@ -203,19 +232,44 @@ class DashboardApiTest(unittest.TestCase):
     def test_validate_accepts_bools_partial_and_full(self):
         self.assertEqual(self.api._validate_switch_payload({"enabled": True}),
                          {"enabled": True})
-        full = {"enabled": False, "events": False, "content": True}
+        full = {"enabled": False, "events": False, "live_detail": "detailed"}
         self.assertEqual(self.api._validate_switch_payload(full), full)
 
+    def test_validate_accepts_all_live_detail_values(self):
+        for value in ("follow-dsh", "compact", "standard", "detailed", "verbose"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.api._validate_switch_payload({"live_detail": value}),
+                    {"live_detail": value},
+                )
+
+    def test_validate_rejects_illegal_live_detail(self):
+        for bad in ("banana", "normal", "expanded", "", 1, None, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.api._validate_switch_payload({"live_detail": bad})
+
     def test_validate_accepts_code_blocks_as_deprecated_alias(self):
-        # 旧面板（升级窗口）POST 旧键 code_blocks → 映射为 content。
+        # 旧面板（升级窗口）POST 旧键 code_blocks → 映射为 content → live_detail。
         self.assertEqual(
             self.api._validate_switch_payload({"code_blocks": False}),
-            {"content": False},
+            {"live_detail": "standard"},
         )
-        # 别名与显式 content 同时给出 → 显式 content 优先。
+        # code_blocks 与显式 content 同时给出 → 显式 content 优先（true→detailed）。
         self.assertEqual(
             self.api._validate_switch_payload({"code_blocks": False, "content": True}),
-            {"content": True},
+            {"live_detail": "detailed"},
+        )
+
+    def test_validate_content_maps_to_live_detail_only_when_absent(self):
+        # 遗留 content 映射为 live_detail；显式 live_detail 优先于 content。
+        self.assertEqual(
+            self.api._validate_switch_payload({"content": True}),
+            {"live_detail": "detailed"},
+        )
+        self.assertEqual(
+            self.api._validate_switch_payload({"content": False, "live_detail": "verbose"}),
+            {"live_detail": "verbose"},
         )
 
     def test_validate_alias_value_must_be_bool(self):
@@ -303,7 +357,8 @@ class DashboardApiTest(unittest.TestCase):
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": True, "events": True, "content": False},
+            {"enabled": True, "events": True, "live_detail": "follow-dsh",
+             "effective": "standard"},
         )
 
     def test_read_collector_values_legacy_config_fallback(self):
@@ -312,7 +367,8 @@ class DashboardApiTest(unittest.TestCase):
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": True, "events": False, "content": True},
+            {"enabled": True, "events": False, "live_detail": "follow-dsh",
+             "effective": "detailed"},
         )
 
     def test_read_collector_values_normalizes_string_bools(self):
@@ -321,29 +377,42 @@ class DashboardApiTest(unittest.TestCase):
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": False, "events": True, "content": True},
+            {"enabled": False, "events": True, "live_detail": "follow-dsh",
+             "effective": "detailed"},
         )
 
     def test_read_collector_values_missing_entry_defaults(self):
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": False, "events": True, "content": True},
+            {"enabled": False, "events": True, "live_detail": "follow-dsh",
+             "effective": "detailed"},
+        )
+
+    def test_read_collector_values_explicit_live_detail(self):
+        self.config.config = _entry_config(
+            settings={"collector": {"live_detail": "verbose"}},
+        )
+        self.assertEqual(
+            self.api._read_collector_values(),
+            {"enabled": False, "events": True, "live_detail": "verbose",
+             "effective": "verbose"},
         )
 
     def test_read_collector_ignores_legacy_code_blocks_key(self):
-        # 配置文件里残留旧键 code_blocks：不读取、不报错、不当 fallback，
-        # content 取默认 true；GET 永不返回 code_blocks。
+        # 配置文件里残留旧键 code_blocks：不读取、不报错、不当 fallback；
+        # GET 永不返回 code_blocks / content。
         self.config.config = _entry_config(
             settings={"collector": {"enabled": True, "code_blocks": False}},
         )
         self.assertEqual(
             self.api._read_collector_values(),
-            {"enabled": True, "events": True, "content": True},
+            {"enabled": True, "events": True, "live_detail": "follow-dsh",
+             "effective": "detailed"},
         )
         resp = self.api.get_collector()
         self.assertEqual(set(resp), set(_SWITCH_KEYS))
         self.assertNotIn("code_blocks", resp)
-        self.assertIs(resp["content"]["value"], True)
+        self.assertNotIn("content", resp)
 
     def test_read_collector_values_fails_loud_on_read_error(self):
         self.config.read_raises = OSError("io error")
@@ -362,11 +431,30 @@ class DashboardApiTest(unittest.TestCase):
         )
         resp = self.api.get_collector()
         self.assertEqual(set(resp), set(_SWITCH_KEYS))
-        for key in _SWITCH_KEYS:
-            self.assertEqual(set(resp[key]), {"value", "default"})
-            self.assertEqual(resp[key]["default"], _DEFAULTS[key])
+        self.assertEqual(set(resp["enabled"]), {"value", "default"})
+        self.assertEqual(set(resp["events"]), {"value", "default"})
+        self.assertEqual(set(resp["live_detail"]), {"value", "default", "effective"})
+        self.assertEqual(resp["enabled"]["default"], _DEFAULTS["enabled"])
+        self.assertEqual(resp["events"]["default"], _DEFAULTS["events"])
+        self.assertEqual(resp["live_detail"]["default"], _DEFAULTS["live_detail"])
         self.assertIs(resp["enabled"]["value"], True)
         self.assertNotIn("SECRET-VALUE", json.dumps(resp))
+
+    def test_get_collector_echoes_effective_level(self):
+        # follow-dsh 时回显实际生效档位（确定性：dsh_home 不存在 → 回落 detailed）。
+        self.config.config = _entry_config(
+            settings={"collector": {"live_detail": "follow-dsh"}},
+        )
+        resp = self.api.get_collector()
+        self.assertEqual(resp["live_detail"]["value"], "follow-dsh")
+        self.assertEqual(resp["live_detail"]["effective"], "detailed")
+        # 显式四档时 effective == value。
+        self.config.config = _entry_config(
+            settings={"collector": {"live_detail": "verbose"}},
+        )
+        resp = self.api.get_collector()
+        self.assertEqual(resp["live_detail"]["value"], "verbose")
+        self.assertEqual(resp["live_detail"]["effective"], "verbose")
 
     def test_get_collector_read_failure_500(self):
         self.config.read_raises = OSError("io error")
@@ -379,6 +467,11 @@ class DashboardApiTest(unittest.TestCase):
             self.api.post_collector({"enabled": True, "bogus": False})
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_post_collector_rejects_illegal_live_detail_400(self):
+        with self.assertRaises(FakeHTTPException) as ctx:
+            self.api.post_collector({"live_detail": "banana"})
+        self.assertEqual(ctx.exception.status_code, 400)
+
     def test_post_collector_success_writes_and_returns_state(self):
         # 已存 enabled=true（非默认），只提交 events → 响应必须回报**写后磁盘状态**：
         # 未提交的 enabled 仍是 true，而不是被误报成默认 false。
@@ -387,27 +480,39 @@ class DashboardApiTest(unittest.TestCase):
         self.assertEqual(len(self.config.save_calls), 1)
         self.assertIs(resp["events"]["value"], False)
         self.assertIs(resp["enabled"]["value"], True)  # 来自库中值，不是默认
-        self.assertIs(resp["content"]["value"], True)
+        self.assertEqual(resp["live_detail"]["value"], "follow-dsh")  # 未提交 → 默认
         self.assertEqual(set(resp), set(_SWITCH_KEYS))
+
+    def test_post_collector_live_detail_writes_and_echoes(self):
+        resp = self.api.post_collector({"live_detail": "verbose"})
+        self.assertEqual(len(self.config.save_calls), 1)
+        self.assertEqual(resp["live_detail"]["value"], "verbose")
+        self.assertEqual(resp["live_detail"]["effective"], "verbose")
+        collector = self.config.save_calls[0]["config"]["plugins"]["entries"][
+            _PLUGIN_ID
+        ]["settings"]["collector"]
+        self.assertIn("live_detail", collector)
+        self.assertNotIn("content", collector)
 
     def test_post_collector_response_reflects_persisted_not_defaults(self):
         # enabled 默认 false：若响应照提交子集回报，未提交键会被报成默认值。
         self.config.config = _entry_config(settings={"collector": {"enabled": True}})
-        resp = self.api.post_collector({"content": False})
-        self.assertIs(resp["content"]["value"], False)
+        resp = self.api.post_collector({"live_detail": "compact"})
+        self.assertEqual(resp["live_detail"]["value"], "compact")
         self.assertIs(resp["enabled"]["value"], True)
 
-    def test_post_collector_alias_writes_content_path(self):
-        # 旧面板 POST code_blocks → 写回的是 content 键，响应也只含三键元数据。
+    def test_post_collector_alias_writes_live_detail_path(self):
+        # 旧面板 POST code_blocks → 映射为 content → live_detail；写回的是 live_detail 键。
         resp = self.api.post_collector({"code_blocks": False})
         self.assertEqual(len(self.config.save_calls), 1)
-        self.assertIs(resp["content"]["value"], False)
+        self.assertEqual(resp["live_detail"]["value"], "standard")
         self.assertEqual(set(resp), set(_SWITCH_KEYS))
         collector = self.config.save_calls[0]["config"]["plugins"]["entries"][
             _PLUGIN_ID
         ]["settings"]["collector"]
-        self.assertIn("content", collector)
+        self.assertIn("live_detail", collector)
         self.assertNotIn("code_blocks", collector)
+        self.assertNotIn("content", collector)
 
     def test_post_collector_write_failure_500(self):
         self.config.save_raises = OSError("disk full")

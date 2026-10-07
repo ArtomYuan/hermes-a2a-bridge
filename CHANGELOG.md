@@ -5,6 +5,62 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-07
+
+> ⚠️ **行为变更（升级前必读）**：直播过程展示新增四档，**默认档为 `follow-dsh`**
+> （跟随 dsh「工作步骤展示 / Work details」）。当前生产 dsh 的 Work details 为
+> `standard`，故**升级后直播默认比 v0.3.3 更简洁**——工具行只留「工具名 + 人话
+> 摘要」、工具输出只留完成标记，不再有参数 / 输出代码框。
+> **一行回退**：把 `plugins.entries.hermes-a2a-bridge.settings.collector.live_detail`
+> 设为 `detailed`，即恢复 v0.3.3 的观感。
+
+### Added
+
+- 直播档位 `collector.live_detail`（默认 `follow-dsh`）：`follow-dsh` / `compact` /
+  `standard` / `detailed` / `verbose`（跟随 dsh / 简洁 / 标准 / 详细 / 完全展开），
+  与 dsh「工作步骤展示（Work details）」四档**一一对应**。四档渲染（逐事件）：
+  `compact` 不发工具行与思考行；`standard` 工具行只留「工具名 + 摘要」、结果只留
+  完成标记（≡ 旧 `content: false`）；`detailed` 带参数 / 输出代码框，全量不含截断
+  （≡ 旧 `content: true`）；`verbose` 与 `detailed` 的唯一差异是**非 final 叙述文本
+  不截断**。见 CONFIGURATION「直播档位」节。
+- `follow-dsh` 解析：读 `<dsh_home>/profiles/<dsh_profile>/cordis.patch.yml` 的
+  `- id: ui-chat` 条目 → `config.transcriptView`（**YAML 条目数组**，非点路径）；
+  dsh 旧值 `normal` / `expanded` 一律读作 `detailed`。任一失败（缺文件 / 坏 YAML /
+  无 `ui-chat` 条目 / 无该键 / 非法值）**回落 `detailed`** 并记一次日志，不抛异常、
+  不阻塞任务。新增可选键 `collector.dsh_home`（默认 `/home/artom/.dsh`）与
+  `collector.dsh_profile`（默认 `web`）。
+- Dashboard「A2A 直播开关」第三行由布尔开关改为**直播档位下拉**（5 选项，中英文案
+  成对）；`GET /collector` 回显当前值与 `follow-dsh` 时的**实际生效档位**，POST 校验
+  接受该字符串枚举并拒绝非法值。
+
+### Changed
+
+- **默认直播粒度变化**：`live_detail` 与遗留 `content` 都未设置时，默认
+  `follow-dsh`（v0.3.3 的观感对应 `detailed`）。当前生产 dsh = `standard`，故升级后
+  默认更简洁；回退见上方提示。
+- 向后兼容：遗留 `collector.content` 继续生效（`true` → `detailed`、`false` →
+  `standard`，精确保持 v0.3.3 行为）；**`live_detail` 未设置而 `content` 已显式设置
+  时沿用 `content` 映射**，既有部署行为不变——只有两者都未设置才会自动跟随 dsh。
+- `collector.events: false`（安静模式）仍**优先于档位**；`compact` 比旧
+  `content: false` 更严（连工具行与思考行都不发）。stats 完整性、秒回受理回执与
+  📬 最终结果送达均不受档位影响。
+- CONFIGURATION / README 中英四份文档同步改写：「内容开关（布尔）」章节改为「直播
+  档位（四档）」，Dashboard 说明改为三开关（`enabled` / `events` / `live_detail`）。
+
+### Deprecated
+
+- 配置键 `collector.content`（布尔）从 Dashboard UI 撤下（第三行改为 `live_detail`
+  下拉），但**配置层继续兼容**：`true` → `detailed`、`false` → `standard`，且
+  `live_detail` 未设置时优先沿用该映射。建议迁移到 `collector.live_detail`；保留
+  该键不报错、无副作用。
+
+### Tested
+
+- 既有 **147 项**基线（见 0.3.3）不回归；本次在其上新增四档渲染（逐事件断言）、
+  遗留 `content` 映射、`follow-dsh` 解析与**全部回落分支**（缺文件 / 坏 YAML /
+  无 `ui-chat` 条目 / 无键 / 非法值 / 旧值 `normal`·`expanded` 归一）、「终态与错误在
+  任何档位都不丢」用例。
+
 ## [0.3.3] - 2026-09-30
 
 ### Changed
@@ -27,6 +83,11 @@
   缺失时回退文案 `🔧 调用工具`。完成标记（`📋 \`name\` 完成`）、起止标记
   （`turn_start` / 终态 `status`）、stats 完整性、秒回受理回执与 📬 最终结果
   送达均不受影响；`content=true`（默认）观感不变。
+
+### Tested
+
+- 单元测试 **147 项**：`test_consumer` 78、`test_origin_injection` 12、
+  `test_override` 19、`test_hot_read` 10、`test_dashboard_api` 28。
 
 ## [0.3.0] - 2026-09-29
 

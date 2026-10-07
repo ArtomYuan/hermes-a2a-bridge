@@ -137,19 +137,23 @@ class HookTest(unittest.TestCase):
         _restore_modules()
         self._orig_stream = _MODULE._stream_dsh_call
         self._orig_spawn = _MODULE._spawn_stream_worker
+        self._orig_read_live_detail = _MODULE._read_live_detail
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CONTENT = True
         _MODULE._EVENTS = True
+        _MODULE._LIVE_DETAIL = "follow-dsh"
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
     def tearDown(self):
         _MODULE._stream_dsh_call = self._orig_stream
         _MODULE._spawn_stream_worker = self._orig_spawn
+        _MODULE._read_live_detail = self._orig_read_live_detail
         _restore_modules()
         _MODULE._COLLECTOR_ENABLED = False
         _MODULE._CONTENT = True
         _MODULE._EVENTS = True
+        _MODULE._LIVE_DETAIL = "follow-dsh"
         _MODULE._CTX = None
         _MODULE._CONSUMER_MODULE = None
 
@@ -275,6 +279,7 @@ class HookTest(unittest.TestCase):
         _install_fake_hermes_cli(_CONFIG)
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._read_live_detail = lambda: "detailed"
         result = _MODULE._stream_dsh_call("hi", "feishu/oc_x/omt_y")
         self.assertEqual(result, "[dsh · context feishu/oc_x/omt_y · completed]\n收到")
         self.assertEqual(len(consumer.consume_stream_calls), 1)
@@ -288,10 +293,10 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["thread_id"], "omt_y")
         # 缺 timeout 配置 → 回退默认 300。
         self.assertEqual(call["timeout"], 300)
-        # 默认 _EVENTS=True / _CONTENT=True 且本用例不调 register →
-        # consume_stream 收到 events=True / content=True；code_blocks 固定 True。
+        # 默认 _EVENTS=True；live_detail 经 _read_live_detail 解析为 "detailed"
+        # （此处 patch 为确定值）；code_blocks 固定 True。
         self.assertEqual(call["events"], True)
-        self.assertEqual(call["content"], True)
+        self.assertEqual(call["level"], "detailed")
         self.assertIs(call["code_blocks"], True)
         # 消息面（platform/chat_id 非空）→ 真 sender：直播（code_blocks=True）与
         # 结果送达（code_blocks=False）各构造一次。
@@ -321,6 +326,7 @@ class HookTest(unittest.TestCase):
         _install_fake_hermes_cli(config)
         consumer = _FakeConsumer()
         _MODULE._CONSUMER_MODULE = consumer
+        _MODULE._read_live_detail = lambda: "detailed"
         _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         self.assertEqual(consumer.consume_stream_calls[0]["timeout"], 3600)
 
@@ -356,12 +362,15 @@ class HookTest(unittest.TestCase):
         _MODULE._CTX = _SettingsCtx(
             {"collector.content": False, "collector.events": True}
         )
+        # content=false → 遗留映射为 standard 档（此处 patch 为确定值，映射本身见
+        # test_consumer.resolve_collector_level）。
+        _MODULE._read_live_detail = lambda: "standard"
         try:
             result = _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         finally:
             _MODULE._CTX = None
-        # 直播确实按内容开关渲染…
-        self.assertIs(consumer.consume_stream_calls[0]["content"], False)
+        # 直播确实按 content=false 映射出的 standard 档渲染…
+        self.assertIs(consumer.consume_stream_calls[0]["level"], "standard")
         # …但结果送达照旧：一条消息、📬 头行 + 最终全文、发到同一消息面。
         delivered = consumer.senders[1][2]
         self.assertEqual(len(delivered), 1)

@@ -241,6 +241,19 @@ DEFAULT_EVENTS = True
 # 内容开关默认开（向后兼容：已部署副本不配置即保持现状观感——直播全显）。
 DEFAULT_CONTENT = True
 
+# 直播档位（有序，对齐 dsh TRANSCRIPT_VIEW_MODES）。
+LIVE_DETAIL_MODES = ("compact", "standard", "detailed", "verbose")
+
+# live_detail 配置默认值（未显式设置且 content 未显式设置 → follow-dsh）。
+DEFAULT_LIVE_DETAIL = "follow-dsh"
+
+# follow-dsh 解析失败时的安全回落档位（= Web 默认 detailed，也 = 旧 content=True 观感）。
+LIVE_DETAIL_FALLBACK = "detailed"
+
+# dsh 数据根与活动 profile 的默认值（follow-dsh 读取路径）。
+DSH_HOME_DEFAULT = "/home/artom/.dsh"
+DSH_PROFILE_DEFAULT = "web"
+
 # 内容开关关时 tool_call 的「简短摘要」：把命令换成人话短语（bridge 侧启发式，
 # 不依赖 dsh 提供额外字段）。规则表优先，未命中则取命令首行截断兜底。
 _SUMMARY_FALLBACK_LIMIT = 50
@@ -514,8 +527,110 @@ def summarize_tool_call(arguments: Any) -> str:
     return _truncate(line, _SUMMARY_FALLBACK_LIMIT)
 
 
+def _to_bool(value: Any) -> bool:
+    """YAML 布尔 / 字符串布尔稳健转 bool（遗留 ``collector.content`` 键）。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def normalize_live_detail(value: Any) -> Optional[str]:
+    """把档位值归一为四档之一；非法 / None / 非四档返回 None。
+
+    只接受四档字面量（大小写不敏感）；dsh 旧值 ``normal`` / ``expanded`` 不在此归一
+    （由 ``read_dsh_transcript_view`` 负责），保证 ``collector.live_detail`` 值域严格。
+    """
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in LIVE_DETAIL_MODES:
+            return text
+    return None
+
+
+def read_dsh_transcript_view(dsh_home: str, dsh_profile: str) -> str:
+    """读 dsh profile patch 的 ``ui-chat.transcriptView``，返回四档之一。
+
+    路径 ``<dsh_home>/profiles/<dsh_profile>/cordis.patch.yml`` 是 YAML 条目数组；
+    定位 ``id == "ui-chat"`` → ``config.transcriptView``。旧值 ``normal`` / ``expanded``
+    读作 ``detailed``。**任何失败**（PyYAML 不可用 / 文件缺失 / YAML 坏 / 非数组 /
+    无 ui-chat 条目 / 无键 / 值非法）→ 返回 ``LIVE_DETAIL_FALLBACK``（detailed），
+    log 一次，不抛不阻塞。
+    """
+    import os
+
+    path = os.path.join(str(dsh_home), "profiles", str(dsh_profile), "cordis.patch.yml")
+    try:
+        import yaml
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: follow-dsh: PyYAML unavailable: %s", exc)
+        return LIVE_DETAIL_FALLBACK
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: follow-dsh: cannot read %s: %s", path, exc)
+        return LIVE_DETAIL_FALLBACK
+    if not isinstance(data, list):
+        logger.warning("hermes-a2a-bridge: follow-dsh: %s is not an entry array", path)
+        return LIVE_DETAIL_FALLBACK
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("id") != "ui-chat":
+            continue
+        config = entry.get("config")
+        if not isinstance(config, dict) or "transcriptView" not in config:
+            break
+        value = config.get("transcriptView")
+        mode = normalize_live_detail(value)
+        if mode is not None:
+            return mode
+        if isinstance(value, str) and value.strip().lower() in ("normal", "expanded"):
+            return "detailed"
+        break
+    logger.warning(
+        "hermes-a2a-bridge: follow-dsh: no valid ui-chat.transcriptView in %s", path
+    )
+    return LIVE_DETAIL_FALLBACK
+
+
+def resolve_collector_level(
+    live_detail_raw: Any,
+    content_raw: Any,
+    dsh_home: Any = None,
+    dsh_profile: Any = None,
+) -> str:
+    """按冻结优先级把 collector 配置解析为四档之一。
+
+    优先级：显式 live_detail（四档）> follow-dsh 解析 > 遗留 content 映射 > 默认。
+    - ``live_detail`` 是四档之一 → 直接用；
+    - ``live_detail`` 为 ``follow-dsh``（或其它非四档字符串）→ 读 dsh（失败回落 detailed）；
+    - ``live_detail`` 未设置而 ``content`` 显式设置 → ``true→detailed`` / ``false→standard``；
+    - 两者都未设置 → follow-dsh。
+    """
+    mode = normalize_live_detail(live_detail_raw)
+    if mode is not None:
+        return mode
+    if live_detail_raw is None and content_raw is not None:
+        return "detailed" if _to_bool(content_raw) else "standard"
+    return read_dsh_transcript_view(
+        dsh_home if dsh_home is not None else DSH_HOME_DEFAULT,
+        dsh_profile if dsh_profile is not None else DSH_PROFILE_DEFAULT,
+    )
+
+
+def resolve_live_detail(content: bool = True, level: Optional[str] = None) -> str:
+    """把渲染参数解析为四档之一：显式 ``level`` 优先，否则 ``content``→detailed/standard。"""
+    if level in LIVE_DETAIL_MODES:
+        return level
+    return "detailed" if content else "standard"
+
+
 def render_line(
-    event: Dict[str, Any], code_blocks: bool = True, content: bool = True
+    event: Dict[str, Any],
+    code_blocks: bool = True,
+    content: bool = True,
+    level: Optional[str] = None,
 ) -> Optional[str]:
     """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
 
@@ -526,16 +641,30 @@ def render_line(
     v0.3.0 起 ``code_blocks`` 仅是「内容显示时」的内部渲染方式，不再由配置
     开关控制。
 
-    ``content=True``（默认）：与现状等价（全显）。``content=False``（内容开关
-    关）：把**操作内细节**换成人话摘要——tool_call 渲染为
-    ``🔧 `name` · <简短摘要>``（命令换短语，见 ``summarize_tool_call``），
-    tool_result 只返回 ``📋 `name` 完成`` 完成标记（不带输出正文）。
-    **操作流不受影响**：text（含 final）与 thinking 与 ``content=True`` 同款渲染，
-    turn_start / status 终态等起止标记照常。
+    ``content``（遗留布尔，向后兼容）：``True`` ≡ ``detailed``、``False`` ≡ ``standard``。
+    ``level``（四档，优先于 ``content``）：``compact`` / ``standard`` / ``detailed`` /
+    ``verbose``。四档阶梯（``render_line`` 是唯一裁剪层）：
+
+    | 事件 | compact | standard | detailed | verbose |
+    |---|---|---|---|---|
+    | turn_start | 🚀 轮次标记 | 同左 | 同左 | 同左 |
+    | tool_call | 不发 | 🔧 `name` · 摘要（无代码框） | 🔧 `name` + 参数代码框 | = detailed（不截断） |
+    | tool_result | 不发 | 仅 📋 `name` 完成 | 📋 `name` 完成 + 输出代码框 | = detailed（不截断） |
+    | thinking | 不发 | 🧠 思考中… | 同左 | 同左 |
+    | text（叙述/final） | 发 | 发 | 发 | 发（不截断） |
+    | status 终态/错误 | 必发 | 必发 | 必发 | 必发 |
+
+    - ``standard`` ≡ 旧 ``content=False``；``detailed`` ≡ 旧 ``content=True``（向后兼容锚点）。
+    - 任何档位都不吞终态（✅/❌/⚠️）、错误、final_text、stats。
+    - ``collector.events=false``（安静模式）优先于档位（由 consume_stream 处理）。
     """
+    mode = resolve_live_detail(content, level)
     etype = event.get("type")
-    # 内容开关关：只收窄「操作内细节」两个分支；叙述 / 思考等操作流照常渲染。
-    if not content:
+    # compact：不发思考与工具（调用/结果）行，只保留 turn_start / text / status 终态。
+    if mode == "compact" and etype in ("thinking", "tool_call", "tool_result"):
+        return None
+    # standard（≡ 旧 content=False）：tool_call → 摘要，tool_result → 仅完成标记。
+    if mode == "standard":
         if etype == "tool_call":
             name = event.get("name") or ""
             summary = summarize_tool_call(event.get("arguments"))
@@ -589,7 +718,12 @@ def render_line(
             # 非 final text：短文本普通行；含命令 / 代码特征时框化。
             if _looks_like_code(raw):
                 return "📖 " + _fence(raw)
+            # verbose：不截断非 final text；其余档截断到 120。
+            if mode == "verbose":
+                return "📖 " + raw
             return "📖 " + _truncate(raw, 120)
+        if mode == "verbose":
+            return "📖 " + raw
         return "📖 " + _truncate(raw, 120)
     if etype == "status":
         state = event.get("state")
@@ -617,8 +751,10 @@ class Throttler:
     - TODO(P2c): 软上限（单任务最多 30 条消息）本阶段不做。
     """
 
-    def __init__(self, min_interval: float = 2.0) -> None:
+    def __init__(self, min_interval: float = 2.0, level: Optional[str] = None) -> None:
         self.min_interval = float(min_interval)
+        # verbose 档：非 final text 聚合不截断（其余档截断 120）。
+        self.level = level if level in LIVE_DETAIL_MODES else None
         self._last_send = 0.0
         self._text_buf: list = []
 
@@ -629,6 +765,8 @@ class Throttler:
         self._text_buf = []
         if not joined:
             return None
+        if self.level == "verbose":
+            return "📖 " + joined
         return "📖 " + _truncate(joined, 120)
 
     def _wait_interval(self) -> None:
@@ -821,6 +959,7 @@ def consume_stream(
     code_blocks: bool = DEFAULT_CODE_BLOCKS,
     events: bool = DEFAULT_EVENTS,
     content: bool = DEFAULT_CONTENT,
+    level: Optional[str] = None,
 ) -> Dict[str, Any]:
     """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → 节流 → 发送，返回统计。
 
@@ -829,16 +968,18 @@ def consume_stream(
     ``events`` 控制「中间事件」是否推送：``False`` 时只推最终结果（final 文本 /
     终态 status），中间事件（工具调用 / 中间文本 / thinking / 状态行）跳过渲染与
     发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
-    ``content`` 控制「操作内细节」是否推送：``False`` 时只关闭**细节**——
-    ``tool_call`` 只留工具名（不带参数 / 命令正文，``render_line`` 负责）与
-    ``tool_result`` 只留 ``📋 `name` 完成`` 完成标记（不带输出正文）。**操作流本身
-    不受影响**：text（含 final）与 thinking 照常渲染推送，turn_start / status 终态
-    等起止标记亦然。stats 完整性不受 content 影响（final_text / events_seen /
-    states 仍完整统计，供上层「📬 最终结果送达」使用）。
+    ``content``（遗留布尔）与 ``level``（四档，优先）经 ``resolve_live_detail`` 解析为
+    渲染档位：``content=False`` ≡ ``standard``、``content=True`` ≡ ``detailed``；显式
+    ``level``（compact/standard/detailed/verbose）优先于 ``content``。**操作流本身
+    不受档位影响**：text（含 final）与 thinking 照常渲染推送，turn_start / status 终态
+    等起止标记亦然（compact 档收窄 thinking/tool_call/tool_result 除外）。stats 完整性
+    不受档位影响（final_text / events_seen / states 仍完整统计，供上层「📬 最终结果
+    送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
     """
+    mode = resolve_live_detail(content, level)
     stats: Dict[str, Any] = {
         "final_text": "",
         "events_seen": 0,
@@ -850,7 +991,7 @@ def consume_stream(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    throttler = Throttler(min_interval=min_interval)
+    throttler = Throttler(min_interval=min_interval, level=mode)
     try:
         results = iter_sse_data(
             url, _streaming_message_body(message, context_id), headers, timeout
@@ -865,11 +1006,11 @@ def consume_stream(
                 # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
                 if not events and not _is_final_event(event):
                     continue
-                # 内容开关（content=false）只关闭「操作内细节」，由 render_line 在
-                # tool_call / tool_result 两个分支上收窄；操作流（text / thinking）
+                # 内容/档位（content / level）只关闭「操作内细节」，由 render_line 在
+                # tool_call / tool_result / thinking 分支上收窄；操作流（text）
                 # 与其起止标记照常走 feed，因此这里不再跳过任何事件类型。
                 line = render_line(
-                    event, code_blocks=code_blocks, content=content
+                    event, code_blocks=code_blocks, level=mode
                 )
                 for text in throttler.feed(event, line):
                     res = sender(platform, chat_id, thread_id, text)

@@ -645,9 +645,12 @@ def group_title(kinds: Iterable[str]) -> str:
     return title
 
 
-# 代码框组框内排版常量（v0.5.0，见 DESIGN-BOX.md §3.2，排版已冻结）。
+# 代码框组框内排版常量（v0.5.0，见 DESIGN-BOX.md §3.2；v0.5.2 起组头首词改「工作步骤」、
+# 围栏去掉语言标记，两处偏离见 CHANGELOG 0.5.2）。
 _BOX_SEP = "─" * 30             # 分隔线：仅当有逐步行时出现（逐步行前、思考段前各一次）
-_BOX_FENCE_LANG = "text"        # 代码框语言标签（无语法高亮）
+# 框不带语言标记（裸 ``` 围栏）：飞书代码块左上角会把围栏信息位当语言名显示，
+# ```text 会露出无意义的「text」标签；不指定语言时客户端不显示语言名，且与操作输出框
+# （``_fence`` 的默认无语言围栏）形态一致。围栏信息位是「编程语言解析」位，不承载自由文案。
 _BOX_ARG_LIMIT = 120            # detailed 档逐步行「参数（截断）」上限
 _BOX_RESULT_LIMIT = 120         # detailed 档结果行「结果首行（截断）」上限
 _THINKING_PREVIEW_LIMIT = 120   # standard/detailed 档思考「首行预览」截断上限
@@ -706,7 +709,7 @@ def render_process_box(
     纯函数（便于单测）：输入有序步骤明细（每项含 ``name`` / ``arguments`` /
     ``result``）与思考文本，输出框内多行正文。四档排版与密度见 DESIGN-BOX.md §3.2/§3.3：
 
-    - 第 1 行组头 ``工具 · <N> 步 · <类别串>``（仅当有步骤时；不带轮次号）；
+    - 第 1 行组头 ``工作步骤 · <N> 步 · <类别串>``（仅当有步骤时；不带轮次号）；
     - 分隔线（30 个 ─）仅当有逐步行时出现（逐步行前；另有思考段时在其前再出现一次）；
     - 逐步行 ``<i>. <工具名> · <参数/摘要>``（standard 用摘要，detailed/verbose 用参数）；
     - 结果行 ``   ↳ <结果>``（仅 detailed/verbose；缩进 3 空格）；
@@ -719,7 +722,7 @@ def render_process_box(
     lines: list = []
     if step_list:
         kinds = [tool_activity_kind(s.get("name")) for s in step_list]
-        lines.append(f"工具 · {len(step_list)} 步 · {group_title(kinds)}")
+        lines.append(f"工作步骤 · {len(step_list)} 步 · {group_title(kinds)}")
     has_steps = bool(step_list) and mode in ("standard", "detailed", "verbose")
     if has_steps:
         lines.append(_BOX_SEP)
@@ -921,7 +924,7 @@ class Throttler:
     """聚合低信号 text、四档统一把一轮内的工具步骤与思考收口为一条「代码框组」消息，并做限速。
 
     - ``tool_call`` / ``tool_result`` / ``thinking`` 在**四档**都进组缓冲，不逐条发出；
-      收口时由 ``render_process_box`` 渲染为一条 ```text 代码框消息（一条消息 = 一个框）。
+      收口时由 ``render_process_box`` 渲染为一条无语言标记的代码框消息（一条消息 = 一个框）。
     - 低信号 ``text``（非 final）只累积，不逐条发；在 ``turn_end`` 或 status 终态时
       flush 为一条 ``📖`` 行。
     - 收口时机（沿用）：``turn_end``、终态 status、final text、新 ``turn_start``（上一轮
@@ -976,7 +979,7 @@ class Throttler:
             self._thinking_parts.append(str(event.get("text") or ""))
 
     def _flush_process_box(self) -> Optional[str]:
-        """收口当前代码框组为一条 ```text 框消息；空组（无工具且无思考）返回 None。"""
+        """收口当前代码框组为一条无语言标记的代码框消息；空组（无工具且无思考）返回 None。"""
         if not self._steps and not self._thinking_parts:
             return None
         thinking = "\n".join(self._thinking_parts) if self._thinking_parts else None
@@ -985,7 +988,7 @@ class Throttler:
         self._thinking_parts = []
         if not body.strip():
             return None
-        return _fence(body, _BOX_FENCE_LANG)
+        return _fence(body)
 
     def _wait_interval(self) -> None:
         if self.min_interval <= 0:

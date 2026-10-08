@@ -19,8 +19,8 @@ roughly like this (`standard`, the default tier of the dsh in production today):
 
 ````text
 🚀 第 1 轮
-```text
-工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+```
+工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
 1. bash  · 查看 git 提交记录
 2. read  · 读取文件（config.yaml）
@@ -85,7 +85,10 @@ automatically rendered as code blocks:
 
 - **Feishu**: fenced content triggers post rich text; code blocks are scrollable;
 - **QQ / other mainstream gateways**: markdown code blocks render as code blocks;
-- **plain-text platforms**: automatically degraded to plain text (no garbling).
+- **plain-text platforms**: automatically degraded to plain text (no garbling);
+- **no language tag on fences**: Feishu shows the fence info string as the code
+  block's language name in the top-left corner, so the info string is left empty
+  (no meaningless "text" label), matching the operation-output boxes.
 
 Sample code-block content (an `ls -la` output block):
 
@@ -102,7 +105,7 @@ Progress display and intermediate-event push are both configurable
 (`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
 `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
 default `follow-dsh` to follow dsh's current tier; all four use **one code-box group
-per turn**, whose first line is the group header `工具 · N 步 · <类别串>`, differing
+per turn**, whose first line is the group header `工作步骤 · N 步 · <类别串>`, differing
 only in in-box density: `compact` header + "思考" label, `standard` plain-language
 step summaries, `detailed` arguments + `↳ first result line`, `verbose` arguments /
 results and full thinking text untruncated; `collector.events` for the event stream —

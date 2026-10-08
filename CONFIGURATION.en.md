@@ -389,7 +389,8 @@ the first line inside it is the group header — visible even when collapsed.
 #### In-box layout (frozen)
 
 ```text
-Line 1: group header = 工具 · <N> 步 · <kind string>   (N = tool steps of the turn; kind string uses dsh's verbatim algorithm)
+Line 1: group header = 工作步骤 · <N> 步 · <kind string>   (N = tool steps of the turn; kind string uses dsh's verbatim algorithm)
+Fence:                three backticks with an empty info string (no language label; Feishu shows no label)
 Separator:            ──────────────────────────────   (exactly 30 ─, only when there are step lines)
 Step line:            <i>. <tool name> · <that tier's arguments/summary>
 Result line (detailed/verbose):   ↳ <that tier's result>   (indented 3 spaces)
@@ -407,6 +408,13 @@ Separator:            appears only "after the step lines, before the thinking"
 - Multi-line arguments / results are flattened to one line inside the box; under
   `verbose` the full result and the full thinking text keep their original
   multi-line indentation.
+- The box carries **no language tag** (a bare three-backtick fence): a Feishu code
+  block shows the fence info string as its language name in the top-left corner, so
+  `text` leaks a meaningless "text" label; with no language specified the client
+  shows no label, matching the operation-output boxes (the `📖` path already uses
+  `_fence`'s language-less fence). On the Feishu side the info string is a
+  **programming-language parsing** slot, not free-form text (hence not a custom word
+  such as 工作步骤).
 
 #### Sample rendering per tier
 
@@ -417,8 +425,8 @@ Separator:            appears only "after the step lines, before the thinking"
 **`compact` (terse) — group header + thinking label (no preview)**
 
 ````text
-```text
-工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+```
+工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 思考
 ```
 ````
@@ -429,8 +437,8 @@ Separator:            appears only "after the step lines, before the thinking"
 **`standard` — group header + "tool · plain-language summary" per step**
 
 ````text
-```text
-工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+```
+工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
 1. bash  · 查看 git 提交记录
 2. read  · 读取文件（config.yaml）
@@ -453,8 +461,8 @@ Separator:            appears only "after the step lines, before the thinking"
 **`detailed` — group header + "tool · arguments" per step + first result line**
 
 ````text
-```text
-工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+```
+工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
 1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
@@ -477,8 +485,8 @@ Separator:            appears only "after the step lines, before the thinking"
 **`verbose` — group header + full arguments + full results per step**
 
 ````text
-```text
-工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+```
+工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
 1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
@@ -814,7 +822,7 @@ losing step information.
    `a2a_call(agent="dsh", ...)` and observe ① the agent receives the "accepted"
    receipt within seconds (no more long blocking); ② the conversation receives
    `🚀 第 N 轮` → **one process code-box group per turn** (header
-   `工具 · N 步 · <类别串>` + step lines + a final `思考 · …` segment; the in-box
+   `工作步骤 · N 步 · <类别串>` + step lines + a final `思考 · …` segment; the in-box
    density follows the live-detail tier: `compact` no step line, `standard`
    plain-language summaries, `detailed` arguments + first result line, `verbose`
    untruncated) → `📖 输出完成` → `✅ 完成` (by default `follow-dsh` follows dsh's
@@ -879,7 +887,7 @@ format (a mock sender records the send list), covering normalized event kinds an
 order, rendered-line emoji prefixes, text aggregation flushing only at terminal
 state, redact invocation, two-level sender fallback
 (no gateway → `no_gateway`), no crash on abnormal events, four-tier **code-box group**
-rendering (one box per turn, group header `工具 · N 步 · <类别串>`, separator, step
+rendering (one box per turn, group header `工作步骤 · N 步 · <类别串>`, separator, step
 lines, `↳` result lines, thinking segment; the in-box density differences — `compact`
 no step line / `standard` no result line / `detailed` has result lines / `verbose`
 untruncated; box emission rules — no box when there is neither a tool nor thinking,

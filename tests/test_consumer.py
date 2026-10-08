@@ -247,11 +247,11 @@ _EXPECTED_KINDS = [
 ]
 
 # consume_stream / Throttler 期望的发送行序列（min_interval=0）。
-# v0.5.0：一轮内的 tool_call / tool_result / thinking 统一收口为一条 ```text 代码框
+# 一轮内的 tool_call / tool_result / thinking 统一收口为一条无语言标记的代码框
 # 组消息（默认档 detailed），替换 v0.4.1 的「🧠 思考中… / 🔧 / 📋」逐条行。
 _BOX_BODY = "\n".join(
     [
-        "工具 · 1 步 · 已调用工具",
+        "工作步骤 · 1 步 · 已调用工具",
         consumer._BOX_SEP,
         "1. shell_exec · ls",
         "   ↳ total 4",
@@ -259,7 +259,7 @@ _BOX_BODY = "\n".join(
         "思考 · 让我先想想",
     ]
 )
-_EXPECTED_BOX = "```text\n" + _BOX_BODY + "\n```"
+_EXPECTED_BOX = "```\n" + _BOX_BODY + "\n```"
 _EXPECTED_SENT = [
     _EXPECTED_BOX,
     "📖 正在查看当前目录…",
@@ -662,9 +662,9 @@ class ThrottlerTest(unittest.TestCase):
             {"type": "turn_start", "turn": 1},
         ]
         sent = self._run(events)
-        box = "```text\n" + "\n".join(
+        box = "```\n" + "\n".join(
             [
-                "工具 · 1 步 · 已调用工具",
+                "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
                 "1. x · ls",
                 "   ↳ r",
@@ -994,11 +994,11 @@ class ConsumeStreamContentTest(unittest.TestCase):
     def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
         # content=false（standard 档）把一轮的 tool_call + tool_result + thinking 收口
-        # 为一条 ```text 代码框组消息（组头 + 每步「工具名 · 人话摘要」+ 思考首行预览）；
+        # 为一条无语言标记的代码框组消息（组头 + 每步「工具名 · 人话摘要」+ 思考首行预览）；
         # 操作流（📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常。
-        box = "```text\n" + "\n".join(
+        box = "```\n" + "\n".join(
             [
-                "工具 · 1 步 · 已调用工具",
+                "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
                 "1. shell_exec · 列出目录",
                 consumer._BOX_SEP,
@@ -1092,9 +1092,9 @@ class ConsumeStreamContentTest(unittest.TestCase):
         # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；工具步收口为一条代码框组
         # 消息（shell_exec 未知 → tools 兜底 → 已调用工具；standard 逐步行 = 人话摘要），
         # 框先于触发的最终文本行发出。
-        box = "```text\n" + "\n".join(
+        box = "```\n" + "\n".join(
             [
-                "工具 · 1 步 · 已调用工具",
+                "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
                 "1. shell_exec · 列出目录",
                 consumer._BOX_SEP,

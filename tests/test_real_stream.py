@@ -6,7 +6,7 @@
 
 用 ``tests/fixtures/real-stream-2026-10-08.jsonl`` 驱动 ``consume_stream``
 （``level="standard"``、桩 sender、``min_interval=0``），验证「代码框组」形态在一轮
-2 步工具调用流下：``events_seen == 10``、收口恰好 1 个框（含 ``工具 · 2 步`` 与 2 条
+2 步工具调用流下：``events_seen == 10``、收口恰好 1 个框（含 ``工作步骤 · 2 步`` 与 2 条
 逐步行）、全流程消息数 == 4（``🚀 第 1 轮`` + 框 + 最终文本 + ``✅ 完成``）。
 
 fixture 来源：真机沙箱录得的原始帧 ``bridge-silence-1008/REAL-STREAM.jsonl`` 的前
@@ -90,11 +90,11 @@ class RealStreamRegressionTest(unittest.TestCase):
         # 最终文本完整记录（供上层「📬 结果送达」使用），非空。
         self.assertTrue(stats["final_text"])
         self.assertIn("只读", stats["final_text"])
-        # 收口恰好 1 个框：以 ```text 起始的消息恰一条。
-        boxes = [m for m in sent if m.startswith("```text")]
+        # 收口恰好 1 个框：以裸 ``` 围栏起始的消息恰一条。
+        boxes = [m for m in sent if m.startswith("```")]
         self.assertEqual(len(boxes), 1)
         box = boxes[0]
-        self.assertIn("工具 · 2 步", box)
+        self.assertIn("工作步骤 · 2 步", box)
         # 2 条逐步行（standard 档 = 工具名 + 人话摘要；真实帧两工具均为 bash）。
         self.assertIn("1. bash · 列出目录", box)
         self.assertIn("2. bash · 读取文件（os-release）", box)

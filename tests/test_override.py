@@ -8,8 +8,8 @@
 加载 ``__init__.py``，通过 ``sys.modules`` 注入假的 ``gateway.session_context``、
 ``hermes_cli.config``，并 monkeypatch 模块级 ``_stream_dsh_call`` / ``_CONSUMER_MODULE``
 / ``_COLLECTOR_ENABLED``，以验证 ``_on_pre_tool_call`` 的 dsh 单执行（block）分支、
-流式失败回退、显式 context_id 放行、非 dsh / collector 关 / a2a_orchestrate / 非消息面
-仅注入 origin，以及 ``_stream_dsh_call`` 的格式化结果与缺配置抛错。
+流式失败回退、显式 context_id 作为 origin 拦截（原样采用）、非 dsh / collector 关 /
+a2a_orchestrate / 非消息面仅注入 origin，以及 ``_stream_dsh_call`` 的格式化结果与缺配置抛错。
 """
 
 import importlib.util
@@ -163,17 +163,24 @@ class HookTest(unittest.TestCase):
             _MODULE._on_pre_tool_call("a2a_history", {"context_id": "x"})
         )
 
-    # 2. 显式 context_id 已给 → None（不拦截、不覆盖）
-    def test_explicit_context_id_not_intercepted(self):
+    # 2. 显式 context_id + collector 开 + dsh → 原样采用为 origin 并拦截（block）。
+    def test_explicit_context_id_adopted_as_origin_and_blocked(self):
         _install_fake_gateway(
             True, {"HERMES_SESSION_PLATFORM": "feishu", "HERMES_SESSION_CHAT_ID": "oc_x"}
         )
         _MODULE._COLLECTOR_ENABLED = True
-        self.assertIsNone(
-            _MODULE._on_pre_tool_call(
-                "a2a_call", {"agent": "dsh", "message": "hi", "context_id": "custom"}
-            )
+        calls = []
+
+        def fake_spawn(message, context_id):
+            calls.append((message, context_id))
+
+        _MODULE._spawn_stream_worker = fake_spawn
+        result = _MODULE._on_pre_tool_call(
+            "a2a_call", {"agent": "dsh", "message": "hi", "context_id": "custom"}
         )
+        self.assertEqual(result["action"], "block")
+        self.assertIn("custom", result["message"])
+        self.assertEqual(calls, [("hi", "custom")])
 
     # 3. a2a_call + dsh + collector 开 + origin 非空 + message 非空 → 异步 spawn + block 受理回执。
     def test_dsh_single_execution_spawns_async_and_blocks(self):

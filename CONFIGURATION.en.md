@@ -15,7 +15,17 @@
 > preview are folded into one code block**, one group per message (group header +
 > step lines + thinking segment); there are no more heartbeat / closing lines
 > (`standard`) or per-step tool lines (`detailed` / `verbose`) — use a higher
-> tier for denser **in-box** content. The override approach
+> tier for denser **in-box** content. **As of v0.5.1 an explicit `context_id` no
+> longer turns live streaming off** — `pre_tool_call` always gates on the same
+> condition (`a2a_call` + `collector.enabled` + a dsh target + a non-empty
+> `message`), and the origin is the caller's explicit `context_id` **when
+> present**, otherwise the current messaging-surface origin; the explicit value
+> is **adopted as-is, never overwritten**, so the message still lands in the same
+> conversation. The trade-off is that such calls go from **synchronous** to
+> **asynchronous** (instant "⏳ accepted" → background execution + live progress →
+> result delivered automatically on completion). Previously (v0.5.0 and earlier)
+> an explicit `context_id` made the hook return early and pass through, so live
+> streaming **never started (zero messages)**. The override approach
 > (`register_tool(override=True)`)
 > was abandoned because the registration mechanism is unreliable on the real
 > gateway.
@@ -49,9 +59,15 @@ The Hermes built-in A2A plugin exposes 5 outbound client tools to the agent
   desktop / cron / kanban / api_server / webhook and the like never inject.
   Injection is also skipped when either `HERMES_SESSION_PLATFORM` or
   `HERMES_SESSION_CHAT_ID` is empty.
-- **Explicit-first**: when the caller already passes a non-empty `context_id` or
-  `contextId` (alias; the handler accepts both
-  `args.get("context_id") or args.get("contextId")`), it is not overwritten.
+- **Explicit `context_id`: adopted as-is and used as the live origin**: when the
+  caller already passes a non-empty `context_id` or `contextId` (alias; the
+  handler accepts both `args.get("context_id") or args.get("contextId")`), it is
+  **not overwritten** — the value serves both as the **live origin** and as the
+  dsh-side session-reuse key, so the message still lands in the conversation the
+  caller named. **As of v0.5.1 a dsh call carrying an explicit `context_id` is
+  intercepted and streamed live too** (see "Live consumer → Gate condition");
+  in v0.5.0 and earlier such calls returned early and passed through, so live
+  streaming never started.
 - **Off by default**: when this plugin is not in the `plugins.enabled` allowlist
   it is not loaded, so "not enabled = no side effects".
 - **Fail-open**: any import failure / exception returns `None` (does not block the
@@ -137,14 +153,20 @@ variable `A2A_SERVER_TOKEN`), `provider` / `model` / `preset` / `cwd` /
 1. On a Hermes messaging conversation, the agent calls
    `a2a_call(agent="dsh", message=...)`.
 2. This plugin's `pre_tool_call` injects
-   `context_id = {platform}/{chat_id}[/{thread_id}]`; the framework shallow-merges
-   it into `message.contextId` (A2A protocol `text_message(..., context_id=ctx)`).
+   `context_id = {platform}/{chat_id}[/{thread_id}]` (when the caller **already
+   passed** a non-empty `context_id` / `contextId`, nothing is injected and
+   nothing is overwritten — that value is adopted as-is); the framework
+   shallow-merges it into `message.contextId` (A2A protocol
+   `text_message(..., context_id=ctx)`).
 3. dsh-a2a-server receives `message.contextId` and uses it as the session-reuse
    key: repeated deliveries from the same Hermes conversation → reuse the same
    dsh session (continuous context); different conversations → different
    contextId → isolation.
 4. When `context_id` / `contextId` is passed explicitly, the caller's semantics
-   are preserved (actively resume an existing session or specify a key).
+   are preserved (actively resume an existing session or specify a key); as of
+   v0.5.1 that value also serves as the **live origin** — an `a2a_call` carrying
+   an explicit `context_id` is intercepted and streamed live too (see "Live
+   consumer → Gate condition").
 
 ## Live consumer (P2c-fix: pre_tool_call hook single execution)
 
@@ -157,6 +179,18 @@ a2a platform's deferred load `register_tools` overwrites the override back to th
 original handler), so override was abandoned and single execution was moved into
 the `pre_tool_call` hook:
 
+- **Gate condition (v0.5.1, frozen)**: `tool_name == "a2a_call"` +
+  `collector.enabled` true + a dsh target + a non-empty `message`. When it holds,
+  the live-stream decision is entered; the **live origin is the caller's explicit
+  `context_id` when present, otherwise the current messaging-surface origin**
+  (`{platform}/{chat_id}[/{thread_id}]`) — a non-empty origin means the call is
+  intercepted (`block`) and streamed live, and when both are empty the call is
+  **not intercepted** and passes through unchanged. An explicit
+  `context_id` is **adopted as-is, never overwritten**, so the message still lands
+  in the same conversation. **The v0.5.1 fix**: the v0.5.0-and-earlier rule "an
+  explicit `context_id` / `contextId` returns early and passes through" was
+  removed — such calls previously produced **no live output at all (zero
+  messages)**.
 - **dsh-target single execution (async)**: the `pre_tool_call` hook immediately
   spawns a background daemon thread running `_stream_dsh_call` (sends only **one**
   `SendStreamingMessage`, consumes SSE events while rendering intermediate
@@ -192,6 +226,33 @@ The final result travels an independent path: when the task finishes,
 **normal message** (plain-text chunking, `make_sender(code_blocks=False)`) to the
 messaging surface; on failure it retries once and only logs a warning — no
 silence after "done".
+
+### Troubleshooting: why does a conversation show no live messages? (v0.5.1)
+
+The entry point of the live chain is the `pre_tool_call` **interception** — an
+`a2a_call` that was **not intercepted** definitely has no live output. First
+confirm whether that call was intercepted; the two signatures are mutually
+exclusive:
+
+| That `a2a_call` | Tool result | Log signature |
+| --- | --- | --- |
+| **Intercepted** (live branch) | the "⏳ accepted" receipt | `Tool a2a_call returned error {"error":"[dsh · context …` |
+| **Not intercepted** (original synchronous handler) | the task's final text (returned synchronously) | `tool a2a_call completed (…s, … chars)` |
+
+Check them in this order:
+
+1. Look at that call's lines in `~/.hermes/logs/agent.log` — a
+   `tool a2a_call completed (…s, … chars)` means it was **not intercepted** and no
+   live output will start; a
+   `Tool a2a_call returned error {"error":"[dsh · context …` means it was
+   intercepted and the live chain started.
+2. When it was not intercepted, walk the gate condition: is `collector.enabled`
+   true (Dashboard switch or `config.yaml`), is the target dsh, is `message`
+   non-empty, and is the origin non-empty (on a non-messaging surface with no
+   explicit `context_id` both are empty → pass through).
+3. **An explicit `context_id` is not a reason for "no live output"** (as of
+   v0.5.1): that value becomes the origin and the call is intercepted as usual;
+   if such a call shows no live output, check the other conditions in step 2.
 
 ### Enable method (collector live gating)
 
@@ -760,7 +821,9 @@ losing step information.
    current tier), and that **dsh executes
    only once** (the dsh-a2a-server log shows only one task submission); ③ when the
    task finishes, the conversation receives the "📬 dsh 任务完成，结果如下" result
-   message (header + full text).
+   message (header + full text). Also (v0.5.1): have an `a2a_call` carrying an
+   **explicit `context_id`** trigger the same receipt and live stream, with the
+   message landing in the same conversation that `context_id` names.
 4. redact confirmation: tokens in progress text do not appear in plaintext.
 5. Degradation confirmation: temporarily turn off `collector.enabled` (Dashboard
    toggle or a config edit) and confirm the dsh target only injects origin and
@@ -832,8 +895,12 @@ message sample" mapping table.
 `test_override.py` covers `_on_pre_tool_call`'s single-execution hook branch and
 `_stream_dsh_call`: dsh target (collector on + origin non-empty + message
 non-empty) spawns async and blocks with an "accepted" receipt, spawn failure
-falls back to origin injection, explicit context_id is passed through, non-dsh /
-collector off / a2a_orchestrate / non-messaging surface injects origin only, and
+falls back to origin injection, **an explicit `context_id` is intercepted too**
+(the origin takes that value — an explicit non-empty value plus dsh plus
+collector on returns block and spawns the worker; interception still happens when
+the messaging surface is empty and only the explicit value supplies the origin),
+non-dsh / collector off / a2a_orchestrate / non-messaging surface injects origin
+only, and
 `_stream_dsh_call` formats the result, result delivery (`_format_result_message`
 three variants / worker swallows exceptions / delivery retries once), and raises
 on missing dsh config.
@@ -892,6 +959,10 @@ end-to-end verification under the real gateway is deferred to the window period
 - Trigger condition: a dsh target is judged by `a2a_call`'s `agent=="dsh"` or its
   URL; non-dsh targets are not blocked, only inject origin, and do not trigger
   streaming.
+- An explicit `context_id` does not change the trigger condition (v0.5.1): it
+  only decides the live **origin** (the explicit value outranks the
+  messaging-surface origin), never disables interception; the value is passed to
+  dsh **as-is, never overwritten**, so the session-reuse key is unchanged.
 - On spawn failure / missing dsh config, fall back to origin-injection only; the
   task still executes once via the original synchronous `a2a_call`
   (functionality preserved), just without live output.

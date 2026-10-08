@@ -55,6 +55,29 @@ Long text exceeding the gateway's per-message limit is split at code-block
 boundaries; continuation chunks are joined with a `⏩ 续` marker, so code blocks
 never break across chunks (the fence stays closed).
 
+### An explicit `context_id` is streamed live too (v0.5.1)
+
+The `pre_tool_call` gate condition is `a2a_call` + `collector.enabled` + a dsh
+target + a non-empty `message`; the live origin is the caller's explicit
+`context_id` **when present**, otherwise the current messaging-surface origin.
+So **a call carrying an explicit `context_id` is intercepted and streamed live
+too** — in v0.5.0 and earlier such calls passed through and live streaming never
+started; that is the behavior v0.5.1 fixes.
+
+The trade-off: a call with an explicit `context_id` goes from **synchronous** to
+**asynchronous** (instant "⏳ accepted" receipt → background execution + live
+progress → the result is delivered automatically to this conversation on
+completion); the `context_id` the caller supplies is **adopted as-is, never
+overwritten**, so the message still lands in the same conversation.
+
+Troubleshooting: if a conversation shows no live messages, first confirm whether
+that `a2a_call` was intercepted — when it was, the tool result is the "⏳
+accepted" receipt (log like
+`Tool a2a_call returned error {"error":"[dsh · context …`); when it was not, the
+log reads `tool a2a_call completed (…s, … chars)`. See
+[CONFIGURATION.en.md](CONFIGURATION.en.md), "Troubleshooting: why does a
+conversation show no live messages?".
+
 ### Code blocks
 
 Operation content — tool commands, execution results, and final text — is

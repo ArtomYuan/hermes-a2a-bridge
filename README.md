@@ -43,6 +43,22 @@ Hermes 侧接入 dsh A2A server 的桥插件：把 dsh 任务的执行过程实�
 长文本超过网关单条上限时按代码块边界分块，块间以 `⏩ 续` 提示衔接，代码框不会
 跨块断裂（围栏保持闭合）。
 
+### 显式 `context_id` 也会直播（v0.5.1）
+
+`pre_tool_call` 的拦截条件为 `a2a_call` + `collector.enabled` + 目标为 dsh +
+`message` 非空；直播 origin 取「调用方显式给出的 `context_id`」**优先**，否则取当前
+消息面 origin。因此**显式携带 `context_id` 的调用同样会被拦截并直播**——v0.5.0 及
+更早这类调用会被放行、直播完全不启动，这是 v0.5.1 修复的行为。
+
+取舍：带显式 `context_id` 的调用由**同步**变为**异步**（秒回「⏳ 已受理」回执 →
+后台执行 + 过程直播 → 完成后结果自动送达本对话）；调用方给出的 `context_id`
+**原样采用、不被覆盖**，因此消息仍落在同一会话。
+
+排查：若某会话没有直播消息，先确认该次 `a2a_call` 是否被拦截——被拦截时工具结果为
+「⏳ 已受理」回执（日志形如 `Tool a2a_call returned error {"error":"[dsh · context …`）；
+未被拦截时日志为 `tool a2a_call completed (…s, … chars)`。详见
+[CONFIGURATION.md](CONFIGURATION.md)「排查：某会话为何没有直播消息？」。
+
 ### 代码框效果
 
 操作内容——工具命令、执行结果、最终文本——会自动以代码框渲染：

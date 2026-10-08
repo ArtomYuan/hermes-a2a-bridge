@@ -10,6 +10,12 @@
 > 一轮内的工具步骤与**落定的思考预览折叠渲染进同一个代码框**、作为**一条消息的一个
 > 组**（组头 + 逐步行 + 思考段），不再有 v0.4.1 的心跳行 / 收口行（`standard`）与
 > 逐条工具行（`detailed` / `verbose`）；想要更细的**框内**密度请用更高档位。
+> **v0.5.1 起显式 `context_id` 不再关闭直播**——`pre_tool_call` 一律按同一条件拦截
+> （`a2a_call` + `collector.enabled` + dsh 目标 + `message` 非空），origin 取调用方
+> 显式给出的 `context_id` **优先**、否则取当前消息面 origin；显式值**原样采用、不被
+> 覆盖**，故消息仍落在同一会话。取舍是这类调用由**同步**变为**异步**（秒回「⏳ 已
+> 受理」→ 后台执行 + 过程直播 → 完成后结果自动送达）。此前（v0.5.0 及更早）显式
+> `context_id` 会让 hook 早退放行，直播**完全不启动（零消息）**。
 > override 方案（`register_tool(override=True)`）因注册机制在真实 gateway 不可靠已弃用。
 
 ## 行为
@@ -33,8 +39,12 @@ Hermes 内置 A2A 插件向 agent 暴露 5 个 outbound client 工具（**裸名
 - **门控**：仅 `session_is_messaging_surface()` 为真时注入（飞书/QQ/Telegram 等人工
   消息面）；CLI / TUI / desktop / cron / kanban / api_server / webhook 等一律不注入。
   任一 `HERMES_SESSION_PLATFORM` / `HERMES_SESSION_CHAT_ID` 为空也不注入。
-- **显式优先**：调用方已显式传入非空 `context_id` 或 `contextId`（别名，handler
-  同时接受 `args.get("context_id") or args.get("contextId")`）时不覆盖。
+- **显式 `context_id`：原样采用，并作为直播 origin**：调用方已显式传入非空
+  `context_id` 或 `contextId`（别名，handler 同时接受
+  `args.get("context_id") or args.get("contextId")`）时**不覆盖**——该值同时作为
+  **直播 origin** 与 dsh 侧会话复用键，故消息仍落在调用方指定的同一会话。
+  **v0.5.1 起，带显式 `context_id` 的 dsh 调用同样会被拦截并直播**（见「直播
+  消费者 → 拦截条件」）；v0.5.0 及更早此类调用被早退放行、直播完全不启动。
 - **默认关**：本插件不在 `plugins.enabled` 白名单时不会被加载，故「未启用即无副作用」。
 - **故障放行**：任何 import 失败 / 异常都 `return None`（不阻断工具调用），仅
   `logging.warning` 记录原因。
@@ -109,11 +119,15 @@ dsh 侧由 `dsh-a2a-server` 库（`ArtomYuan/dsh-a2a-server`）暴露 A2A server
 ### contextId 会话复用链路
 
 1. Hermes 侧 messaging 对话中，agent 调 `a2a_call(agent="dsh", message=...)`。
-2. 本插件 `pre_tool_call` 注入 `context_id = {platform}/{chat_id}[/{thread_id}]`，
-   框架浅合并进 `message.contextId`（A2A 协议 `text_message(..., context_id=ctx)`）。
+2. 本插件 `pre_tool_call` 注入 `context_id = {platform}/{chat_id}[/{thread_id}]`
+   （调用方**已显式给出**非空 `context_id` / `contextId` 时**不注入、不覆盖**，原样
+   采用该值），框架浅合并进 `message.contextId`（A2A 协议
+   `text_message(..., context_id=ctx)`）。
 3. dsh-a2a-server 收到 `message.contextId`，把它作为会话复用键：同一 Hermes 对话
    重复投递 → 复用同一 dsh 会话（上下文连续）；不同对话 → 不同 contextId → 隔离。
-4. 显式传入 `context_id` / `contextId` 时保留调用方语义（可主动续接既有会话或指定键）。
+4. 显式传入 `context_id` / `contextId` 时保留调用方语义（可主动续接既有会话或指定
+   键）；v0.5.1 起该值同时作为**直播 origin**——带显式 `context_id` 的 `a2a_call`
+   同样被拦截并直播（见「直播消费者 → 拦截条件」）。
 
 ## 直播消费者（P2c-fix：pre_tool_call hook 单执行）
 
@@ -123,6 +137,14 @@ dsh 侧由 `dsh-a2a-server` 库（`ArtomYuan/dsh-a2a-server`）暴露 A2A server
 gateway 里不可靠（a2a 平台 deferred load 二次 register_tools 会把 override 覆写回原
 handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行**：
 
+- **拦截条件（v0.5.1，冻结）**：`tool_name == "a2a_call"` + `collector.enabled` 为真
+  + 目标是 dsh + `message` 非空。满足即进入直播判定；**直播 origin 取「调用方显式
+  给出的 `context_id`」优先，否则取当前消息面 origin**
+  （`{platform}/{chat_id}[/{thread_id}]`）——origin 非空即拦截（`block`）并直播，
+  两者都为空则**不拦截**、按原样放行。
+  显式 `context_id` **原样采用、不被覆盖**，消息仍落在同一会话。**v0.5.1 修复**：
+  删除了 v0.5.0 及更早「见显式 `context_id` / `contextId` 即早退放行」的规则——此前
+  这类调用**完全不直播（零消息）**。
 - **dsh 目标单执行（异步）**：`pre_tool_call` hook 立即 spawn 后台 daemon 线程跑
   `_stream_dsh_call`（只发**一条** `SendStreamingMessage`，边消费 SSE 事件边把中间
   进度渲染推回飞书 / QQ；`collector.enabled` 门控、默认关），并当即以
@@ -147,6 +169,28 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
 `📬 **dsh 任务完成，结果如下**（用时 …）` 头行 + 结果全文以**普通消息**（纯文本分块，
 `make_sender(code_blocks=False)`）送达消息面；失败重试一次后仅记 warning——「完成」
 之后不静默。
+
+### 排查：某会话为何没有直播消息？（v0.5.1）
+
+直播链路的入口是 `pre_tool_call` 的**拦截**——**未被拦截的 `a2a_call` 一定没有
+直播**。自查时先确认该次调用是否被拦截，两条特征互斥：
+
+| 该次 `a2a_call` | 工具结果 | 日志特征 |
+| --- | --- | --- |
+| **被拦截**（走直播分支） | 「⏳ 已受理」回执 | `Tool a2a_call returned error {"error":"[dsh · context …` |
+| **未被拦截**（走原同步 handler） | 任务最终文本（同步返回） | `tool a2a_call completed (…s, … chars)` |
+
+建议按此顺序核对：
+
+1. 看 `~/.hermes/logs/agent.log` 中该次调用的日志形态——出现
+   `tool a2a_call completed (…s, … chars)` 即**未被拦截**，直播不会启动；出现
+   `Tool a2a_call returned error {"error":"[dsh · context …` 即被拦截，直播链路
+   已启动。
+2. 未被拦截时依次核对拦截条件：`collector.enabled` 是否为真（Dashboard 开关或
+   `config.yaml`）、目标是否 dsh、`message` 是否非空、origin 是否非空（非消息面且
+   无显式 `context_id` 时两者皆空 → 放行）。
+3. **带显式 `context_id` 不是「不直播」的理由**（v0.5.1 起）：该值会作为 origin 被
+   采用并照常拦截；若这类调用未直播，按第 2 步的其它条件排查。
 
 ### 启用方式（collector 直播门控）
 
@@ -625,6 +669,8 @@ a2a_call（pre_tool_call hook）
    （默认 `follow-dsh` 跟随 dsh 当前档位），且
    **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
    ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 全文）。
+   另（v0.5.1）：让调用**显式携带 `context_id`** 的 `a2a_call` 同样触发上述回执与
+   直播，且消息落在该 `context_id` 对应的同一会话。
 4. redact 确认：进度文本中的 token 不落明文。
 5. 降级确认：临时把 `collector.enabled` 关掉（Dashboard 面板点选或改 config），
    确认 dsh 目标仅注入 origin、走原同步 `a2a_call`（无直播、无双执行）——且
@@ -678,7 +724,9 @@ python3 tests/test_dashboard_api.py
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
 dsh 目标（collector 开 + origin 非空 + message 非空）异步 spawn + 受理回执回传、
-spawn 失败回退注入 origin、显式 context_id 放行、非 dsh / collector 关 /
+spawn 失败回退注入 origin、**显式 `context_id` 同样拦截**（origin 取该值——显式值
+非空且 dsh + collector 开时返回 block 并 spawn worker；消息面为空、origin 仅来自
+显式值时仍拦截）、非 dsh / collector 关 /
 a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格式化结果、
 结果送达（`_format_result_message` 三态 / worker 吞异常 / 送达重试一次）与缺 dsh
 配置抛错。
@@ -723,6 +771,8 @@ gateway 生效需重启（见「启用」）。本阶段不重启；真实 gatew
   不会起新 loop 导致跨线程失败。
 - 触发条件：dsh 目标判定为 `a2a_call` 的 `agent=="dsh"` 或其 URL；非 dsh 目标不
   block，仅注入 origin，不触发流式。
+- 显式 `context_id` 不改变触发条件（v0.5.1）：它只决定直播 **origin**（显式值优先于
+  消息面 origin），不关闭拦截；该值**原样传给 dsh、不被覆盖**，会话复用键不变。
 - spawn 失败 / 缺 dsh 配置时回退为仅注入 origin，任务仍会经原同步 `a2a_call` 执行一
   次（功能不丢），只是无直播。
 - 回执与结果分开：受理回执经 `{"error": ...}` 回传（秒回）；最终结果经结果送达通道

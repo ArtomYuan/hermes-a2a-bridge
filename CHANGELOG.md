@@ -5,6 +5,47 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.1] - 2026-10-08
+
+> ⚠️ **行为修复（升级前必读）**：修复「调用方**显式携带 `context_id`** 时直播
+> **完全不启动（零消息）**」。根因是 `pre_tool_call` 见到显式 `context_id` /
+> `contextId` 即**早退放行**（既不拦截、也不注入），整条直播链被掐断；v0.5.1 改为
+> 以该值为**直播 origin** 并照常拦截。**取舍**：这类调用由**同步**变为**异步**
+> （秒回「⏳ 已受理」回执 → 后台执行 + 过程直播 → 完成后结果自动送达本对话）；
+> 调用方给出的 `context_id` **原样采用、不被覆盖**，因此消息仍落在同一会话。
+> 另注：**v0.5.0 的「代码框组」形态本身正常**，本次不改渲染。
+
+### Fixed
+
+- 修复显式 `context_id` 导致直播零消息：删除 `pre_tool_call` 中「见显式
+  `context_id` / `contextId` 即 `return None`」的早退。**拦截条件不变**——
+  `tool_name == "a2a_call"` + `collector.enabled` 为真 + 目标是 dsh + `message`
+  非空；**origin 改为取「调用方显式给出的 `context_id`」优先，否则取当前消息面
+  origin**（`{platform}/{chat_id}[/{thread_id}]`）；两者都为空才不拦截、按原样放行。
+  显式值**原样采用、不被覆盖**，dsh 侧会话复用键不变。
+
+### Changed
+
+- 带显式 `context_id` 的 dsh 调用由**同步**变为**异步**（v0.5.1 行为），与无显式
+  `context_id` 的调用一致：秒回「⏳ 已受理」回执、后台流式执行并直播过程、完成后
+  「📬 dsh 任务完成，结果如下」结果自动送达本对话。这是直播所需，也是本次修复的
+  取舍（此前显式 `context_id` 走原同步 `SendMessage`、无直播）。
+- CONFIGURATION / README 中英四份文档同步补「显式 `context_id` 作为直播 origin」的
+  行为与取舍、拦截条件，以及「某会话为何没有直播消息」的排查线索小节（被拦截 →
+  「⏳ 已受理」回执与 `Tool a2a_call returned error {"error":"[dsh · context …`；
+  未被拦截 → `tool a2a_call completed (…s, … chars)`）。
+- `plugin.yaml` 与 `dashboard/manifest.json` 版本号同步 bump 到 `0.5.1`。
+
+### Unchanged
+
+- **v0.5.0 的「代码框组」渲染形态不受影响**：本次不动渲染——四档形态、发框规则、
+  终态强制收口与 stats 口径全部不变；v0.5.0 形态本身经三重验证正常（本地真实帧
+  复现 10 事件 → 5 条消息；生产实跑 `events_seen=10`、`messages_sent=4` 吻合）。
+- 无显式 `context_id` 的调用行为不变；`collector.enabled` 关、非 dsh 目标、非消息面
+  仍不拦截（仅按原逻辑注入 origin）。
+- 秒回受理回执与「📬 完成消息 + 结果全文」送达不变；`collector.events: false`
+  仍**优先于档位**。
+
 ## [0.5.0] - 2026-10-08
 
 > ⚠️ **行为变更（升级前必读）**：四档统一改为**「每轮一个代码框组」**——一轮内的

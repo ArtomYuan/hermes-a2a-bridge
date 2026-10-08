@@ -29,7 +29,9 @@ Hermes 内置 A2A 插件（``~/.hermes/hermes-agent/plugins/platforms/a2a/``）�
 - 门控：仅 ``session_is_messaging_surface()`` 为真时注入。CLI / TUI / desktop /
   cron / kanban / api_server / webhook 等非消息面一律不注入。
 - 范围：仅 ``a2a_call`` 与 ``a2a_orchestrate`` 两个工具；其余工具不动。
-- 显式优先：若调用方已显式传入非空 ``context_id`` 或 ``contextId``（别名），则不覆盖。
+- 显式优先：若调用方已显式传入非空 ``context_id`` 或 ``contextId``（别名），该值被
+  原样采用为直播 origin（不覆盖调用方意图）；非直播路径（collector 关 / 非 dsh /
+  ``a2a_orchestrate``）仍不覆盖调用方 context。
 - 故障放行：任何 import 失败 / 异常都 return None（不阻断工具调用），仅 logging.warning 记录。
 - 默认关：本插件不在 ``plugins.enabled`` 白名单时不会被加载，故「未启用即无副作用」。
   启用方式见 README.md。
@@ -43,7 +45,10 @@ register_tools 会把 override 覆写回原 handler，或 replacement_coordinato
 hook 里对 dsh 目标做**单执行**：
 
 - 触发条件：``a2a_call`` + ``_is_dsh_agent(agent)`` + ``collector.enabled`` 开 +
-  消息面 origin 非空 + message 非空。
+  origin 非空（显式 context_id 或消息面 origin）+ message 非空。
+- origin 取值：``explicit or _build_origin()``。带显式 ``context_id`` 的调用**不再
+  关闭直播**——显式值被原样采用为 origin（不覆盖调用方意图），因此消息仍落到同一
+  dsh 会话；该调用由同步变异步（后台直播 + 受理回执 + 结果自动送达）。
 - 单执行（异步，2026-09-15 改）：hook 立即 spawn 后台 daemon 线程跑
   ``_stream_dsh_call``（发 ``SendStreamingMessage``、消费 SSE 直播），并立刻以
   ``{"action": "block", "message": 受理回执}`` 阻止原 ``a2a_call`` 执行（消除双执行）。
@@ -54,7 +59,7 @@ hook 里对 dsh 目标做**单执行**：
 - 回退：spawn 失败时退化为注入 origin 让原 ``a2a_call`` 走同步 ``SendMessage``
   （功能不丢、无直播）。
 - 其余（``a2a_orchestrate`` / 非 dsh 目标 / collector 关 / 非消息面 / message 空）：
-  仅注入 origin，不 block。
+  仅注入 origin 或放行（显式 context_id 时不覆盖）。
 """
 
 import logging
@@ -459,29 +464,34 @@ def _on_pre_tool_call(
 ) -> Optional[Dict[str, Any]]:
     """pre_tool_call 钩子：origin 注入 + dsh 单执行（block 原 a2a_call）。
 
-    对 dsh 目标的 ``a2a_call``（collector 开 + 消息面 origin 非空 + message 非空）走
-    单执行：``_stream_dsh_call`` 发一条 SendStreamingMessage 收最终文本，随后
-    ``{"action": "block", "message": 结果}`` 阻止原 a2a_call 执行（消除双执行）。流式
-    失败时回退为仅注入 origin。其余情况（a2a_orchestrate / 非 dsh / collector 关 /
-    非消息面 / message 空）仅注入 origin 或放行。
+    对 dsh 目标的 ``a2a_call``（collector 开 + origin 非空 + message 非空）走单执行：
+    ``_spawn_stream_worker`` 后台直播，随后 ``{"action": "block", "message": 受理回执}``
+    阻止原 a2a_call 执行（消除双执行）。origin 取 ``explicit or _build_origin()``：
+    调用方显式传入的 context_id（或 contextId 别名）不再关闭直播，而是原样采用为
+    origin（不覆盖调用方意图）。流式失败时回退为仅注入 origin。其余情况
+    （a2a_orchestrate / 非 dsh / collector 关 / 非消息面 / message 空）仅注入 origin
+    或放行（显式 context_id 时不覆盖）。
     """
     if tool_name not in _TARGET_TOOLS:
         return None
 
     args = args if isinstance(args, dict) else {}
 
-    # 显式优先：调用方已给出 context_id（或 contextId 别名）时不拦截、不覆盖。
-    if args.get("context_id") or args.get("contextId"):
-        return None
+    # 显式 context_id（或 contextId 别名）：作为直播 origin 原样采用（不覆盖）。
+    explicit = str(args.get("context_id") or args.get("contextId") or "").strip()
 
+    # 消息面 origin（非消息面 / platform 或 chat_id 为空时返回 ""）。
     origin = _build_origin()
+    # 有效 origin：显式优先，否则消息面。带显式 context_id 的调用由同步变异步
+    # （后台直播 + 受理回执 + 结果自动送达），且该 context 被原样采用。
+    eff_origin = explicit or origin
 
-    # 单执行：a2a_call 目标 dsh + collector 开 + messaging 面（origin 非空）。
+    # 单执行：a2a_call 目标 dsh + collector 开 + origin 非空。
     # collector.enabled 热读：Dashboard 改配置后下一次工具调用即生效。
     if (
         tool_name == "a2a_call"
         and _read_switch("collector.enabled", False)
-        and origin
+        and eff_origin
         and _is_dsh_agent(
             str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
         )
@@ -491,13 +501,13 @@ def _on_pre_tool_call(
         ).strip()
         if message:
             try:
-                _spawn_stream_worker(message, origin)
+                _spawn_stream_worker(message, eff_origin)
                 # 异步单执行（2026-09-15）：回调秒回受理回执，任务在后台直播 +
                 # 完成后结果自动送达；block 阻止原 a2a_call 执行（消除双执行）。
                 return {
                     "action": "block",
                     "message": (
-                        f"[dsh · context {origin}] ⏳ 已受理——任务在后台执行，"
+                        f"[dsh · context {eff_origin}] ⏳ 已受理——任务在后台执行，"
                         "过程直播中；完成后结果会自动送达本对话。"
                     ),
                 }
@@ -506,10 +516,13 @@ def _on_pre_tool_call(
                     "hermes-a2a-bridge: stream worker spawn failed, fallback sync: %s",
                     exc,
                 )
-                # 回退：注入 origin 让原 a2a_call 走同步 SendMessage（功能不丢）。
-                return {"action": "modify", "args": {"context_id": origin}}
+                # 回退：落到下方「仅注入 origin」分支，让原 a2a_call 走同步
+                # SendMessage（功能不丢、无直播）。
 
-    # 其余（a2a_orchestrate / 非 dsh / collector 关 / 非 messaging）：仅 origin 注入。
+    # 其余（a2a_orchestrate / 非 dsh / collector 关 / 非 messaging / message 空）：
+    # 仅 origin 注入。显式优先：调用方已给出 context_id 时不覆盖。
+    if explicit:
+        return None
     if not origin:
         return None
     return {"action": "modify", "args": {"context_id": origin}}

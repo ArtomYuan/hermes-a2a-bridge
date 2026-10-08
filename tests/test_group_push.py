@@ -1,19 +1,18 @@
-"""standard 档「步骤组」收敛（组推送）单元测试（纯静态，不接 gateway / 不接 dsh）.
+"""「代码框组」渲染（v0.5.0）单元测试（纯静态，不接 gateway / 不接 dsh）.
 
 运行方式
 --------
     python3 tests/test_group_push.py
 
-覆盖 ALIGN-FIX.md 修正 1/2/3（覆盖 DESIGN-GROUP.md §三 冻结契约）：
-- standard 下 tool_call / tool_result 不再逐条发出，进组缓冲（分组单位 = 一轮）；
-- 每满 ``_GROUP_HEARTBEAT_STEPS=6`` 步发一条心跳（开放态行）；
-- ``thinking`` 并入当前组、不断组、不单独发一行、不计步骤（整轮只有思考时收口为「已完成分析」）；
-- 遇 ``turn_end`` / 终态 status / final text / 新 ``turn_start`` 收口为一条关闭态行，且组行先于触发行；
-- 种类映射表（tool_activity_kind，对齐 dsh activity() 原表）与关闭态标题合成（group_title，
-  对齐 dsh processTitle：1/2/3/>3 类四种形态）；
-- 终态强制收口（组内还有缓冲时终态到达不丢信息）；
-- compact / detailed / verbose 不回归；
-- 摘要小改进（对象参数无命令键时取标识性键 key=value）。
+覆盖 DESIGN-BOX.md §三 冻结契约（v0.5.0 四档统一「代码框组」）：
+- 一轮内的工具步骤与思考收口为一条 ```text 代码框消息（组头 + 分隔线 + 逐步行 +
+  结果行 + 思考段）；
+- 四档密度差异（compact 无逐步行 / standard 无结果行 / detailed 有结果行 / verbose 不截断）；
+- 收口时机（turn_end / 终态 / final / 新 turn_start），框先于触发行；
+- 发框规则（无工具无思考 → 不发框；只有思考 → 发只含思考行的框）；
+- 种类映射表（tool_activity_kind）与组头类别串（group_title）逐字不变；
+- 终态强制收口；超长框分块后围栏闭合；
+- 摘要（summarize_tool_call）锚点不回归。
 
 仅用标准库 ``unittest``，沿用 test_consumer.py 的 spec 加载方式。
 """
@@ -50,10 +49,24 @@ def _level_run(events, level):
     return sent
 
 
-class GroupPushTest(unittest.TestCase):
-    """standard 组推送：心跳（第 6 步）与收口各一条，不再有逐条 tool 行。"""
+def _box(*lines):
+    """把框内行序列包成 ```text 代码框消息（收口消息的期望形态）。"""
+    return "```text\n" + "\n".join(lines) + "\n```"
 
-    def test_eight_steps_heartbeat_then_close(self):
+
+# 三工具步 + 思考，供密度对比（bash→commands、read→read、grep→search）。
+_THREE_STEPS = [
+    {"name": "bash", "arguments": "ls", "result": "file1\nfile2"},
+    {"name": "read", "arguments": "cat /a.txt", "result": "content"},
+    {"name": "grep", "arguments": "grep foo", "result": "12 hits"},
+]
+_THREE_HEADER = "工具 · 3 步 · 执行了命令，已读取文件，已搜索代码"
+
+
+class BoxGroupTest(unittest.TestCase):
+    """standard 档：一轮收口为一条代码框组消息，不再有心跳 + 收口行两条路径。"""
+
+    def test_eight_steps_single_box(self):
         events = [{"type": "turn_start", "turn": 1}]
         for i in range(1, 9):
             events.append({"type": "tool_call", "name": "bash", "arguments": f"echo step{i}"})
@@ -62,21 +75,16 @@ class GroupPushTest(unittest.TestCase):
         events.append({"type": "status", "state": "completed"})
 
         sent = _std_run(events)
-        self.assertEqual(
-            sent,
-            [
-                "🚀 第 1 轮",
-                "🔧 正在执行 · 第 6 步 · echo step6",  # 第 6 步心跳
-                "🔧 执行了命令",  # turn_end 收口（关闭态）
-                "✅ 完成",
-            ],
-        )
-        # 不再有逐条 tool 行（🔧 `name` 摘要行 / 📋 完成行）。
-        self.assertFalse(any(line.startswith("🔧 `") for line in sent))
+        step_lines = [f"{i}. bash · echo step{i}" for i in range(1, 9)]
+        box = _box("工具 · 8 步 · 执行了命令", consumer._BOX_SEP, *step_lines)
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "✅ 完成"])
+        # 不再有心跳行，也没有逐条 🔧 / 📋 行。
+        self.assertFalse(any("正在执行" in line for line in sent))
+        self.assertFalse(any("🔧" in line for line in sent))
         self.assertFalse(any("📋" in line for line in sent))
 
-    def test_more_than_twelve_steps_two_heartbeats(self):
-        # 13 步：第 6 步与第 12 步各一条心跳，收口一条。
+    def test_more_than_twelve_steps_no_heartbeat(self):
+        # 13 步：全部收口进一条框，无第 6/12 步心跳。
         events = []
         for i in range(1, 14):
             events.append({"type": "tool_call", "name": "bash", "arguments": f"echo step{i}"})
@@ -84,17 +92,18 @@ class GroupPushTest(unittest.TestCase):
         events.append({"type": "status", "state": "completed"})
 
         sent = _std_run(events)
-        heartbeats = [line for line in sent if "正在执行" in line]
-        closes = [line for line in sent if line.startswith("🔧 ") and "正在执行" not in line]
-        self.assertEqual(len(heartbeats), 2)
-        self.assertEqual(heartbeats[0], "🔧 正在执行 · 第 6 步 · echo step6")
-        self.assertEqual(heartbeats[1], "🔧 正在执行 · 第 12 步 · echo step12")
-        self.assertEqual(closes, ["🔧 执行了命令"])
-        self.assertEqual(sent[-1], "✅ 完成")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[1], "✅ 完成")
+        body = sent[0]
+        self.assertTrue(body.startswith("```text\n工具 · 13 步 · 执行了命令\n"))
+        # 13 条逐步行，无心跳。
+        self.assertEqual(body.count("\n1. "), 1)
+        self.assertIn("\n13. bash · echo step13\n", body)
+        self.assertNotIn("正在执行", body)
 
 
 class CloseTimingTest(unittest.TestCase):
-    """收口时机：turn_end / 终态 / final text / 新 turn_start，且组行先于触发行。"""
+    """收口时机：turn_end / 终态 / final text / 新 turn_start，且框先于触发行。"""
 
     def test_close_on_turn_end_before_narrative(self):
         events = [
@@ -104,8 +113,9 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
         sent = _std_run(events)
-        # 组行先于 turn_end flush 出的叙述 text 行。
-        self.assertEqual(sent, ["🔧 已读取文件", "📖 叙述正文"])
+        # 框先于 turn_end flush 出的叙述 text 行。
+        box = _box("工具 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（a.txt）")
+        self.assertEqual(sent, [box, "📖 叙述正文"])
 
     def test_close_on_terminal_status_before_status_line(self):
         events = [
@@ -114,11 +124,12 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "status", "state": "completed"},
         ]
         sent = _std_run(events)
-        # 组行先于终态行。
-        self.assertEqual(sent, ["🔧 执行了命令", "✅ 完成"])
+        # 框先于终态行。
+        box = _box("工具 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        self.assertEqual(sent, [box, "✅ 完成"])
 
     def test_thinking_does_not_split_group(self):
-        # 思考夹在两个工具步之间：不断组、不单独发一行、不计步骤；整轮最终只有 1 条收口行。
+        # 思考夹在两个工具步之间：不断组、不单独发一行、不计步骤；整轮 1 条框。
         events = [
             {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
             {"type": "tool_result", "name": "read", "text": "x"},
@@ -128,9 +139,15 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
         sent = _std_run(events)
-        # 两个工具步 + 思考收口为一条关闭态行（2 类：已读取文件并执行了命令），
-        # 没有「🧠 思考中…」单独行，也没有被思考拆成两段。
-        self.assertEqual(sent, ["🔧 已读取文件并执行了命令"])
+        box = _box(
+            "工具 · 2 步 · 已读取文件并执行了命令",
+            consumer._BOX_SEP,
+            "1. read · 读取文件（a.txt）",
+            "2. bash · 列出目录",
+            consumer._BOX_SEP,
+            "思考 · 想想",
+        )
+        self.assertEqual(sent, [box])
 
     def test_close_before_final_text(self):
         # 防御性收口：final 文本到达时残存组先收口，再发最终文本。
@@ -141,17 +158,19 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "status", "state": "completed"},
         ]
         sent = _std_run(events)
-        self.assertEqual(sent, ["🔧 执行了命令", "📖 输出完成", "✅ 完成"])
+        box = _box("工具 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        self.assertEqual(sent, [box, "📖 输出完成", "✅ 完成"])
 
     def test_turn_start_flushes_previous_group(self):
-        # 新 turn_start 到达时，若上一轮组未收口（无 turn_end）则先收口，组行先于轮次标记行。
+        # 新 turn_start 到达时，若上一轮组未收口（无 turn_end）则先收口，框先于轮次标记行。
         events = [
             {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
             {"type": "tool_result", "name": "read", "text": "x"},
             {"type": "turn_start", "turn": 2},
         ]
         sent = _std_run(events)
-        self.assertEqual(sent, ["🔧 已读取文件", "🚀 第 2 轮"])
+        box = _box("工具 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（a.txt）")
+        self.assertEqual(sent, [box, "🚀 第 2 轮"])
 
 
 class ToolActivityKindTest(unittest.TestCase):
@@ -206,7 +225,7 @@ class ToolActivityKindTest(unittest.TestCase):
 
 
 class GroupTitleTest(unittest.TestCase):
-    """关闭态标题合成：1/2/3/>3 类四种形态（对齐 dsh processTitle）。"""
+    """组头类别串合成：1/2/3/>3 类四种形态（对齐 dsh processTitle）。"""
 
     def test_single_kind(self):
         self.assertEqual(consumer.group_title(["read"]), "已读取文件")
@@ -242,19 +261,9 @@ class GroupTitleTest(unittest.TestCase):
         # 未知 kind 退化为 tools 文案。
         self.assertEqual(consumer.group_title(["bogus"]), "已调用工具")
 
-    def test_close_line_prefix(self):
-        self.assertEqual(consumer.render_group_close(["commands"]), "🔧 执行了命令")
-
-    def test_heartbeat_with_and_without_summary(self):
-        self.assertEqual(
-            consumer.render_group_heartbeat(6, "ls /tmp"),
-            "🔧 正在执行 · 第 6 步 · ls /tmp",
-        )
-        self.assertEqual(consumer.render_group_heartbeat(6, ""), "🔧 正在执行 · 第 6 步")
-
 
 class TerminalForceFlushTest(unittest.TestCase):
-    """终态强制收口：组内还有缓冲时终态到达，信息不丢。"""
+    """终态强制收口：组内还有缓冲时终态到达，信息不丢（框先于终态行）。"""
 
     def test_terminal_flushes_buffered_group(self):
         events = [
@@ -266,8 +275,13 @@ class TerminalForceFlushTest(unittest.TestCase):
             {"type": "status", "state": "completed"},
         ]
         sent = _std_run(events)
-        # 两类工具都被收口进一条关闭态行（2 类用「并」，commands 不以「已」开头故不去「已」）。
-        self.assertEqual(sent, ["🔧 执行了命令并已读取文件", "✅ 完成"])
+        box = _box(
+            "工具 · 2 步 · 执行了命令并已读取文件",
+            consumer._BOX_SEP,
+            "1. bash · 列出目录",
+            "2. read · 读取文件（b.txt）",
+        )
+        self.assertEqual(sent, [box, "✅ 完成"])
 
     def test_failed_status_also_flushes(self):
         events = [
@@ -276,26 +290,27 @@ class TerminalForceFlushTest(unittest.TestCase):
             {"type": "status", "state": "failed"},
         ]
         sent = _std_run(events)
-        self.assertEqual(sent, ["🔧 执行了命令", "❌ 失败"])
+        box = _box("工具 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        self.assertEqual(sent, [box, "❌ 失败"])
 
 
 class ThinkingGroupTest(unittest.TestCase):
-    """思考并入组：不单独发一行、不计步骤；整轮只有思考时收口为「已完成分析」。"""
+    """思考并入框：不单独发一行、不计步骤；只有思考时发只含思考行的框。"""
 
-    def test_thinking_only_turn_closes_as_analysis_completed(self):
-        # 整轮只有思考、没有工具步 → 收口标题 = 已完成分析。
+    def test_thinking_only_turn_sends_thinking_box(self):
+        # 整轮只有思考、没有工具步 → 发只含「思考…」行的框（无组头）。
         events = [
             {"type": "turn_start", "turn": 1},
             {"type": "thinking", "text": "让我先规划一下"},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
         sent = _std_run(events)
-        self.assertEqual(sent, ["🚀 第 1 轮", "🔧 已完成分析"])
+        self.assertEqual(sent, ["🚀 第 1 轮", _box("思考 · 让我先规划一下")])
         # 没有「🧠 思考中…」单独行。
         self.assertFalse(any("🧠" in line for line in sent))
 
-    def test_thinking_with_tools_not_in_title(self):
-        # 有工具步时，思考不计入关闭态标题的类别（对齐 dsh processTitle：counts 只含工具）。
+    def test_thinking_with_tools_not_in_header(self):
+        # 有工具步时，思考不计入组头类别（对齐 dsh processTitle：counts 只含工具）。
         events = [
             {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
             {"type": "tool_result", "name": "read", "text": "x"},
@@ -303,10 +318,17 @@ class ThinkingGroupTest(unittest.TestCase):
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
         sent = _std_run(events)
-        self.assertEqual(sent, ["🔧 已读取文件"])
+        box = _box(
+            "工具 · 1 步 · 已读取文件",
+            consumer._BOX_SEP,
+            "1. read · 读取文件（a.txt）",
+            consumer._BOX_SEP,
+            "思考 · 想想",
+        )
+        self.assertEqual(sent, [box])
 
-    def test_thinking_not_counted_in_heartbeat_steps(self):
-        # 思考不计入工具步数：仅 3 个工具步 + 若干思考，不触发第 6 步心跳。
+    def test_thinking_not_counted_in_step_lines(self):
+        # 思考不计入工具步数：仅 3 个工具步 + 若干思考，组头仍为 3 步。
         events = [
             {"type": "tool_call", "name": "bash", "arguments": "ls"},
             {"type": "tool_result", "name": "bash", "text": "x"},
@@ -319,13 +341,155 @@ class ThinkingGroupTest(unittest.TestCase):
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
         sent = _std_run(events)
-        # 只有 3 步，无心跳；收口一条（commands）。
-        self.assertEqual(sent, ["🔧 执行了命令"])
-        self.assertFalse(any("正在执行" in line for line in sent))
+        box = _box(
+            "工具 · 3 步 · 执行了命令",
+            consumer._BOX_SEP,
+            "1. bash · 列出目录",
+            "2. bash · 列出目录",
+            "3. bash · 列出目录",
+            consumer._BOX_SEP,
+            "思考 · 想想",
+        )
+        self.assertEqual(sent, [box])
+
+
+class BoxRuleTest(unittest.TestCase):
+    """发框规则：无工具无思考 → 不发框；只有思考 → 发；四档统一收口为一条框。"""
+
+    def test_no_tool_no_thinking_no_box(self):
+        # 整轮既无工具步也无思考 → 不发框（只留起止标记）。
+        events = [
+            {"type": "turn_start", "turn": 1},
+            {"type": "turn_end", "turn": 1, "reason": "stop"},
+            {"type": "status", "state": "completed"},
+        ]
+        sent = _std_run(events)
+        self.assertEqual(sent, ["🚀 第 1 轮", "✅ 完成"])
+        self.assertFalse(any(line.startswith("```text") for line in sent))
+
+    def test_only_thinking_sends_box(self):
+        # 只有思考、无工具 → 发只含思考行的框（无组头、无分隔线）。
+        for level in ("standard", "detailed", "verbose"):
+            with self.subTest(level=level):
+                events = [
+                    {"type": "thinking", "text": "让我想想"},
+                    {"type": "turn_end", "turn": 1, "reason": "stop"},
+                ]
+                sent = _level_run(events, level)
+                self.assertEqual(sent, [_box("思考 · 让我想想")])
+
+    def test_compact_only_thinking_label(self):
+        # compact 档只有思考 → 框内仅「思考」标签，无预览。
+        events = [
+            {"type": "thinking", "text": "让我想想"},
+            {"type": "turn_end", "turn": 1, "reason": "stop"},
+        ]
+        sent = _level_run(events, "compact")
+        self.assertEqual(sent, [_box("思考")])
+
+
+class RenderProcessBoxTest(unittest.TestCase):
+    """render_process_box 纯函数：四档框排版逐行断言 + 密度差异 + 围栏闭合。"""
+
+    def test_compact_header_only_plus_thinking_label(self):
+        body = consumer.render_process_box(_THREE_STEPS, "让我先想想", "compact")
+        self.assertEqual(body.splitlines(), [_THREE_HEADER, "思考"])
+
+    def test_compact_with_tools_no_thinking_header_only(self):
+        # 整轮只有工具、无思考：compact 框内只剩组头一行（非空框）。
+        body = consumer.render_process_box(_THREE_STEPS, None, "compact")
+        self.assertEqual(body.splitlines(), [_THREE_HEADER])
+
+    def test_standard_step_lines_no_result(self):
+        body = consumer.render_process_box(_THREE_STEPS, "让我先想想", "standard")
+        self.assertEqual(
+            body.splitlines(),
+            [
+                _THREE_HEADER,
+                consumer._BOX_SEP,
+                "1. bash · 列出目录",
+                "2. read · 读取文件（a.txt）",
+                "3. grep · 查找（foo）",
+                consumer._BOX_SEP,
+                "思考 · 让我先想想",
+            ],
+        )
+
+    def test_detailed_step_and_result_lines(self):
+        body = consumer.render_process_box(_THREE_STEPS, "让我先想想", "detailed")
+        self.assertEqual(
+            body.splitlines(),
+            [
+                _THREE_HEADER,
+                consumer._BOX_SEP,
+                "1. bash · ls",
+                "   ↳ file1",
+                "2. read · cat /a.txt",
+                "   ↳ content",
+                "3. grep · grep foo",
+                "   ↳ 12 hits",
+                consumer._BOX_SEP,
+                "思考 · 让我先想想",
+            ],
+        )
+
+    def test_verbose_full_result_multiline(self):
+        body = consumer.render_process_box(_THREE_STEPS, "让我先想想", "verbose")
+        self.assertEqual(
+            body.splitlines(),
+            [
+                _THREE_HEADER,
+                consumer._BOX_SEP,
+                "1. bash · ls",
+                "   ↳ file1",
+                "      file2",
+                "2. read · cat /a.txt",
+                "   ↳ content",
+                "3. grep · grep foo",
+                "   ↳ 12 hits",
+                consumer._BOX_SEP,
+                "思考 · 让我先想想",
+            ],
+        )
+
+    def test_verbose_argument_not_truncated_detailed_is(self):
+        # 密度差异：verbose 参数与结果不截断，detailed 截断。
+        long_arg = "x" * 300
+        long_result = "r" * 300
+        steps = [{"name": "bash", "arguments": long_arg, "result": long_result}]
+        verbose = consumer.render_process_box(steps, None, "verbose")
+        detailed = consumer.render_process_box(steps, None, "detailed")
+        self.assertIn(long_arg, verbose)          # verbose 参数完整
+        self.assertIn(long_result, verbose)       # verbose 结果完整
+        self.assertNotIn(long_arg, detailed)      # detailed 参数截断
+        self.assertNotIn(long_result, detailed)   # detailed 结果截断
+        self.assertIn("…", detailed)              # 截断标记
+
+    def test_separator_only_when_steps_present(self):
+        # 只有思考：无组头、无分隔线。
+        body = consumer.render_process_box([], "想想", "standard")
+        self.assertEqual(body.splitlines(), ["思考 · 想想"])
+        # 无步骤无思考：空串（调用方不发框）。
+        self.assertEqual(consumer.render_process_box([], None, "standard"), "")
+
+    def test_box_fence_balanced(self):
+        # 代码框组（含 ```text 围栏）恰好一对围栏（开 + 闭）。
+        box = _box(*consumer.render_process_box(_THREE_STEPS, "让我先想想", "verbose").splitlines())
+        self.assertEqual(box.count("```"), 2)
+
+    def test_long_box_chunks_keep_fence_closed(self):
+        # 超长框按 _split_fenced_chunks 分块后每块围栏闭合（偶数个 ```）。
+        steps = [{"name": "bash", "arguments": "echo " + "x" * 500, "result": "y" * 900}] * 40
+        body = consumer.render_process_box(steps, "让我先想想" * 200, "verbose")
+        fenced = consumer._fence(body, consumer._BOX_FENCE_LANG)
+        chunks = consumer._split_fenced_chunks(fenced, limit=800)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertEqual(chunk.count("```") % 2, 0, f"unbalanced fence: {chunk[:80]!r}")
 
 
 class NoRegressionTest(unittest.TestCase):
-    """compact / detailed / verbose 逐字不回归（组推送只影响 standard）。"""
+    """四档统一代码框组后，非过程事件（起止标记 / 叙述 / 终态）逐字不回归。"""
 
     _EVENTS = [
         {"type": "turn_start", "turn": 1},
@@ -336,36 +500,24 @@ class NoRegressionTest(unittest.TestCase):
         {"type": "status", "state": "completed"},
     ]
 
-    def test_detailed_per_step_unchanged(self):
+    def test_detailed_single_box(self):
         sent = _level_run(self._EVENTS, "detailed")
-        self.assertEqual(
-            sent,
-            [
-                "🚀 第 1 轮",
-                "🔧 `bash`\n```bash\ngit log\n```",
-                "📋 `bash` 完成\n```\na1b2c3\n```",
-                "📖 输出完成",
-                "📖 叙述",
-                "✅ 完成",
-            ],
+        box = _box(
+            "工具 · 1 步 · 执行了命令",
+            consumer._BOX_SEP,
+            "1. bash · git log",
+            "   ↳ a1b2c3",
         )
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "📖 输出完成", "📖 叙述", "✅ 完成"])
 
-    def test_verbose_per_step_unchanged(self):
-        sent = _level_run(self._EVENTS, "verbose")
-        # 短文本下 verbose 与 detailed 逐字一致（tool_call/tool_result 逐条）。
-        self.assertEqual(sent, _level_run(self._EVENTS, "detailed"))
+    def test_verbose_equals_detailed_short(self):
+        # 短文本下 verbose 与 detailed 逐字一致（结果/参数均不截断时）。
+        self.assertEqual(_level_run(self._EVENTS, "verbose"), _level_run(self._EVENTS, "detailed"))
 
-    def test_compact_no_tool_lines_unchanged(self):
+    def test_compact_header_only_box(self):
         sent = _level_run(self._EVENTS, "compact")
-        self.assertEqual(
-            sent,
-            [
-                "🚀 第 1 轮",
-                "📖 输出完成",
-                "📖 叙述",
-                "✅ 完成",
-            ],
-        )
+        box = _box("工具 · 1 步 · 执行了命令")
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "📖 输出完成", "📖 叙述", "✅ 完成"])
         self.assertFalse(any("🔧" in line or "📋" in line for line in sent))
 
 

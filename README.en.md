@@ -11,40 +11,49 @@ session" continuity onto `contextId`.
 ### Live stream
 
 When a dsh task is submitted, this plugin consumes the SSE stream and pushes
-intermediate progress back to the messaging surface in real time. The live
-sequence a user sees in Feishu / QQ looks like this (commands and results are
-rendered as code blocks):
+intermediate progress back to the messaging surface in real time. As of v0.5.0 a
+turn's **tool steps and its settled thinking are folded into one code block**,
+serving as **one group in one message** (the first line inside is the group header,
+visible even when collapsed). The live sequence a user sees in Feishu / QQ looks
+roughly like this (`standard`, the default tier of the dsh in production today):
 
+````text
+🚀 第 1 轮
+```text
+工具 · 8 步 · 执行了命令，已读取文件，已搜索代码等
+──────────────────────────────
+1. bash  · 查看 git 提交记录
+2. read  · 读取文件（config.yaml）
+3. grep  · 查找（TODO）
+4. bash  · echo 2
+5. edit  · /tmp/a
+6. bash  · echo 3
+7. write · /tmp/b
+8. bash  · echo 4
+──────────────────────────────
+思考 · 我先把目录结构列出来确认范围…
 ```
-🚀 开始执行
-🧠 思考中…
-🔧 `bash`                    <- tool call, command in a code block
-    ┌─ ```bash
-    │  ls -la /tmp
-    └─ ```
-📋 `bash` 完成               <- tool result, output in a code block
-    ┌─ ```
-    │  total 4
-    │  drwxrwxrwt  2 root root 40 Sep 11 14:00 .
-    └─ ```
-📖 输出完成                  <- long result rendered as a code block
+📖 输出完成
 ✅ 完成
-```
+````
+
+> Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; the step
+> summaries are plain-language (1. "view git log"; 2. "read file (config.yaml)";
+> 3. "find (TODO)"; 4–8. `echo 2` / `/tmp/a` / `echo 3` / `/tmp/b` / `echo 4`); the
+> last segment is "Thinking · <first-line preview>".
+
+All four tiers (`compact` / `standard` / `detailed` / `verbose`) send this one box;
+only the **in-box density** differs: `compact` is the header plus a "思考" label only
+(no step line), `standard` uses plain-language step summaries, `detailed` adds step
+arguments + `↳ first result line`, and `verbose` leaves arguments / results and the
+full thinking text untruncated. A turn with **neither a tool step nor thinking sends
+no box** (never an empty box); thinking with no tool sends a box containing only the
+thinking line. The group header carries **no turn number** — the independent
+`🚀 第 N 轮` marker already sits above it.
 
 Long text exceeding the gateway's per-message limit is split at code-block
 boundaries; continuation chunks are joined with a `⏩ 续` marker, so code blocks
-never break across chunks.
-
-> The sample above is the `detailed` tier — tool commands and results go into code
-> blocks and thinking gets its own line (`🧠 思考中…`). By default `follow-dsh`
-> follows dsh's current tier, and the dsh "Work
-> details" value in production today is `standard`, so the live stream is **group
-> push**: each turn closes into one closed-state line (e.g.
-> `🔧 已读取文件并搜索代码` — "Read files and searched code"), `thinking` is **folded
-> into the group, never pushed on its own**, with a heartbeat line
-> `🔧 正在执行 · 第 N 步 · ...` every 6 steps, **no longer two lines per step**; to get
-> the per-step look above, set `collector.live_detail: detailed` (or `verbose`) — a
-> one-line rollback.
+never break across chunks (the fence stays closed).
 
 ### Code blocks
 
@@ -69,14 +78,16 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 Progress display and intermediate-event push are both configurable
 (`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
 `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
-default `follow-dsh` to follow dsh's current tier; `standard` is **group push** — one
-closing line per turn (`thinking` folded into the group, never pushed on its own) plus a
-heartbeat every 6 steps, while `detailed` / `verbose` send
-per-step lines with code blocks; `collector.events` for the event stream — off is quiet
-mode, pushing the final result only, and it **outranks the tier**; code-block rendering
-stays as the internal style for a tier and is no longer a standalone switch), and can be
-toggled or selected from the "A2A live switches" panel on the Dashboard "Plugins" page
-(instant effect) — see [CONFIGURATION.en.md](CONFIGURATION.en.md).
+default `follow-dsh` to follow dsh's current tier; all four use **one code-box group
+per turn**, whose first line is the group header `工具 · N 步 · <类别串>`, differing
+only in in-box density: `compact` header + "思考" label, `standard` plain-language
+step summaries, `detailed` arguments + `↳ first result line`, `verbose` arguments /
+results and full thinking text untruncated; `collector.events` for the event stream —
+off is quiet mode, pushing the final result only, and it **outranks the tier**;
+code-block rendering stays as the internal style for a tier and is no longer a
+standalone switch), and can be toggled or selected from the "A2A live switches" panel
+on the Dashboard "Plugins" page (instant effect) — see
+[CONFIGURATION.en.md](CONFIGURATION.en.md).
 
 ## Architecture
 

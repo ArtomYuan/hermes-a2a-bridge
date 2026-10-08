@@ -247,11 +247,21 @@ _EXPECTED_KINDS = [
 ]
 
 # consume_stream / Throttler 期望的发送行序列（min_interval=0）。
-# tool_call / tool_result 的操作内容现以 ``` 代码框输出（emoji 前缀 + 工具名在框外）。
+# v0.5.0：一轮内的 tool_call / tool_result / thinking 统一收口为一条 ```text 代码框
+# 组消息（默认档 detailed），替换 v0.4.1 的「🧠 思考中… / 🔧 / 📋」逐条行。
+_BOX_BODY = "\n".join(
+    [
+        "工具 · 1 步 · 已调用工具",
+        consumer._BOX_SEP,
+        "1. shell_exec · ls",
+        "   ↳ total 4",
+        consumer._BOX_SEP,
+        "思考 · 让我先想想",
+    ]
+)
+_EXPECTED_BOX = "```text\n" + _BOX_BODY + "\n```"
 _EXPECTED_SENT = [
-    "🧠 思考中…",
-    "🔧 `shell_exec`\n```bash\nls\n```",
-    "📋 `shell_exec` 完成\n```\ntotal 4\nfile1.txt\nfile2.txt\nfile3.txt\n```",
+    _EXPECTED_BOX,
     "📖 正在查看当前目录…",
     "📖 输出完成",
     "✅ 完成",
@@ -323,12 +333,12 @@ class ToolCallSummaryTest(unittest.TestCase):
         self.assertEqual(consumer.summarize_tool_call("   "), "")
 
     def test_content_true_keeps_full_command(self):
-        # content=true 不受摘要逻辑影响：仍是工具名 + 命令代码框。
+        # v0.5.0：tool_call 四档均不再单独成行（统一由代码框组承载），返回 None。
         line = consumer.render_line(
             {"type": "tool_call", "name": "bash", "arguments": "git log --oneline -3"},
             content=True,
         )
-        self.assertEqual(line, "🔧 `bash`\n```bash\ngit log --oneline -3\n```")
+        self.assertIsNone(line)
 
 
 class ParseAndNormalizeTest(unittest.TestCase):
@@ -394,37 +404,32 @@ class RenderLineTest(unittest.TestCase):
         self.assertEqual(consumer.render_line({"type": "turn_start", "turn": 3}), "🚀 第 3 轮")
 
     def test_thinking(self):
-        self.assertEqual(consumer.render_line({"type": "thinking", "text": "x"}), "🧠 思考中…")
+        # v0.5.0：thinking 四档均不再单独成行（由代码框组承载）。
+        self.assertIsNone(consumer.render_line({"type": "thinking", "text": "x"}))
 
     def test_tool_call(self):
-        self.assertEqual(
+        # v0.5.0：tool_call 四档均不再单独成行（由代码框组承载）。
+        self.assertIsNone(
             consumer.render_line({"type": "tool_call", "name": "shell_exec", "arguments": "ls"}),
-            "🔧 `shell_exec`\n```bash\nls\n```",
         )
 
     def test_tool_call_no_arguments(self):
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call", "name": "shell_exec"}),
-            "🔧 调用工具 `shell_exec`",
-        )
+        self.assertIsNone(consumer.render_line({"type": "tool_call", "name": "shell_exec"}))
 
     def test_tool_result_with_summary(self):
-        line = consumer.render_line({"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt\nfile2.txt\nfile3.txt"})
-        self.assertEqual(
-            line,
-            "📋 `shell_exec` 完成\n```\ntotal 4\nfile1.txt\nfile2.txt\nfile3.txt\n```",
+        self.assertIsNone(
+            consumer.render_line(
+                {"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt\nfile2.txt\nfile3.txt"}
+            )
         )
 
     def test_tool_result_empty_text(self):
-        self.assertEqual(
-            consumer.render_line({"type": "tool_result", "name": "t", "text": ""}),
-            "📋 `t` 完成",
-        )
+        self.assertIsNone(consumer.render_line({"type": "tool_result", "name": "t", "text": ""}))
 
     def test_tool_result_fence_is_balanced(self):
-        line = consumer.render_line({"type": "tool_result", "name": "t", "text": "a\nb\nc"})
-        # 代码框只有一对围栏（开 + 闭），无未闭合围栏。
-        self.assertEqual(line.count("```"), 2)
+        # v0.5.0：tool_result 不再单独成行，围栏平衡改由 render_process_box 承载
+        # （见 RenderProcessBoxTest.test_box_fence_balanced）。
+        self.assertIsNone(consumer.render_line({"type": "tool_result", "name": "t", "text": "a\nb\nc"}))
 
     def test_text_non_final_truncated(self):
         line = consumer.render_line({"type": "text", "text": "y" * 300, "final": False})
@@ -457,8 +462,9 @@ class RenderLineTest(unittest.TestCase):
 
     def test_inner_fence_escaped(self):
         # 结果正文含 ``` 时，内层围栏被转义，外层围栏仍闭合（恰 2 个围栏）。
+        # v0.5.0 起该转义由 _fence 在代码框组（render_process_box）上承载。
         text = "code:\n```\nprint(1)\n```\ndone"
-        line = consumer.render_line({"type": "tool_result", "name": "t", "text": text})
+        line = consumer._fence(text)
         self.assertEqual(line.count("```"), 2)
         # 内层 ``` 已转义为 零宽空格 形式，不再作为围栏。
         self.assertIn("`\u200b``", line)
@@ -479,37 +485,33 @@ class RenderLineCodeBlocksTest(unittest.TestCase):
     """code_blocks 开关：true 时框化，false 时纯文本（无围栏、内容完整）。"""
 
     def test_tool_call_code_blocks_false_plain(self):
+        # v0.5.0：tool_call 四档均不再单独成行，code_blocks 开关不再影响它。
         line = consumer.render_line(
             {"type": "tool_call", "name": "shell_exec", "arguments": "ls -la"},
             code_blocks=False,
         )
-        self.assertNotIn("```", line)
-        self.assertEqual(line, "🔧 调用工具 `shell_exec`：ls -la")
+        self.assertIsNone(line)
 
     def test_tool_call_code_blocks_true_fenced(self):
         line = consumer.render_line(
             {"type": "tool_call", "name": "shell_exec", "arguments": "ls"},
             code_blocks=True,
         )
-        self.assertIn("```bash", line)
-        self.assertEqual(line.count("```"), 2)
+        self.assertIsNone(line)
 
     def test_tool_result_code_blocks_false_plain(self):
         line = consumer.render_line(
             {"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt"},
             code_blocks=False,
         )
-        self.assertNotIn("```", line)
-        # 纯文本下内容完整（不截断）。
-        self.assertIn("total 4", line)
-        self.assertIn("file1.txt", line)
+        self.assertIsNone(line)
 
     def test_tool_result_code_blocks_true_fenced(self):
         line = consumer.render_line(
             {"type": "tool_result", "name": "shell_exec", "text": "total 4\nfile1.txt"},
             code_blocks=True,
         )
-        self.assertEqual(line.count("```"), 2)
+        self.assertIsNone(line)
 
     def test_final_text_code_blocks_false_plain_complete(self):
         final_text = "line\n" * 10
@@ -560,49 +562,41 @@ class RenderLineContentTest(unittest.TestCase):
         )
 
     def test_content_false_hides_thinking(self):
-        # standard（content=False）下思考并入步骤组，不再单独渲染一行（行为变更）。
+        # v0.5.0：thinking 四档均并入代码框组，不再单独渲染一行（行为变更）。
         self.assertIsNone(
             consumer.render_line({"type": "thinking", "text": "让我想想"}, content=False)
         )
 
     def test_content_false_tool_result_marker_only(self):
+        # v0.5.0：tool_result 四档均不再单独成行（由代码框组承载），内容不泄露。
         line = consumer.render_line(
             {"type": "tool_result", "name": "shell_exec", "text": "total 4\nSECRET-OUTPUT"},
             content=False,
         )
-        self.assertEqual(line, "📋 `shell_exec` 完成")
-        self.assertNotIn("total 4", line)
-        self.assertNotIn("SECRET-OUTPUT", line)
+        self.assertIsNone(line)
 
     def test_content_false_tool_result_empty_name(self):
-        self.assertEqual(
-            consumer.render_line({"type": "tool_result", "name": "", "text": "x"}, content=False),
-            "📋 工具完成",
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_result", "name": "", "text": "x"}, content=False)
         )
 
     def test_content_false_keeps_control_events(self):
-        # 起止标记照常渲染；工具调用把命令换成人话摘要（不再是命令全文）。
+        # 起止标记照常渲染；tool_call / tool_result 不再单独成行（进代码框组）。
         self.assertEqual(
             consumer.render_line({"type": "turn_start", "turn": 2}, content=False),
             "🚀 第 2 轮",
         )
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, content=False),
-            "🔧 `bash` · 列出目录",
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, content=False)
         )
-        # 无参数：只有工具名（没有摘要可给）。
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call", "name": "bash"}, content=False),
-            "🔧 `bash`",
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call", "name": "bash"}, content=False)
         )
-        # name 缺失：退化为「🔧 <摘要>」/「🔧 工具调用」。
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call", "arguments": "ls"}, content=False),
-            "🔧 列出目录",
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call", "arguments": "ls"}, content=False)
         )
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call"}, content=False),
-            "🔧 工具调用",
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call"}, content=False)
         )
         self.assertEqual(
             consumer.render_line({"type": "status", "state": "completed"}, content=False),
@@ -659,6 +653,8 @@ class ThrottlerTest(unittest.TestCase):
         self.assertEqual(sent, ["📖 块内容"])
 
     def test_high_signal_each_passed(self):
+        # v0.5.0：thinking / tool_call / tool_result 进组缓冲，turn_start 触发收口为
+        # 一条代码框组消息，随后才是轮次标记行。
         events = [
             {"type": "thinking", "text": "a"},
             {"type": "tool_call", "name": "x", "arguments": "ls"},
@@ -666,21 +662,23 @@ class ThrottlerTest(unittest.TestCase):
             {"type": "turn_start", "turn": 1},
         ]
         sent = self._run(events)
-        self.assertEqual(
-            sent,
+        box = "```text\n" + "\n".join(
             [
-                "🧠 思考中…",
-                "🔧 `x`\n```bash\nls\n```",
-                "📋 `x` 完成\n```\nr\n```",
-                "🚀 第 1 轮",
-            ],
-        )
+                "工具 · 1 步 · 已调用工具",
+                consumer._BOX_SEP,
+                "1. x · ls",
+                "   ↳ r",
+                consumer._BOX_SEP,
+                "思考 · a",
+            ]
+        ) + "\n```"
+        self.assertEqual(sent, [box, "🚀 第 1 轮"])
 
     def test_rate_limit_drops_nothing_with_zero_interval(self):
-        # min_interval=0 → 不等待，高信号全放行（时间测试不做，只验证不抛错）。
+        # min_interval=0 → 不等待；thinking 全部进组缓冲（不收口则不发出）。
         events = [{"type": "thinking", "text": str(i)} for i in range(5)]
         sent = self._run(events, min_interval=0.0)
-        self.assertEqual(len(sent), 5)
+        self.assertEqual(len(sent), 0)
 
     def test_verbose_flush_does_not_truncate(self):
         # verbose 档：非 final text 聚合 flush 不截断；其余档截断 120。
@@ -857,7 +855,7 @@ class ConsumeStreamTest(unittest.TestCase):
         )
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
-        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(stats["messages_sent"], 4)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
         self.assertEqual(sent, _EXPECTED_SENT)
 
@@ -953,7 +951,7 @@ class ConsumeStreamEventsTest(unittest.TestCase):
 
     def test_events_true_matches_current(self):
         stats, sent = self._run(True)
-        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(stats["messages_sent"], 4)
         self.assertEqual(sent, _EXPECTED_SENT)
 
 
@@ -995,31 +993,35 @@ class ConsumeStreamContentTest(unittest.TestCase):
 
     def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
-        # content=false（standard 档）把工具步收敛为组推送：一轮的 tool_call +
-        # tool_result 不再逐条，收口为一条关闭态组行（🔧 <活动种类标题>）；操作流
-        # （📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常；思考并入组、不单独发「🧠 思考中…」。
+        # content=false（standard 档）把一轮的 tool_call + tool_result + thinking 收口
+        # 为一条 ```text 代码框组消息（组头 + 每步「工具名 · 人话摘要」+ 思考首行预览）；
+        # 操作流（📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常。
+        box = "```text\n" + "\n".join(
+            [
+                "工具 · 1 步 · 已调用工具",
+                consumer._BOX_SEP,
+                "1. shell_exec · 列出目录",
+                consumer._BOX_SEP,
+                "思考 · 让我先想想",
+            ]
+        ) + "\n```"
         self.assertEqual(
             sent,
             [
-                "🔧 已调用工具",
+                box,
                 "📖 正在查看当前目录…",
                 "📖 输出完成",
                 "✅ 完成",
             ],
         )
-        # 细节不泄露：不出现命令正文 / 输出正文 / 任何代码框。
+        # 细节不泄露：standard 无结果行，命令正文 / 输出正文不出现。
         for line in sent:
-            self.assertNotIn("```", line)
             self.assertNotIn("ls\n", line)
             self.assertNotIn("total 4", line)
             self.assertNotIn("file1.txt", line)
-        # 工具步不再逐条：只有一条 🔧 关闭态组行，且无 📋 逐条完成行。
-        self.assertEqual(
-            [line for line in sent if "🔧" in line],
-            ["🔧 已调用工具"],
-        )
+        # 不再有 🔧 / 📋 / 🧠 逐条行（统一由框承载）。
+        self.assertFalse(any("🔧" in line for line in sent))
         self.assertFalse(any("📋" in line for line in sent))
-        # 思考全文不出现（并入组，不单独发）。
         self.assertFalse(any("🧠" in line for line in sent))
         # stats 完整性不变：final_text / events_seen / states 仍完整统计。
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
@@ -1055,14 +1057,14 @@ class ConsumeStreamContentTest(unittest.TestCase):
 
     def test_content_true_matches_current(self):
         stats, sent = self._run(True)
-        self.assertEqual(stats["messages_sent"], 6)
+        self.assertEqual(stats["messages_sent"], 4)
         self.assertEqual(sent, _EXPECTED_SENT)
 
     def test_content_false_mixed_stream_with_turn_start(self):
         # 混合流：turn_start + thinking + tool_call + tool_result + 非 final text
         # + final text + turn_end + 终态 status。content=false（standard 档）下
-        # 工具步收敛为一条关闭态组行（🔧 <活动种类标题>），正文 / 输出 / 思考全文
-        # 不出现；操作流（🚀 起止标记 / 📖 叙述与最终）照常；思考并入组、不发单独行。
+        # 一轮收口为一条代码框组消息（组头 + 逐步行摘要 + 思考首行预览）；操作流
+        # （🚀 起止标记 / 📖 叙述与最终）照常；框先于触发的最终文本行发出。
         results = [
             {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
             _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
@@ -1087,26 +1089,32 @@ class ConsumeStreamContentTest(unittest.TestCase):
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
             min_interval=0.0, content=False,
         )
-        # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；思考并入组、不单独发；
-        # 工具步收口为一条关闭态组行（shell_exec 未知 → tools 兜底 → 已调用工具），
-        # 组行先于触发的最终文本行发出。
+        # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；工具步收口为一条代码框组
+        # 消息（shell_exec 未知 → tools 兜底 → 已调用工具；standard 逐步行 = 人话摘要），
+        # 框先于触发的最终文本行发出。
+        box = "```text\n" + "\n".join(
+            [
+                "工具 · 1 步 · 已调用工具",
+                consumer._BOX_SEP,
+                "1. shell_exec · 列出目录",
+                consumer._BOX_SEP,
+                "思考 · 内部推理线索ALPHA",
+            ]
+        ) + "\n```"
         self.assertEqual(
             sent,
             [
                 "🚀 第 1 轮",
-                "🔧 已调用工具",
+                box,
                 "📖 输出完成",
                 "📖 中间叙述正文",
                 "✅ 完成",
             ],
         )
+        # standard 无结果行：命令正文 / 输出正文不出现；无 🧠 单独行。
         for line in sent:
-            # 细节（参数 / 输出 / 思考全文）不出现。
             self.assertNotIn("ls /tmp", line)
             self.assertNotIn("file1.txt", line)
-            self.assertNotIn("内部推理线索ALPHA", line)
-            self.assertNotIn("```", line)
-        # 思考不单独发「🧠 思考中…」行。
         self.assertFalse(any("🧠" in line for line in sent))
         # stats 完整：final_text 仍记录（📬 送达依赖它）。
         self.assertEqual(stats["final_text"], "最终结果正文")
@@ -1119,13 +1127,12 @@ class LiveDetailLevelTest(unittest.TestCase):
     """四档渲染（render_line 的 level 参数）：逐事件断言 + 与旧 content 的等价性 + 终态不丢。"""
 
     def test_level_parameter_overrides_content(self):
-        # level 显式给定时忽略 content（content=False 也不影响 detailed 档）。
-        self.assertEqual(
+        # v0.5.0：tool_call 四档均不再单独成行，level 与 content 皆不影响（返回 None）。
+        self.assertIsNone(
             consumer.render_line(
                 {"type": "tool_call", "name": "bash", "arguments": "ls"},
                 content=False, level="detailed",
-            ),
-            "🔧 `bash`\n```bash\nls\n```",
+            )
         )
 
     def test_standard_equals_content_false(self):
@@ -1180,13 +1187,14 @@ class LiveDetailLevelTest(unittest.TestCase):
         self.assertEqual(consumer.render_line({"type": "status", "state": "completed"}, level="compact"), "✅ 完成")
 
     def test_standard_tool_call_summary_no_code_block(self):
+        # v0.5.0：tool_call 不再单独成行（标准档也进代码框组，摘要由 render_process_box 承载）。
         line = consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "ls"}, level="standard")
-        self.assertEqual(line, "🔧 `bash` · 列出目录")
-        self.assertNotIn("```", line)
+        self.assertIsNone(line)
 
     def test_detailed_tool_call_full_code_block(self):
+        # v0.5.0：tool_call 不再单独成行（detailed 档也进代码框组）。
         line = consumer.render_line({"type": "tool_call", "name": "bash", "arguments": "git log"}, level="detailed")
-        self.assertEqual(line, "🔧 `bash`\n```bash\ngit log\n```")
+        self.assertIsNone(line)
 
     def test_verbose_text_not_truncated(self):
         long = "x" * 300
@@ -1200,10 +1208,14 @@ class LiveDetailLevelTest(unittest.TestCase):
         self.assertTrue(detailed.endswith("…"))
 
     def test_verbose_tool_call_equals_detailed(self):
+        # v0.5.0：tool_call 四档均不再单独成行；verbose 与 detailed 的参数不截断差异
+        # 由 render_process_box 承载（见 RenderProcessBoxTest），render_line 返回 None。
         args = "x" * 200
-        self.assertEqual(
-            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="verbose"),
-            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="detailed"),
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="verbose")
+        )
+        self.assertIsNone(
+            consumer.render_line({"type": "tool_call", "name": "bash", "arguments": args}, level="detailed")
         )
 
     def test_terminal_and_final_always_sent_all_levels(self):

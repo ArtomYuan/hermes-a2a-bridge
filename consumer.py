@@ -39,19 +39,13 @@ _DEFAULT_TIMEOUT = 300
 # ``plugins.entries.hermes-a2a-bridge.settings.collector.enabled``，缺省即 False。
 DEFAULT_ENABLED = False
 
-# 高信号事件：逐条放行，不做 text 聚合。
-_HIGH_SIGNAL_TYPES = frozenset({"turn_start", "thinking", "tool_call", "tool_result"})
-
 # 触发 text 缓冲 flush 的终态（status 终态；turn_end 单独处理）。
 _TERMINAL_STATES = frozenset({"completed", "failed", "canceled"})
 
 # --------------------------------------------------------------------------
-# standard 档「步骤组」收敛：心跳步数、活动种类文案、工具名 → 种类映射。
+# 「代码框组」渲染（v0.5.0）：活动种类文案、工具名 → 种类映射。
 # 对齐 dsh message.stepProcess.done.* 措辞（见 ALIGN-FIX.md 修正 2/3）。
 # --------------------------------------------------------------------------
-
-# 组内累计每满这些步数发一条开放态心跳行。
-_GROUP_HEARTBEAT_STEPS = 6
 
 # 活动种类 → 关闭态中文文案（对齐 dsh message.stepProcess.done.*，逐字）。
 _TOOL_KIND_TEXT = {
@@ -651,16 +645,103 @@ def group_title(kinds: Iterable[str]) -> str:
     return title
 
 
-def render_group_heartbeat(step: int, summary: str = "") -> str:
-    """开放态组行（心跳）：``🔧 正在执行 · 第 N 步 · <最近一步摘要>``。"""
-    if summary:
-        return f"🔧 正在执行 · 第 {step} 步 · {summary}"
-    return f"🔧 正在执行 · 第 {step} 步"
+# 代码框组框内排版常量（v0.5.0，见 DESIGN-BOX.md §3.2，排版已冻结）。
+_BOX_SEP = "─" * 30             # 分隔线：仅当有逐步行时出现（逐步行前、思考段前各一次）
+_BOX_FENCE_LANG = "text"        # 代码框语言标签（无语法高亮）
+_BOX_ARG_LIMIT = 120            # detailed 档逐步行「参数（截断）」上限
+_BOX_RESULT_LIMIT = 120         # detailed 档结果行「结果首行（截断）」上限
+_THINKING_PREVIEW_LIMIT = 120   # standard/detailed 档思考「首行预览」截断上限
 
 
-def render_group_close(kinds: Iterable[str]) -> str:
-    """关闭态组行（收口）：``🔧 <活动种类标题>``。"""
-    return "🔧 " + group_title(kinds)
+def _raw_arguments(arguments: Any) -> str:
+    """把 tool_call 的 ``arguments`` 规范成原始参数文本（dict/list → 单行 JSON）。"""
+    if isinstance(arguments, (dict, list)):
+        return json.dumps(arguments, ensure_ascii=False)
+    return str(arguments or "").strip()
+
+
+def _box_step_argument(arguments: Any, level: str) -> str:
+    """逐步行参数段：多行参数压成单行；verbose 完整、detailed 截断（standard 不用此函数）。"""
+    flat = " ".join(_raw_arguments(arguments).split())
+    if level == "verbose":
+        return flat
+    return _truncate(flat, _BOX_ARG_LIMIT)
+
+
+def _box_step_result(result: Any, level: str) -> str:
+    """结果行正文：detailed 取首行截断；verbose 完整多行（续行缩进 6 空格）。"""
+    text = str(result or "")
+    lines = text.splitlines() or [""]
+    if level == "verbose":
+        rendered = lines[0]
+        for cont in lines[1:]:
+            rendered += "\n      " + cont
+        return rendered
+    return _truncate(lines[0], _BOX_RESULT_LIMIT)
+
+
+def _box_thinking(thinking_text: Any, level: str) -> str:
+    """思考段：compact 仅「思考」；standard/detailed 首行预览；verbose 完整多行。"""
+    if level == "compact":
+        return "思考"
+    text = str(thinking_text or "")
+    if not text.strip():
+        return "思考"
+    lines = text.splitlines()
+    if level == "verbose":
+        rendered = "思考 · " + lines[0]
+        for cont in lines[1:]:
+            rendered += "\n      " + cont
+        return rendered
+    return "思考 · " + _truncate(lines[0], _THINKING_PREVIEW_LIMIT)
+
+
+def render_process_box(
+    steps: Iterable[Dict[str, Any]],
+    thinking_text: Optional[str] = None,
+    level: Optional[str] = None,
+) -> str:
+    """把一轮的步骤明细与思考渲染为「代码框组」正文（不含外层围栏）。
+
+    纯函数（便于单测）：输入有序步骤明细（每项含 ``name`` / ``arguments`` /
+    ``result``）与思考文本，输出框内多行正文。四档排版与密度见 DESIGN-BOX.md §3.2/§3.3：
+
+    - 第 1 行组头 ``工具 · <N> 步 · <类别串>``（仅当有步骤时；不带轮次号）；
+    - 分隔线（30 个 ─）仅当有逐步行时出现（逐步行前；另有思考段时在其前再出现一次）；
+    - 逐步行 ``<i>. <工具名> · <参数/摘要>``（standard 用摘要，detailed/verbose 用参数）；
+    - 结果行 ``   ↳ <结果>``（仅 detailed/verbose；缩进 3 空格）；
+    - 末段思考 ``思考 · <预览或全文>``（compact 仅「思考」；``thinking_text`` 为 None 表示无思考）。
+
+    ``level`` 非四档时回落 detailed；``steps`` 为空且无思考时返回空串（调用方不发框）。
+    """
+    mode = level if level in LIVE_DETAIL_MODES else "detailed"
+    step_list = list(steps)
+    lines: list = []
+    if step_list:
+        kinds = [tool_activity_kind(s.get("name")) for s in step_list]
+        lines.append(f"工具 · {len(step_list)} 步 · {group_title(kinds)}")
+    has_steps = bool(step_list) and mode in ("standard", "detailed", "verbose")
+    if has_steps:
+        lines.append(_BOX_SEP)
+        for i, step in enumerate(step_list, 1):
+            name = str(step.get("name") or "")
+            if mode == "standard":
+                summary = summarize_tool_call(step.get("arguments"))
+                if name and summary:
+                    lines.append(f"{i}. {name} · {summary}")
+                elif name:
+                    lines.append(f"{i}. {name}")
+                else:
+                    lines.append(f"{i}. 工具调用")
+            else:
+                arg_text = _box_step_argument(step.get("arguments"), mode)
+                lines.append(f"{i}. {name} · {arg_text}" if name else f"{i}. {arg_text}")
+                lines.append(f"   ↳ {_box_step_result(step.get('result'), mode)}")
+    if thinking_text is not None:
+        if has_steps:
+            lines.append(_BOX_SEP)
+        lines.append(_box_thinking(thinking_text, mode))
+    return "\n".join(lines)
 
 
 def _to_bool(value: Any) -> bool:
@@ -770,78 +851,34 @@ def render_line(
 ) -> Optional[str]:
     """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
 
-    ``code_blocks=True``（默认）：操作内容（tool_call 命令 / tool_result 结果 /
-    长 final 文本）以 ``` 代码框输出，让飞书渲染为可滚动代码框；短文本
-    （thinking / 普通 text）保持普通行。``code_blocks=False``：所有内容回退
-    纯文本行（不包围栏、不做围栏转义），内容完整，飞书 / QQ 按普通文本渲染。
-    v0.3.0 起 ``code_blocks`` 仅是「内容显示时」的内部渲染方式，不再由配置
-    开关控制。
+    v0.5.0 起 ``tool_call`` / ``tool_result`` / ``thinking`` 在**四档均不再产出单独行**
+    ——一轮内的工具步骤与思考统一由 ``Throttler`` 收口为一条「代码框组」消息
+    （见 ``render_process_box``）。``render_line`` 只负责渲染起止标记（turn_start）、
+    叙述 / 最终文本（text）与终态（status）：
 
-    ``content``（遗留布尔，向后兼容）：``True`` ≡ ``detailed``、``False`` ≡ ``standard``。
-    ``level``（四档，优先于 ``content``）：``compact`` / ``standard`` / ``detailed`` /
-    ``verbose``。四档阶梯（``render_line`` 是唯一裁剪层）：
+    | 事件 | 四档行为 |
+    |---|---|
+    | turn_start | 🚀 轮次标记（四档同） |
+    | tool_call / tool_result / thinking | 一律返回 None（由代码框组承载） |
+    | text（叙述/final） | 发；verbose 不截断，其余档非 final 截断 120 |
+    | status 终态/错误 | 必发（四档同） |
 
-    | 事件 | compact | standard | detailed | verbose |
-    |---|---|---|---|---|
-    | turn_start | 🚀 轮次标记 | 同左 | 同左 | 同左 |
-    | tool_call | 不发 | 🔧 `name` · 摘要（无代码框） | 🔧 `name` + 参数代码框 | = detailed（不截断） |
-    | tool_result | 不发 | 仅 📋 `name` 完成 | 📋 `name` 完成 + 输出代码框 | = detailed（不截断） |
-    | thinking | 不发 | 不发（并入步骤组） | 🧠 思考中… | 同左 |
-    | text（叙述/final） | 发 | 发 | 发 | 发（不截断） |
-    | status 终态/错误 | 必发 | 必发 | 必发 | 必发 |
-
-    - ``standard`` ≡ 旧 ``content=False``；``detailed`` ≡ 旧 ``content=True``（向后兼容锚点）。
+    ``code_blocks`` 仅影响 text 内容显示样式（长 final 文本 / 代码特征文本是否以
+    代码框渲染）；``content``（遗留布尔）与 ``level``（四档，优先）经
+    ``resolve_live_detail`` 解析，只影响 text 的截断口径。
     - 任何档位都不吞终态（✅/❌/⚠️）、错误、final_text、stats。
     - ``collector.events=false``（安静模式）优先于档位（由 consume_stream 处理）。
     """
     mode = resolve_live_detail(content, level)
     etype = event.get("type")
-    # compact：不发思考与工具（调用/结果）行，只保留 turn_start / text / status 终态。
-    if mode == "compact" and etype in ("thinking", "tool_call", "tool_result"):
+    # tool_call / tool_result / thinking：四档统一由「代码框组」承载，不再单独成行。
+    if etype in ("thinking", "tool_call", "tool_result"):
         return None
-    # standard（≡ 旧 content=False）：tool_call → 摘要，tool_result → 仅完成标记。
-    if mode == "standard":
-        if etype == "tool_call":
-            name = event.get("name") or ""
-            summary = summarize_tool_call(event.get("arguments"))
-            if name and summary:
-                return f"🔧 `{name}` · {summary}"
-            if name:
-                return f"🔧 `{name}`"
-            if summary:
-                return f"🔧 {summary}"
-            return "🔧 工具调用"
-        if etype == "tool_result":
-            name = event.get("name") or ""
-            return f"📋 `{name}` 完成" if name else "📋 工具完成"
-        if etype == "thinking":
-            # 思考并入当前步骤组（由 Throttler 记为组成员），不再单独渲染一行。
-            return None
     if etype == "turn_start":
         turn = event.get("turn")
         if turn is not None:
             return f"🚀 第 {turn} 轮"
         return "🚀 开始执行"
-    if etype == "thinking":
-        return "🧠 思考中…"
-    if etype == "tool_call":
-        name = event.get("name") or ""
-        arguments = str(event.get("arguments") or "").strip()
-        if arguments:
-            if code_blocks:
-                # 命令正文进代码框，emoji 前缀 + 工具名留在框外。
-                return f"🔧 `{name}`\n{_fence(arguments, 'bash')}"
-            return f"🔧 调用工具 `{name}`：{arguments}"
-        return f"🔧 调用工具 `{name}`"
-    if etype == "tool_result":
-        name = event.get("name") or ""
-        text = str(event.get("text") or "").strip()
-        if text:
-            if code_blocks:
-                # 结果正文进代码框（无语言标签），emoji 前缀 + 工具名留在框外。
-                return f"📋 `{name}` 完成\n{_fence(text)}"
-            return f"📋 `{name}` 完成：{text}"
-        return f"📋 `{name}` 完成" if name else "📋 工具完成"
     if etype == "text":
         if event.get("final"):
             final_text = str(event.get("text") or "")
@@ -881,16 +918,15 @@ def render_line(
 # --------------------------------------------------------------------------
 
 class Throttler:
-    """聚合低信号 text、逐条放行高信号、standard 档把工具步收敛为组推送，并做限速。
+    """聚合低信号 text、四档统一把一轮内的工具步骤与思考收口为一条「代码框组」消息，并做限速。
 
-    - 高信号（turn_start / thinking / tool_call / tool_result / status 终态）逐条放行
-      （standard 档除外，见下）。
+    - ``tool_call`` / ``tool_result`` / ``thinking`` 在**四档**都进组缓冲，不逐条发出；
+      收口时由 ``render_process_box`` 渲染为一条 ```text 代码框消息（一条消息 = 一个框）。
     - 低信号 ``text``（非 final）只累积，不逐条发；在 ``turn_end`` 或 status 终态时
       flush 为一条 ``📖`` 行。
-    - standard 档：``tool_call`` / ``tool_result`` 进组缓冲，``thinking`` 作为组成员
-      （kind=thinking）并入当前组（不单独发一行、不计步骤）；每满
-      ``_GROUP_HEARTBEAT_STEPS`` 步发一条心跳（开放态行），遇 ``turn_end`` / 终态
-      status / final text / 新 ``turn_start`` 时收口为一条关闭态行，且组行先于触发行发出。
+    - 收口时机（沿用）：``turn_end``、终态 status、final text、新 ``turn_start``（上一轮
+      未发则先发）；框**先于**触发它的叙述 / 终态行发出。终态强制收口（组缓冲不丢信息）。
+    - 发空规则：该轮既无工具步也无思考 → 不发框；只有思考无工具 → 发只含「思考…」行的框。
     - 全局限速：相邻两次 send 至少间隔 ``min_interval`` 秒（默认 2.0）；不足则等待。
     - TODO(P2c): 软上限（单任务最多 30 条消息）本阶段不做。
     """
@@ -901,11 +937,9 @@ class Throttler:
         self.level = level if level in LIVE_DETAIL_MODES else None
         self._last_send = 0.0
         self._text_buf: list = []
-        # standard 档步骤组缓冲状态（其它档不使用）。
-        self._tool_steps = 0          # 本段累计工具步数（tool_call 计数，thinking 不计）。
-        self._tool_kinds: list = []   # 本段去重后的活动种类（首次出现顺序，仅工具步）。
-        self._has_thinking = False    # 本段是否出现过思考（空组收口时兜底为「已完成分析」）。
-        self._last_summary = ""       # 最近一步 tool_call 摘要（心跳用）。
+        # 代码框组缓冲（四档统一）：累积一轮内的步骤明细与思考文本，收口为一条框消息。
+        self._steps: list = []          # 步骤明细：{"name", "arguments", "result"}（一个 tool_call = 一步）
+        self._thinking_parts: list = []  # 思考文本片段（可多条，收口时以换行连接）
 
     def _flush_text(self) -> Optional[str]:
         if not self._text_buf:
@@ -918,36 +952,40 @@ class Throttler:
             return "📖 " + joined
         return "📖 " + _truncate(joined, 120)
 
-    def _buffer_tool_event(self, event: Dict[str, Any]) -> Optional[str]:
-        """standard 档把 tool_call / tool_result 收进组缓冲；到阈值时返回心跳行。"""
-        kind = tool_activity_kind(event.get("name"))
-        if kind not in self._tool_kinds:
-            self._tool_kinds.append(kind)
-        if event.get("type") == "tool_call":
-            self._tool_steps += 1
-            self._last_summary = summarize_tool_call(event.get("arguments"))
-            if self._tool_steps % _GROUP_HEARTBEAT_STEPS == 0:
-                return render_group_heartbeat(self._tool_steps, self._last_summary)
-        return None
+    def _buffer_process_event(self, event: Dict[str, Any]) -> None:
+        """把 tool_call / tool_result / thinking 收进代码框组缓冲（四档统一，不逐条发出）。"""
+        etype = event.get("type")
+        if etype == "tool_call":
+            self._steps.append(
+                {
+                    "name": event.get("name") or "",
+                    "arguments": event.get("arguments"),
+                    "result": "",
+                }
+            )
+        elif etype == "tool_result":
+            result = str(event.get("text") or "")
+            if self._steps:
+                self._steps[-1]["result"] = result
+            else:
+                # 异常流：无前导 tool_call 的 tool_result，补一步只含结果。
+                self._steps.append(
+                    {"name": event.get("name") or "", "arguments": "", "result": result}
+                )
+        elif etype == "thinking":
+            self._thinking_parts.append(str(event.get("text") or ""))
 
-    def _flush_tool_group(self) -> Optional[str]:
-        """收口当前步骤组（关闭态行），并清空组缓冲；空组（无工具且无思考）返回 None。
-
-        组内只有思考、没有工具步时，标题为「已完成分析」（对齐 dsh ``processTitle``
-        空 counts 的兜底）。
-        """
-        if not self._tool_kinds and not self._has_thinking:
+    def _flush_process_box(self) -> Optional[str]:
+        """收口当前代码框组为一条 ```text 框消息；空组（无工具且无思考）返回 None。"""
+        if not self._steps and not self._thinking_parts:
             return None
-        line = (
-            render_group_close(self._tool_kinds)
-            if self._tool_kinds
-            else render_group_close(["thinking"])
-        )
-        self._tool_kinds = []
-        self._tool_steps = 0
-        self._last_summary = ""
-        self._has_thinking = False
-        return line
+        thinking = "\n".join(self._thinking_parts) if self._thinking_parts else None
+        body = render_process_box(self._steps, thinking, self.level)
+        self._steps = []
+        self._thinking_parts = []
+        if not body.strip():
+            return None
+        return _fence(body, _BOX_FENCE_LANG)
 
     def _wait_interval(self) -> None:
         if self.min_interval <= 0:
@@ -959,37 +997,31 @@ class Throttler:
     def feed(self, event: Dict[str, Any], line: Optional[str]) -> list:
         """返回此刻应当发送的行列表（已做聚合与限速）。
 
-        ``event`` 用于判断信号高低与终态；``line`` 是该事件的 ``render_line`` 结果。
-        standard 档下 tool_call / tool_result / thinking 的 ``line`` 被忽略（进组缓冲）。
+        ``event`` 用于判断事件类型与终态；``line`` 是该事件的 ``render_line`` 结果。
+        tool_call / tool_result / thinking 的 ``line`` 恒为 None（四档统一由框承载），
+        这些事件在此进组缓冲。
         """
         if not isinstance(event, dict):
             return []
         etype = event.get("type")
         candidates: list = []
-        standard = self.level == "standard"
 
-        if standard and etype in ("tool_call", "tool_result"):
-            # 工具步进组缓冲，不逐条发出；到阈值时产出心跳行。
-            heartbeat = self._buffer_tool_event(event)
-            if heartbeat:
-                candidates.append(heartbeat)
-        elif standard and etype == "thinking":
-            # 思考并入当前组（kind=thinking）：不断组、不单独发一行、不计步骤。
-            self._has_thinking = True
-        elif standard and etype == "turn_start":
-            # 轮次切换：新 turn 到达时，若上一轮组未收口则先收口（组行先于轮次标记行）。
-            closed = self._flush_tool_group()
-            if closed:
-                candidates.append(closed)
+        if etype in ("tool_call", "tool_result", "thinking"):
+            # 进组缓冲（四档统一），不逐条发出。
+            self._buffer_process_event(event)
+        elif etype == "turn_start":
+            # 轮次切换：新 turn 到达时，若上一轮组未收口则先收口（框先于轮次标记行）。
+            box = self._flush_process_box()
+            if box:
+                candidates.append(box)
             if line:
                 candidates.append(line)
         elif etype == "text":
             if event.get("final"):
                 # 防御性收口：final 文本到达时残存组先收口，再发最终文本。
-                if standard:
-                    closed = self._flush_tool_group()
-                    if closed:
-                        candidates.append(closed)
+                box = self._flush_process_box()
+                if box:
+                    candidates.append(box)
                 if line:
                     candidates.append(line)
             else:
@@ -997,11 +1029,10 @@ class Throttler:
                 if text:
                     self._text_buf.append(text)
         elif etype == "turn_end":
-            # turn_end 触发收口：组行先于 turn_end flush 出的叙述 text 行。
-            if standard:
-                closed = self._flush_tool_group()
-                if closed:
-                    candidates.append(closed)
+            # turn_end 触发收口：框先于 turn_end flush 出的叙述 text 行。
+            box = self._flush_process_box()
+            if box:
+                candidates.append(box)
             flushed = self._flush_text()
             if flushed:
                 candidates.append(flushed)
@@ -1009,21 +1040,16 @@ class Throttler:
         elif etype == "status":
             state = event.get("state")
             if state in _TERMINAL_STATES:
-                # 终态强制收口：组行先于终态行；绝不丢步骤信息。
-                if standard:
-                    closed = self._flush_tool_group()
-                    if closed:
-                        candidates.append(closed)
+                # 终态强制收口：框先于终态行；绝不丢步骤信息。
+                box = self._flush_process_box()
+                if box:
+                    candidates.append(box)
                 flushed = self._flush_text()
                 if flushed:
                     candidates.append(flushed)
                 if line:
                     candidates.append(line)
             # working / submitted：line 为 None，不产生行
-        else:
-            # 非 standard 档的 turn_start / thinking / tool_call / tool_result：高信号逐条放行。
-            if etype in _HIGH_SIGNAL_TYPES and line:
-                candidates.append(line)
 
         out: list = []
         for c in candidates:
@@ -1183,11 +1209,11 @@ def consume_stream(
     发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
     ``content``（遗留布尔）与 ``level``（四档，优先）经 ``resolve_live_detail`` 解析为
     渲染档位：``content=False`` ≡ ``standard``、``content=True`` ≡ ``detailed``；显式
-    ``level``（compact/standard/detailed/verbose）优先于 ``content``。**操作流本身
-    不受档位影响**：text（含 final）与 turn_start / status 终态等起止标记照常渲染推送；
-    thinking 在 compact / standard 档不发（standard 下并入步骤组、compact 下收窄），
-    detailed / verbose 照常逐条。stats 完整性不受档位影响（final_text / events_seen /
-    states 仍完整统计，供上层「📬 最终结果送达」使用）。
+    ``level``（compact/standard/detailed/verbose）优先于 ``content``。v0.5.0 起四档统一
+    把一轮内的工具步骤与思考收口为一条「代码框组」消息（``render_process_box``），
+    ``render_line`` 不再为 tool_call / tool_result / thinking 产出单独行。text（含 final）
+    与 turn_start / status 终态等起止标记照常渲染推送；stats 完整性不受档位影响
+    （final_text / events_seen / states 仍完整统计，供上层「📬 最终结果送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
     "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
@@ -1219,8 +1245,8 @@ def consume_stream(
                 # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
                 if not events and not _is_final_event(event):
                     continue
-                # 内容/档位（content / level）只关闭「操作内细节」，由 render_line 在
-                # tool_call / tool_result / thinking 分支上收窄；操作流（text）
+                # 内容/档位（content / level）只决定框内密度与 text 截断口径，由
+                # render_line / render_process_box 在各自分支处理；操作流（text）
                 # 与其起止标记照常走 feed，因此这里不再跳过任何事件类型。
                 line = render_line(
                     event, code_blocks=code_blocks, level=mode

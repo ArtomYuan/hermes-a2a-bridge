@@ -3,7 +3,7 @@
   "label": "A2A 直播开关",
   "description": "A2A live switches — collector.enabled / events / live_detail（直播档位，四档 + 跟随 dsh）可视化开关；保存即时生效（热读），无需重启网关",
   "icon": "Settings",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "tab": {
     "path": "/hermes-a2a-bridge",
     "hidden": true

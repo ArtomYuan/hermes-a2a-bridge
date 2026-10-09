@@ -26,6 +26,15 @@ _spec = importlib.util.spec_from_file_location("hermes_a2a_bridge", _MODULE_PATH
 _MODULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_MODULE)
 
+# 结果送达的围栏形态由 consumer._fence 提供（生产同源）。这里加载真实 consumer，
+# 让 _FakeConsumer 暴露同一实现——断言测的是真实围栏，而非替身自造的围栏。
+_CONSUMER_PATH = os.path.join(_WORKTREE, "consumer.py")
+_consumer_spec = importlib.util.spec_from_file_location(
+    "hermes_a2a_bridge_consumer_override", _CONSUMER_PATH
+)
+_REAL_CONSUMER = importlib.util.module_from_spec(_consumer_spec)
+_consumer_spec.loader.exec_module(_REAL_CONSUMER)
+
 # 记录加载插件前就存在的相关模块（如有），便于测试尾部还原，避免污染其它用例。
 _PREEXISTING = {
     name: sys.modules.get(name)
@@ -102,6 +111,10 @@ class _FakeConsumer:
     """假 consumer 模块：记录 make_sender / consume_stream 调用。"""
 
     _DEFAULT_TIMEOUT = 300  # 与真实 consumer 一致，供 _coerce_timeout 的 default 兜底
+
+    # 与真实 consumer 同源的围栏渲染（结果送达正文用它包框）。
+    _fence = staticmethod(_REAL_CONSUMER._fence)
+    _split_fenced_chunks = staticmethod(_REAL_CONSUMER._split_fenced_chunks)
 
     def __init__(self):
         self.consume_stream_calls = []
@@ -305,19 +318,19 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["events"], True)
         self.assertEqual(call["level"], "detailed")
         self.assertIs(call["code_blocks"], True)
-        # 消息面（platform/chat_id 非空）→ 真 sender：直播（code_blocks=True）与
-        # 结果送达（code_blocks=False）各构造一次。
+        # 消息面（platform/chat_id 非空）→ 真 sender：直播与结果送达都构造一次，
+        # 两条路径都固定 code_blocks=True（内部样式：围栏感知分块）。
         self.assertEqual(len(consumer.make_sender_calls), 2)
         self.assertIs(consumer.make_sender_calls[0][1], True)
-        self.assertIs(consumer.make_sender_calls[1][1], False)
+        self.assertIs(consumer.make_sender_calls[1][1], True)
         self.assertIs(call["sender"], consumer.senders[0][1])
-        # 结果主动送达：📬 头行 + 全文，发到同一消息面。
+        # 结果主动送达：📬 头行在框**前** + 正文进裸围栏代码框，发到同一消息面。
         sent = consumer.senders[1][2]
         self.assertEqual(len(sent), 1)
         p, c, t, text = sent[0]
         self.assertEqual((p, c, t), ("feishu", "oc_x", "omt_y"))
         self.assertIn("📬 **dsh 任务完成，结果如下**", text)
-        self.assertTrue(text.endswith("\n\n收到"))
+        self.assertTrue(text.endswith("\n\n```\n收到\n```"))
 
     # 12. peer 配置的 timeout 传给 consume_stream（缺省回退 300）。
     def test_stream_dsh_call_passes_peer_timeout(self):
@@ -378,12 +391,13 @@ class HookTest(unittest.TestCase):
             _MODULE._CTX = None
         # 直播确实按 content=false 映射出的 standard 档渲染…
         self.assertIs(consumer.consume_stream_calls[0]["level"], "standard")
-        # …但结果送达照旧：一条消息、📬 头行 + 最终全文、发到同一消息面。
+        # …但结果送达照旧：一条消息、📬 头行 + 最终全文、发到同一消息面；
+        # v0.5.3 起正文以裸围栏代码框渲染，正文完整性不变。
         delivered = consumer.senders[1][2]
         self.assertEqual(len(delivered), 1)
         self.assertEqual(delivered[0][:3], ("feishu", "oc_x", ""))
         self.assertIn("📬 **dsh 任务完成，结果如下**", delivered[0][3])
-        self.assertTrue(delivered[0][3].endswith("\n\n收到"))
+        self.assertTrue(delivered[0][3].endswith("\n\n```\n收到\n```"))
         self.assertIn("收到", result)
 
     # 13. register() 读 collector.enabled / content / events 配置。
@@ -424,18 +438,20 @@ class HookTest(unittest.TestCase):
         self.assertIs(_MODULE._EVENTS, True)
         self.assertIs(_MODULE._CONTENT, True)
 
-    # 15. _format_result_message：完成 / 异常态 / 空文本三态。
+    # 15. _format_result_message：完成 / 异常态 / 空文本三态（正文进裸围栏代码框）。
     def test_format_result_message_variants(self):
         done = _MODULE._format_result_message("# 报告\n正文", "completed", 90)
         self.assertTrue(
-            done.startswith("📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）\n\n")
+            done.startswith("📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）\n\n```\n")
         )
-        self.assertTrue(done.endswith("# 报告\n正文"))
+        self.assertTrue(done.endswith("# 报告\n正文\n```"))
         failed = _MODULE._format_result_message("x", "failed", 5)
         self.assertIn("已结束（失败）", failed)
         self.assertIn("用时 5 秒", failed)
+        self.assertTrue(failed.endswith("```\nx\n```"))
         empty = _MODULE._format_result_message("", "completed", 3)
         self.assertIn("无文本输出", empty)
+        self.assertNotIn("```", empty)  # 无文本不发空框
 
     # 16. _stream_worker：流式异常被吞掉（只记日志，不向线程外抛）。
     def test_stream_worker_swallows_exception(self):
@@ -461,6 +477,35 @@ class HookTest(unittest.TestCase):
         )
         self.assertEqual(len(attempts), 2)
         self.assertIn("📬", attempts[1])
+        # 重试发的是同一条（已框化）消息，正文不变。
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertTrue(attempts[1].endswith("```\n报告\n```"))
+
+    # 18. 结果以**裸围栏代码框**送达：头行在框前、围栏无语言标记、内层围栏转义。
+    def test_final_result_delivered_in_bare_fence_box(self):
+        body = "第一行\n```\n第二行"
+        msg = _MODULE._format_result_message(body, "completed", 7)
+        lines = msg.split("\n")
+        self.assertEqual(lines[0], "📬 **dsh 任务完成，结果如下**（用时 7 秒）")
+        self.assertEqual(lines[1], "")
+        self.assertEqual(lines[2], "```")  # 裸围栏：信息位为空，无语言标记
+        self.assertEqual(lines[-1], "```")  # 围栏成对闭合
+        self.assertNotIn("```text", msg)
+        # 正文内层三反引号被转义（插入零宽空格），故全文只剩外层的一对围栏。
+        self.assertIn("`\u200b``", msg)
+        self.assertEqual(msg.count("```"), 2)
+
+    # 19. 长结果不截断，且经围栏感知分块后每块围栏成对闭合（框不裂）。
+    def test_long_final_result_chunked_with_closed_fences(self):
+        body = "\n".join(f"第 {i} 行 " + "x" * 200 for i in range(80))  # ~16k 字符
+        msg = _MODULE._format_result_message(body, "completed", 12)
+        self.assertTrue(msg.endswith(body + "\n```"))  # 正文逐字不截断
+        chunks = _REAL_CONSUMER._split_fenced_chunks(msg, limit=800)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(chunks[0].startswith("📬"))  # 头行在首块
+        for chunk in chunks:
+            self.assertEqual(chunk.count("```") % 2, 0)  # 每块围栏闭合
+        self.assertTrue(chunks[-1].rstrip().endswith("```"))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 > immediately while a background thread consumes the SSE stream and pushes
 > intermediate progress back to Feishu / QQ (gated by `collector.enabled`, off by
 > default); when the task finishes, the final result is actively delivered to the
-> messaging surface as a normal message — the task runs only once, and there is
+> messaging surface in a code block (v0.5.3) — the task runs only once, and there is
 > no silence after "done". As of v0.4.0 the live progress lines are trimmed by
 > **four tiers** (`collector.live_detail`, default `follow-dsh` to follow dsh's
 > "Work details"; see "Live-detail tier"); as of v0.5.0 all four tiers use the
@@ -197,7 +197,7 @@ the `pre_tool_call` hook:
   progress back to Feishu / QQ; live, gated by `collector.enabled`, off by
   default), and right away blocks the original `a2a_call` with
   `{"action": "block", "message": receipt}`. When the task finishes, the final
-  result is actively delivered to the messaging surface as a normal message (see
+  result is actively delivered to the messaging surface in a code block (see
   "Receipt & result delivery"). The hook callback returns instantly — framework
   hook callbacks have a 30 s cap; synchronously waiting on a long task triggers a
   timeout fail-closed that cascades into skipping other tool calls. Async is the
@@ -222,10 +222,46 @@ above).
 
 The final result travels an independent path: when the task finishes,
 `_stream_dsh_call` calls `_deliver_final_result`, sending a
-`📬 **dsh 任务完成，结果如下**（用时 …）` header line + the full result as a
-**normal message** (plain-text chunking, `make_sender(code_blocks=False)`) to the
-messaging surface; on failure it retries once and only logs a warning — no
-silence after "done".
+`📬 **dsh 任务完成，结果如下**（用时 …）` header line + the full result to the
+messaging surface. **As of v0.5.3 the result body is rendered as a code block**
+(the same **bare** fence as the live process boxes: `_format_result_message` wraps
+it via `consumer._fence`, and `make_sender(code_blocks=True)` does fence-aware
+chunking):
+
+````text
+📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
+
+```
+<full result body: untruncated; inner triple backticks escaped so the outer fence stays closed>
+```
+````
+
+- **Header before the box**: matching the live layout ("`📖 输出完成`" line + box);
+  status / elapsed time are metadata and do not belong in a monospace box.
+- **Body never truncated**: only trailing newlines are stripped; long bodies (>8000)
+  reuse the existing chunking (`_split_fenced_chunks`), joined with `⏩ 续` and with
+  the **fence kept closed** in every chunk.
+- **No empty box**: with no text output the message is just the header
+  (`…——本次无文本输出。`).
+- **Chunk shape for very long results**: `_split_fenced_chunks` flushes the plain
+  lines accumulated before the fence as their own chunk, so the **header becomes a
+  standalone first message** (without the `⏩ 续` marker) and the following chunks are
+  fence-balanced box segments — existing chunking behavior (same for an over-long live
+  final), nothing is lost.
+- **Delivery timing, content completeness and the redact flow are unchanged**:
+  still "delivered as soon as the task finishes", one retry on failure, warning-only
+  afterwards — no silence after "done".
+
+### A style switch for result delivery? (Conclusion: no)
+
+`code_blocks` has been an **internal style parameter** since v0.3.0, not
+config-controlled; the two earlier shape changes (code-box group, bare fence) also
+added no config key. Same here: **no new `collector.*` key** — that would drag in a
+hot-read switch, a fourth Dashboard switch and write-back validation for a mere
+rendering shape. To revert to the v0.5.2 plain-text result message, change one line:
+in `_deliver_final_result` switch `make_sender(_CTX, code_blocks=True)` back to
+`code_blocks=False` and have `_format_result_message` return `final_text` directly
+(without `_box_result_body`).
 
 ### Troubleshooting: why does a conversation show no live messages? (v0.5.1)
 
@@ -658,7 +694,8 @@ set" deployment gets `standard`-density boxes.
     byte-identical for any tier value and its latency is unchanged.
   - **② Final-result delivery on completion**: `_deliver_final_result` still pushes the
     "📬 task completed + full result" message to the same conversation; **no tier ever
-    strips that body**.
+    strips that body**. As of v0.5.3 the body is rendered in a bare-fence code block
+    (shape independent of the tier; see "Receipt and result delivery").
 - **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
   **ignored entirely** — never read, never an error, never migrated, never a fallback.
   Its semantics changed (old `false` = plain-text lines; using it as a fallback would
@@ -670,7 +707,9 @@ set" deployment gets `standard`-density boxes.
   process itself is a code-box group** — all four tiers have that box, and only the
   in-box density differs (`compact`: header + "思考" label; `standard`: plain-language
   step summaries; `detailed`: arguments + first result line; `verbose`: arguments /
-  results and full thinking text untruncated).
+  results and full thinking text untruncated). **As of v0.5.3 the body of the result
+  delivery goes into the same kind of bare-fence code block** (header before the box),
+  matching the process boxes.
 
 When unset and the legacy `content` is also unset, `follow-dsh` is used (the new v0.4.0
 default).
@@ -708,7 +747,8 @@ plugins:
 - `false` (quiet mode): push only the final result (📖 output complete + terminal
   status line); intermediate events are not pushed (no spam). The done card's
   style stays code blocks (internal rendering, no longer configurable; quiet mode
-  outranks the tier — see "Live-detail tier").
+  outranks the tier — see "Live-detail tier"); the 📬 result delivery is boxed the
+  same way and is unaffected by this switch.
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
@@ -766,7 +806,7 @@ a2a_call (pre_tool_call hook)
                         |
               +-- sender (really sends to Feishu/QQ when collector.enabled; otherwise noop)
               |
-              +-- stats.final_text -> result message (📬 header + full text, plain-text chunks) --> delivered
+              +-- stats.final_text -> result message (📬 header + bare-fence code-block body, fence-aware chunks) --> delivered
                         to the messaging surface (no silence after "done"; the receipt carries only "accepted")
 ```
 
@@ -829,7 +869,8 @@ losing step information.
    current tier), and that **dsh executes
    only once** (the dsh-a2a-server log shows only one task submission); ③ when the
    task finishes, the conversation receives the "📬 dsh 任务完成，结果如下" result
-   message (header + full text). Also (v0.5.1): have an `a2a_call` carrying an
+   message (header before the box + body inside a bare-fence code block, body
+   untruncated). Also (v0.5.1): have an `a2a_call` carrying an
    **explicit `context_id`** trigger the same receipt and live stream, with the
    message landing in the same conversation that `context_id` names.
 4. redact confirmation: tokens in progress text do not appear in plaintext.
@@ -910,7 +951,9 @@ the messaging surface is empty and only the explicit value supplies the origin),
 non-dsh / collector off / a2a_orchestrate / non-messaging surface injects origin
 only, and
 `_stream_dsh_call` formats the result, result delivery (`_format_result_message`
-three variants / worker swallows exceptions / delivery retries once), and raises
+three variants + **bare-fence code-box body** — no language tag, inner fences
+escaped, body untruncated / worker swallows exceptions / delivery retries once /
+long results chunk fence-aware with every chunk closed), and raises
 on missing dsh config.
 
 `test_hot_read.py` covers the hot-read rework: `_read_switch` returns the new

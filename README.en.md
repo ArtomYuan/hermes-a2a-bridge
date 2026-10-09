@@ -81,7 +81,8 @@ conversation show no live messages?".
 ### Code blocks
 
 Operation content — tool commands, execution results, and final text — is
-automatically rendered as code blocks:
+automatically rendered as code blocks; **the body of the "📬 result delivery"
+message is boxed the same way** (since v0.5.3, matching the process boxes):
 
 - **Feishu**: fenced content triggers post rich text; code blocks are scrollable;
 - **QQ / other mainstream gateways**: markdown code blocks render as code blocks;
@@ -89,6 +90,17 @@ automatically rendered as code blocks:
 - **no language tag on fences**: Feishu shows the fence info string as the code
   block's language name in the top-left corner, so the info string is left empty
   (no meaningless "text" label), matching the operation-output boxes.
+
+Shape of the result-delivery message (header **before** the box, body in a
+**bare** fence, body **never truncated**):
+
+````text
+📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
+
+```
+<full result body>
+```
+````
 
 Sample code-block content (an `ls -la` output block):
 
@@ -110,8 +122,9 @@ only in in-box density: `compact` header + "思考" label, `standard` plain-lang
 step summaries, `detailed` arguments + `↳ first result line`, `verbose` arguments /
 results and full thinking text untruncated; `collector.events` for the event stream —
 off is quiet mode, pushing the final result only, and it **outranks the tier**;
-code-block rendering stays as the internal style for a tier and is no longer a
-standalone switch), and can be toggled or selected from the "A2A live switches" panel
+code-block rendering stays as the internal style for a tier (**result delivery
+uses the same box shape**) and is no longer a standalone switch), and can be
+toggled or selected from the "A2A live switches" panel
 on the Dashboard "Plugins" page (instant effect) — see
 [CONFIGURATION.en.md](CONFIGURATION.en.md).
 

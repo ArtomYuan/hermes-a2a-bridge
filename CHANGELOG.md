@@ -5,6 +5,47 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.3] - 2026-10-10
+
+> ⚠️ **样式变更（行为面不变）**：任务完成的「📬 结果送达」正文由**普通消息**改为
+> **裸围栏代码框**，与直播过程框形式统一。送达时机、正文完整性（**不截断**）、redact
+> 流程、「📬」头行与失败重试均不变；**不新增配置键**——`code_blocks` 自 v0.3.0 起
+> 就是内部样式参数（v0.5.0 / v0.5.2 两次形态变更也未加键）。要回到 v0.5.2 的纯文本
+> 观感：把 `_deliver_final_result` 的 `make_sender(_CTX, code_blocks=True)` 改回
+> `code_blocks=False`，并让 `_format_result_message` 直接返回 `final_text`（不调
+> `_box_result_body`）。
+
+### Changed
+
+- **结果送达改为代码框**：`_format_result_message` 用 `consumer._fence`（与直播框
+  **同源**）把结果正文包成**裸围栏**（信息位留空、无语言标记）。头行
+  `📬 **dsh 任务完成，结果如下**（用时 …）` 保留在框**前**——与直播
+  「`📖 输出完成` 行 + 框」的排布一致；状态 / 耗时是元信息，不进等宽框。
+- **分块改为围栏感知**：`_deliver_final_result` 的 sender 由 `code_blocks=False`
+  改为 `True`，长结果（>8000）走既有 `_split_fenced_chunks`——分块间以 `⏩ 续`
+  衔接，且**每块围栏闭合**，不再可能切出断裂的框。
+- **正文完整性照旧**：不截断（只剥尾部换行）；正文内层三反引号被转义（在两反引号
+  之间插入零宽空格 U+200B），保证外层围栏不被提前闭合；无文本输出时仍只有头行、
+  **不发空框**。
+- 中英四份文档（README / CONFIGURATION）同步结果送达口径，并写明「**不新增配置键**」
+  的理由与一行回退法；`consumer.py` 的 `code_blocks` / `_split_plain_chunks` 注释口径
+  同步（生产两条路径都走围栏感知分块）。
+- `plugin.yaml` 与 `dashboard/manifest.json` 版本号同步 bump 到 `0.5.3`。
+
+### Unchanged
+
+- 送达时机（任务完成即送）、`📬` 头行三态、redact 流程、失败重试一次后仅记 warning；
+- 直播四档密度、代码框组排版、`follow-dsh` 与优先级链、Dashboard 三开关
+  （`enabled` / `events` / `live_detail`）与写回校验均不变。
+
+### Tests
+
+- 实测 **229 passed, 83 subtests passed**（v0.5.2 为 227 passed）。
+- 更新既有断言：直播与结果送达 sender 的 `code_blocks` 均为 `True`；结果消息断言由
+  「头行 + 全文」改为「头行 + 裸围栏框内全文」（`test_override` / `test_hot_read`）。
+- 新增：结果以**裸围栏代码框**送达（无语言标记、内层围栏转义、全文只剩一对围栏）；
+  长结果不截断且经围栏感知分块后每块围栏成对闭合（框不裂）。
+
 ## [0.5.2] - 2026-10-09
 
 > ℹ️ **样式微调（行为面不变）**：代码框组的**组头**与**围栏语言标记**两处外观调整，

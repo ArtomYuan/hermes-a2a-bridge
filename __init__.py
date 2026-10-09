@@ -54,8 +54,10 @@ hook 里对 dsh 目标做**单执行**：
   ``{"action": "block", "message": 受理回执}`` 阻止原 ``a2a_call`` 执行（消除双执行）。
   必须异步的原因：框架 hook 回调超时 30s，超时即 fail-closed 且其后一段时间内
   所有工具调用被连锁跳过（历史缺陷，2026-09-15 修复）。
-- 结果送达：``_stream_dsh_call`` 在任务完成时把最终结果以普通消息（非代码框）主动
-  送达消息面（``📬 dsh 任务完成…``），失败重试一次后仅记日志——「完成」之后不静默。
+- 结果送达：``_stream_dsh_call`` 在任务完成时把最终结果以**代码框**主动送达消息面
+  ——``📬 **dsh 任务完成，结果如下**（用时 …）`` 头行在框**前**，正文进**裸围栏**
+  代码框（与直播过程框同形、不截断；内层围栏转义，超长按围栏感知分块），失败重试
+  一次后仅记日志——「完成」之后不静默。
 - 回退：spawn 失败时退化为注入 origin 让原 ``a2a_call`` 走同步 ``SendMessage``
   （功能不丢、无直播）。
 - 其余（``a2a_orchestrate`` / 非 dsh 目标 / collector 关 / 非消息面 / message 空）：
@@ -320,8 +322,9 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     events = _read_switch("collector.events", True)
     level = _read_live_detail()
     # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
-    # 直播 sender 固定 code_blocks=True（内部样式）；结果送达 sender 固定 False
-    # （普通消息，见 _deliver_final_result）。
+    # 直播 sender 与结果送达 sender 都固定 code_blocks=True（内部样式：围栏感知分块）。
+    # 结果送达的消息正文由 _format_result_message 包成裸围栏代码框（与直播过程框同形），
+    # 故必须走围栏感知分块，否则超长时分块会把外层围栏切断，见 _deliver_final_result。
     sender = (
         consumer.make_sender(_CTX, code_blocks=True)
         if (platform and chat_id)
@@ -367,7 +370,7 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         header += f" · {state}"
     header += "]"
 
-    # 结果主动送达：任务完成即把最终结果以普通消息推回消息面（「完成」之后不静默）。
+    # 结果主动送达：任务完成即把最终结果以**代码框**消息推回消息面（「完成」之后不静默）。
     if platform and chat_id:
         _deliver_final_result(
             platform, chat_id, thread_id, final_text, state, started_at
@@ -383,8 +386,29 @@ _STATE_ZH = {
 }
 
 
+def _box_result_body(text: str) -> str:
+    """把结果正文包成代码框（与直播过程框**同源**的裸围栏）。
+
+    复用 consumer 的 ``_fence``：裸三反引号（无语言标记）、正文内层三反引号转义为
+    不闭合外层围栏的形式、尾部换行剥除。同源而非重写，是为了让「结果送达」的围栏
+    形态与直播框永远一致。渲染不可用时退回未框化纯文本——送达优先于样式，绝不因
+    样式失败丢结果。
+    """
+    try:
+        return _import_consumer()._fence(text)
+    except Exception as exc:  # 渲染失败不阻断送达
+        logger.warning("hermes-a2a-bridge: result body fence unavailable: %s", exc)
+        return str(text)
+
+
 def _format_result_message(final_text: str, state: str, elapsed_secs: float) -> str:
-    """构造「任务结果」主动送达消息：📬 头行（状态 + 耗时）+ 结果全文。"""
+    """构造「任务结果」主动送达消息：📬 头行（状态 + 耗时）+ **代码框包裹的结果全文**。
+
+    v0.5.3 起结果正文以**裸围栏代码框**渲染（与直播过程框同形），头行留在框**前**
+    ——与直播「``📖 输出完成`` 行 + 框」的排布一致，且状态 / 耗时是元信息、不该进
+    等宽框。正文**不截断**（只剥尾部换行），内层围栏被转义以保证外层围栏闭合；
+    超长（>8000）由 sender 的围栏感知分块处理。无文本输出时只有头行、不发空框。
+    """
     minutes, seconds = divmod(max(0, int(elapsed_secs)), 60)
     cost = f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
     state_zh = _STATE_ZH.get(state, state)
@@ -397,7 +421,7 @@ def _format_result_message(final_text: str, state: str, elapsed_secs: float) -> 
         head = f"📬 **dsh 任务已结束（{state_zh}），输出如下**（用时 {cost}）"
     else:
         head = f"📬 **dsh 任务完成，结果如下**（用时 {cost}）"
-    return f"{head}\n\n{final_text}"
+    return f"{head}\n\n{_box_result_body(final_text)}"
 
 
 def _deliver_final_result(
@@ -408,10 +432,15 @@ def _deliver_final_result(
     state: str,
     started_at: float,
 ) -> None:
-    """把任务最终结果以普通消息主动送达消息面（失败重试一次，绝不抛出）。"""
+    """把任务最终结果以代码框消息主动送达消息面（失败重试一次，绝不抛出）。
+
+    sender 固定 ``code_blocks=True``：结果消息正文是裸围栏代码框（见
+    ``_format_result_message``），分块必须**围栏感知**，否则超长时分块会把外层围栏
+    切断、客户端渲染出断裂的框。
+    """
     try:
         consumer = _import_consumer()
-        sender = consumer.make_sender(_CTX, code_blocks=False)
+        sender = consumer.make_sender(_CTX, code_blocks=True)
     except Exception as exc:
         logger.warning("hermes-a2a-bridge: result sender unavailable: %s", exc)
         return

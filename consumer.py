@@ -260,7 +260,8 @@ def _truncate(text: Any, limit: int) -> str:
 # 结果正文超过此长度（或含换行）时，final 文本以代码框输出（短结果保持普通行）。
 _FINAL_CODE_BLOCK_MIN_LEN = 120
 
-# 代码框渲染：内容显示时的内部样式（v0.3.0 起不再由配置开关控制，直播路径固定 True）。
+# 代码框渲染：内容显示时的内部样式（v0.3.0 起不再由配置开关控制）。直播路径与
+# 结果送达路径（v0.5.3 起结果正文也是裸围栏代码框）都固定 True。
 DEFAULT_CODE_BLOCKS = True
 
 # 事件流开关默认开（向后兼容：已部署副本不配置即保持推送中间事件）。
@@ -418,7 +419,9 @@ def _split_plain_chunks(
     """把长纯文本按换行边界分块（无围栏边界感知），块间追加 ``marker`` 提示。
 
     供 ``code_blocks=False`` 时使用：内容不含代码围栏，只需保证每块 ≤ ``limit``
-    且块间有分隔提示。
+    且块间有分隔提示。v0.5.3 起生产两条路径（直播 / 结果送达）都走围栏感知的
+    ``_split_fenced_chunks``，本函数仅保留给显式传 ``code_blocks=False`` 的独立
+    调用方与单测。
     """
     if len(content) <= limit:
         return [content]
@@ -1092,8 +1095,9 @@ def make_sender(
 
     ``code_blocks`` 控制长文本分块方式：``True``（默认）按代码块边界分块（围栏
     感知）；``False`` 按纯文本换行边界分块（无围栏感知）。v0.3.0 起这是「内容
-    显示时」的内部样式 / 分块参数，不再由配置开关控制（直播路径固定 True，结果
-    送达路径固定 False）。
+    显示时」的内部样式 / 分块参数，不再由配置开关控制——直播路径与结果送达路径
+    （v0.5.3 起结果正文同样以裸围栏代码框渲染）都固定 ``True``；``False`` 分支保留
+    给独立调用方与单测。
 
     发送前必做 redact。发送只走一条通路：从 gateway 主 loop 上的 adapter 发——用
     ``_gateway_runner_ref`` 弱引用拿到 runner，取 ``runner._gateway_loop``（gateway

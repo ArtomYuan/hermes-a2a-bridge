@@ -30,6 +30,14 @@ _spec = importlib.util.spec_from_file_location("hermes_a2a_bridge", _MODULE_PATH
 _MODULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_MODULE)
 
+# 结果送达的围栏形态由 consumer._fence 提供（生产同源）。加载真实 consumer，让
+# _FakeConsumer 暴露同一实现——断言测的是真实围栏，而非替身自造的围栏。
+_consumer_spec = importlib.util.spec_from_file_location(
+    "hermes_a2a_bridge_consumer_hot_read", os.path.join(_WORKTREE, "consumer.py")
+)
+_REAL_CONSUMER = importlib.util.module_from_spec(_consumer_spec)
+_consumer_spec.loader.exec_module(_REAL_CONSUMER)
+
 # 记录加载插件前就存在的相关模块（如有），便于测试尾部还原，避免污染其它用例。
 _PREEXISTING = {
     name: sys.modules.get(name)
@@ -87,6 +95,9 @@ class _FakeConsumer:
     """假 consumer 模块：记录 make_sender / consume_stream 调用（test_override 同款）。"""
 
     _DEFAULT_TIMEOUT = 300
+
+    # 与真实 consumer 同源的围栏渲染（结果送达正文用它包框）。
+    _fence = staticmethod(_REAL_CONSUMER._fence)
 
     def __init__(self):
         self.consume_stream_calls = []
@@ -212,10 +223,10 @@ class HotReadTest(unittest.TestCase):
         call = consumer.consume_stream_calls[0]
         self.assertEqual(call["level"], "standard")
         self.assertIs(call["events"], False)
-        # 直播 sender 固定 code_blocks=True（内部样式；结果送达 sender 恒
-        # code_blocks=False，见第 2 个调用）。
+        # 直播 sender 与结果送达 sender 都固定 code_blocks=True（内部样式：
+        # 结果正文也是裸围栏代码框，需围栏感知分块）。
         self.assertIs(consumer.make_sender_calls[0][1], True)
-        self.assertIs(consumer.make_sender_calls[1][1], False)
+        self.assertIs(consumer.make_sender_calls[1][1], True)
         # 改配置 → 下一个任务拿新值。
         ctx.settings.update({"collector.events": True})
         _MODULE._stream_dsh_call("hi2", "feishu/oc_x")

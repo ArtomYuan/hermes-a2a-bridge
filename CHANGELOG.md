@@ -5,6 +5,62 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-10-10
+
+> ⚠️ **文案变更（形态不变）**：`standard` 档逐步行的摘要由桥侧「命令原文 / 人话
+> 短语」启发式规则表，改为**逐字对齐 dsh 的活动描述**——`<dsh 活动短语>（<dsh 参数
+> 细节>）`，如 `执行命令（df -h）`、`读取文件（config.yaml）`、`搜索代码（TODO）`。
+> **出框形态与 v0.5.x 完全一致**：仍是一轮内的工具步骤 + 思考收口为**一条**无语言
+> 标记代码框（逐组出框），叙述 / 最终文本 / 终态行照旧各自发送；**不新增配置键**。
+
+### Changed
+
+- **步骤行对齐 dsh（A 项）**：`standard` 档逐步行从「`工具名 · <命令原文摘要>`」改为
+  「`工具名 · <dsh 活动描述>`」。活动描述 = dsh 活动短语 + dsh `liveToolDetail` 参数
+  细节：
+  - 活动短语取自 dsh `message.stepProcess.<kind>` 的 zh 词干（读取文件 / 读取图片 /
+    写入文件 / 搜索代码 / 修改文件 / 执行命令 / 运行代码 / 搜索网页 / 访问网页 /
+    协调子智能体 / 更新计划 / 提问 / 调用工具），工具名 → 种类映射沿用 dsh
+    `activity()` 原表（`tool_activity_kind` 不变）；
+  - 参数细节按 dsh `LIVE_TOOL_DETAIL_KEYS` 键序取第一个非空值
+    （`title > description > objective > task > … > command > … > query > path … >
+    status`；`questions` 取首问），空白折叠、160 字符截断补 `…`；
+  - 参数取不到细节时**回落到工具名本身**（dsh `normalizeLiveToolDetail(name)` 的
+    兜底），故纯字符串参数（如 `"ls -la"` 不是参数对象）渲染为 `执行命令（bash）`
+    而不是裸短语；
+  - 无工具名且无细节 → 空串（调用方退化为占位行）。
+  - **桥侧启发式规则表整体删除**：`summarize_tool_call` / `_tool_argument_text` /
+    `_first_command_word` / `_summary_positional` 与 `_SUMMARY_*` 常量
+    （「检查磁盘使用」「列出目录」「查看 git 提交记录」等固定短语、命令首行截断兜底）
+    全部移除，摘要不再依赖命令原文；新增纯函数 `dsh_activity_phrase` /
+    `dsh_activity_detail`（含 `_arguments_object` / `_normalize_activity_detail` /
+    `_question_detail`）与 `describe_tool_call`。
+- `detailed` / `verbose` 档逐步行仍显示原始参数（`{"path": …}`）与 `↳` 结果行，
+  只改 `standard` 档；`compact` 档仍只有组头 + 思考标签。
+- 文档（README / CONFIGURATION 中英）与样例同步「dsh 活动描述」口径；
+  `plugin.yaml` 与 `dashboard/manifest.json` 版本号 bump 到 `0.6.0`。
+
+### Unchanged
+
+- **出框形态**：一轮内的工具步骤 / 思考收口为**一条**无语言标记代码框（逐组出框），
+  收口时机（`turn_end` / 终态 / final / 新 `turn_start`）、空框规则、思考并入框、
+  组头类别串（`工作步骤 · N 步 · <类别串>`）与 dsh `processTitle` 逐字算法、
+  `_split_fenced_chunks` 围栏感知分块、`redact` 流程均不变；
+- 叙述 / 最终文本 / 终态行照旧各自成消息（**不是**「整任务一个框」）；
+- 三个配置键（`collector.enabled` / `collector.events` / `collector.live_detail`）、
+  `follow-dsh` 与优先级链、Dashboard 三开关与写回校验均不变。
+
+### Tests
+
+- 实测 **227 passed, 119 subtests passed**。
+- 更新既有断言：`standard` 逐步行由「人话摘要」改为 dsh 活动描述
+  （`test_consumer` / `test_group_push` / `test_real_stream` 的框内逐步行逐字断言，
+  含真实帧 `description` 优先于 `command` 的用例）。
+- 新增：活动短语表逐项且覆盖 dsh `message.stepProcess` 全部 kind（并断言已剥离
+  「正在/准备/已/了」体标记）、键序 `description` 优先、`questions` 取首问、
+  全字符串数组合并、160 字符截断、非 JSON 参数回落到工具名（`执行命令（bash）`）、
+  空名空细节返回空串。
+
 ## [0.5.3] - 2026-10-10
 
 > ⚠️ **样式变更（行为面不变）**：任务完成的「📬 结果送达」正文由**普通消息**改为

@@ -95,9 +95,10 @@ class RealStreamRegressionTest(unittest.TestCase):
         self.assertEqual(len(boxes), 1)
         box = boxes[0]
         self.assertIn("工作步骤 · 2 步", box)
-        # 2 条逐步行（standard 档 = 工具名 + 人话摘要；真实帧两工具均为 bash）。
-        self.assertIn("1. bash · 列出目录", box)
-        self.assertIn("2. bash · 读取文件（os-release）", box)
+        # 2 条逐步行（standard 档 = 工具名 + dsh 活动描述；真实帧两工具均为 bash，
+        # 参数带 description 且 dsh 键序 description 先于 command）。
+        self.assertIn("1. bash · 执行命令（List current directory contents）", box)
+        self.assertIn("2. bash · 执行命令（Read first 6 lines of os-release）", box)
         # 全流程消息数 == 4：🚀 第 1 轮 + 框 + 最终文本 + ✅ 完成。
         self.assertEqual(len(sent), 4)
         self.assertEqual(sent[0], "🚀 第 1 轮")

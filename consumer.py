@@ -2,8 +2,8 @@
 
 向 dsh-a2a-server 发 ``SendStreamingMessage``，逐行解析 SSE ``data:`` 事件，
 把 ``result.{task|statusUpdate|artifactUpdate}`` 归一化为统一事件序列，经 T0
-emoji 行语言渲染、节流（高信号逐条放行 / 低信号 text 聚合）、redact 后发送到
-飞书 / QQ 消息面。
+emoji 行语言渲染、节流（高信号逐条放行 / 低信号 text 聚合）、逐组代码框收口
+（一轮的工具步骤与思考 = 一条框消息），再经 redact 后发送到飞书 / QQ 消息面。
 
 wire 格式（dsh-a2a-server, @a2a-js/sdk v1.1.0）
 ------------------------------------------------
@@ -283,37 +283,67 @@ LIVE_DETAIL_FALLBACK = "detailed"
 DSH_HOME_DEFAULT = "/home/artom/.dsh"
 DSH_PROFILE_DEFAULT = "web"
 
-# 内容开关关时 tool_call 的「简短摘要」：把命令换成人话短语（bridge 侧启发式，
-# 不依赖 dsh 提供额外字段）。规则表优先，未命中则取命令首行截断兜底。
-_SUMMARY_FALLBACK_LIMIT = 50
+# --------------------------------------------------------------------------
+# 步骤行「活动描述」（v0.6.0）：逐字移植 dsh 的活动描述文案算法。
+# 来源：dsh-client-ui-chat/lib/client.js
+#   - ``message.stepProcess.<kind>`` 文案表（client.js:5366-5379，zh 字典）
+#   - ``activity(name)`` 工具名 → 种类（client.js:10494-10518，见 tool_activity_kind）
+#   - ``liveToolDetail(name, argsRaw)`` 参数细节（client.js:10519-10590）
+# --------------------------------------------------------------------------
 
-# 首命令词 → 固定短语。
-_SUMMARY_PHRASES = {
-    "df": "检查磁盘使用",
-    "free": "检查内存",
-    "du": "统计目录占用",
-    "systemctl": "检查服务状态",
-    "ls": "列出目录",
-    "ps": "查看进程",
+# dsh ``message.stepProcess.<kind>`` 的活动短语：取 dsh 词干、剥离体标记
+# （正在 / 已 / 准备 / 了）。dsh 的组头是**实时进行体**（「正在读取文件」）或
+# **关闭态完成体**（「已读取文件」），逐条步骤行需要名词性活动描述
+# （管理员样例「读取文件（config.yaml）」「搜索代码（xxx）」「执行命令（…）」），
+# 故只剥体标记、不改词干：命令档取 done.commands「执行了命令」→「执行命令」，
+# 读档取 read「读取文件」。
+_DSH_ACTIVITY_PHRASE = {
+    "thinking": "分析请求",        # message.stepProcess.thinking「正在分析请求」
+    "read": "读取文件",            # 「正在/已读取文件」
+    "readImage": "读取图片",       # 「正在/已读取图片」
+    "write": "写入文件",           # 「正在/已写入文件」
+    "search": "搜索代码",          # 「正在/已搜索代码」
+    "edit": "修改文件",            # done.edit「修改了文件」
+    "commands": "执行命令",        # done.commands「执行了命令」
+    "code": "运行代码",            # 「正在运行代码」/ done.code「运行了代码」
+    "webSearch": "搜索网页",       # 「正在/已搜索网页」
+    "webFetch": "访问网页",        # 「正在/已访问网页」
+    "subagents": "协调子智能体",   # 「正在/已协调子智能体」
+    "plan": "更新计划",            # 「正在更新计划」/ done.plan「更新了计划」
+    "questions": "提问",           # prepare.questions「准备提问」
+    "tools": "调用工具",           # 「正在调用工具」/ done.tools「已调用工具」
 }
 
-# 这些命令读文件：摘要里带上文件名（取最后一个位置参数）。
-_SUMMARY_FILE_COMMANDS = ("sed", "head", "tail", "cat", "less", "more")
+# dsh ``LIVE_TOOL_DETAIL_KEYS``（client.js:10519-10544）：按序取第一个非空值作为细节。
+_DSH_ACTIVITY_DETAIL_KEYS = (
+    "title",
+    "description",
+    "objective",
+    "task",
+    "task_name",
+    "name",
+    "question",
+    "questions",
+    "prompt",
+    "message",
+    "command",
+    "cmd",
+    "queries",
+    "query",
+    "pattern",
+    "url",
+    "uri",
+    "file_path",
+    "path",
+    "target",
+    "action",
+    "status",
+)
 
-# 这些命令按「查找」语义摘要（带关键词时给出关键词）。
-_SUMMARY_SEARCH_COMMANDS = ("grep", "rg", "ag")
-
-# 命令前可跳过的包装词（不影响「首命令词」判定）。
-_SUMMARY_SKIP_WORDS = ("sudo", "env", "time", "nohup", "command", "exec")
-
-# tool_call 的 arguments 里，这些键承载可读命令文本。
-_SUMMARY_COMMAND_KEYS = ("command", "cmd", "script", "code", "shell")
-
-# 只带文件路径的工具（如 read_file）：按「读文件」语义摘要。
-_SUMMARY_PATH_KEYS = ("path", "file", "filename", "file_path", "target")
-
-# 摘要小改进：对象参数无命令键时，优先取这些标识性键的 ``key=value``（顺序即优先级）。
-_IDENTIFIER_KEYS = ("job_id", "id", "name", "path", "file_path", "query", "url")
+# dsh ``LIVE_TOOL_DETAIL_MAX_CHARS``（client.js:10519）：细节截断上限。
+# dsh 用 Intl.Segmenter 按**字素**计数；本模块只用标准库，按码点计数近似
+# （中文/ASCII 完全一致，仅 emoji 组合序列等少数场景略有差异）。
+_DSH_ACTIVITY_DETAIL_LIMIT = 160
 
 
 def _escape_inner_fences(text: str) -> str:
@@ -448,123 +478,109 @@ def _is_final_event(event: Dict[str, Any]) -> bool:
     return False
 
 
-def _tool_argument_text(arguments: Any) -> str:
-    """把 tool_call 的 ``arguments`` 规范成可读的命令文本。
+def _arguments_object(arguments: Any) -> Optional[Dict[str, Any]]:
+    """把 tool_call 的 ``arguments`` 解析为 dict（解析不出时返回 None）。
 
-    字符串直接返回；JSON 对象优先取 ``command`` / ``cmd`` / ``script`` 等命令键，
-    仅含 ``path`` / ``file`` 时映射为 ``cat <path>``（从而走「读取文件」规则），
-    其余对象退化为单行 JSON。
-
-    @param arguments - tool_call 事件的原始 ``arguments``。
-    @returns 单行命令文本（无内容时为空串）。
+    与 dsh ``liveToolDetail`` 同构：字符串按 JSON 解析，解析失败即「无参数细节」；
+    dict 原样使用；其余类型（list 等）返回 None。
     """
     if isinstance(arguments, dict):
-        data: Any = arguments
+        return arguments
+    if not isinstance(arguments, str):
+        return None
+    text = arguments.strip()
+    if not text.startswith("{") and not text.startswith("["):
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalize_activity_detail(value: Any) -> str:
+    """逐字移植 dsh ``normalizeLiveToolDetail``（client.js:10545-10558）。
+
+    只接受字符串（或全字符串数组 → ``, `` 连接）；空白折叠成单空格并去首尾；
+    超过 ``_DSH_ACTIVITY_DETAIL_LIMIT`` 字符时截断并补 ``…``（尾部先 trimEnd）。
+    """
+    if isinstance(value, str):
+        normalized = value
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        normalized = ", ".join(value)
     else:
-        text = str(arguments or "").strip()
-        if not text:
-            return ""
-        data = None
-        if text.startswith("{") or text.startswith("["):
-            try:
-                data = json.loads(text)
-            except (ValueError, TypeError):
-                data = None
-        if data is None:
-            return text
-    if isinstance(data, dict):
-        for key in _SUMMARY_COMMAND_KEYS:
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for key in _SUMMARY_PATH_KEYS:
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return f"cat {value.strip()}"
-        # 无命令键：优先取标识性键的 key=value（job_id/id/name/path/... 等），
-        # 仍无则退化为单行 JSON（summarize_tool_call 会再截断）。
-        for key in _IDENTIFIER_KEYS:
-            value = data.get(key)
-            if value is not None and str(value).strip():
-                return f"{key}={value}"
-        return json.dumps(data, ensure_ascii=False)
-    return json.dumps(data, ensure_ascii=False)
+        return ""
+    normalized = " ".join(normalized.split()).strip()
+    if not normalized:
+        return ""
+    if len(normalized) <= _DSH_ACTIVITY_DETAIL_LIMIT:
+        return normalized
+    return normalized[: _DSH_ACTIVITY_DETAIL_LIMIT - 1].rstrip() + "…"
 
 
-def _first_command_word(line: str) -> tuple:
-    """取一行的「首命令词」与其后的参数词（跳过 ``sudo`` / ``VAR=x`` 之类包装）。
-
-    @param line - 单行命令文本。
-    @returns ``(命令词, 其余词列表)``；整行都是包装词时命令词为空串。
-    """
-    words = line.split()
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if word in _SUMMARY_SKIP_WORDS:
-            index += 1
+def _question_detail(value: Any) -> str:
+    """逐字移植 dsh ``questionDetail``：取列表中第一个含非空 ``question`` 的条目。"""
+    if not isinstance(value, list):
+        return ""
+    for item in value:
+        if not isinstance(item, dict):
             continue
-        if "=" in word and not word.startswith("-") and word.split("=", 1)[0].isidentifier():
-            index += 1
-            continue
-        break
-    if index >= len(words):
-        return "", []
-    return words[index].rsplit("/", 1)[-1], words[index + 1 :]
+        detail = _normalize_activity_detail(item.get("question"))
+        if detail:
+            return detail
+    return ""
 
 
-def _summary_positional(words: list) -> list:
-    """过滤掉选项与 sed 脚本表达式，留下位置参数。
+def dsh_activity_detail(name: Any, arguments: Any) -> str:
+    """逐字移植 dsh ``liveToolDetail(name, argsRaw)``（client.js:10575-10590）。
 
-    @param words - 命令词之后的原始词列表。
-    @returns 位置参数字符串列表（引号已剥离）。
-    """
-    out = []
-    for word in words:
-        stripped = word.strip("\"'")
-        if not stripped or stripped.startswith("-"):
-            continue
-        # sed 的脚本表达式（如 1,18p）不是文件。
-        if stripped.endswith(("p", "d")) and stripped[:-1].replace(",", "").isdigit():
-            continue
-        out.append(stripped)
-    return out
+    按 ``_DSH_ACTIVITY_DETAIL_KEYS`` 顺序取第一个非空值；``questions`` 键走
+    ``_question_detail``（取首问）；解析不出参数对象时回落到工具名本身
+    （dsh 的 ``normalizeLiveToolDetail(name)`` 兜底）。
 
-
-def summarize_tool_call(arguments: Any) -> str:
-    """从 tool_call 的 ``arguments`` 生成「人话」摘要（内容开关关时使用）。
-
-    规则表优先（git log / sed·head·cat 等读文件 / grep / df / free / du /
-    systemctl / ls / ps），未命中时取命令首行截断到约 50 字符兜底；无法解析出
-    命令文本时返回空串。
-
+    @param name - 工具名（dsh 兜底文案）。
     @param arguments - tool_call 事件的原始 ``arguments``（字符串或对象）。
-    @returns 单行摘要；无可用信息时为空串。
+    @returns 单行细节文本（可能为空串）。
     """
-    text = _tool_argument_text(arguments).strip()
-    if not text:
-        return ""
-    line = text.splitlines()[0].strip()
-    if not line:
-        return ""
-    command, rest = _first_command_word(line)
-    positional = _summary_positional(rest)
+    fallback = _normalize_activity_detail(name)
+    data = _arguments_object(arguments)
+    if data is None:
+        return fallback
+    for key in _DSH_ACTIVITY_DETAIL_KEYS:
+        if key not in data:
+            continue
+        value = data.get(key)
+        detail = _question_detail(value) if key == "questions" else _normalize_activity_detail(value)
+        if detail:
+            return detail
+    return fallback
 
-    if command == "git":
-        if any(word == "log" or word.startswith("log") for word in rest):
-            return "查看 git 提交记录"
-    elif command in _SUMMARY_FILE_COMMANDS:
-        if positional:
-            return f"读取文件（{positional[-1].rsplit('/', 1)[-1]}）"
-        return "读取文件"
-    elif command in _SUMMARY_SEARCH_COMMANDS:
-        if positional:
-            return f"查找（{_truncate(positional[0], 24)}）"
-        return "搜索文件内容"
-    elif command in _SUMMARY_PHRASES:
-        return _SUMMARY_PHRASES[command]
 
-    return _truncate(line, _SUMMARY_FALLBACK_LIMIT)
+def dsh_activity_phrase(name: Any) -> str:
+    """活动种类 → dsh 活动短语（见 ``_DSH_ACTIVITY_PHRASE`` 的逐项 dsh 出处）。"""
+    kind = tool_activity_kind(name)
+    return _DSH_ACTIVITY_PHRASE.get(kind, _DSH_ACTIVITY_PHRASE["tools"])
+
+
+def describe_tool_call(name: Any, arguments: Any) -> str:
+    """步骤行活动描述：``<dsh 活动短语>（<dsh 参数细节>）``（无细节时只有短语）。
+
+    短语与细节都来自 dsh 的活动描述算法（``message.stepProcess.<kind>`` 词干 +
+    ``liveToolDetail``），是 standard 档逐步行与「内容开关关」路径的唯一摘要来源
+    ——不再回落到命令原文截断（v0.6.0 起）。
+
+    细节逐字沿用 dsh 的回落链：参数里按 ``_DSH_ACTIVITY_DETAIL_KEYS`` 取不到可用值时，
+    ``liveToolDetail`` 回落到**工具名本身**（如纯命令字符串 ``"ls -la"`` → ``bash``），
+    故逐步行是 ``执行命令（bash）`` 而非裸短语——这是与 dsh 逐字对齐的一部分。
+
+    @param name - tool_call / tool_result 事件的 ``name``。
+    @param arguments - tool_call 事件的原始 ``arguments``。
+    @returns 单行活动描述（``name`` 为空且无细节时为空串）。
+    """
+    detail = dsh_activity_detail(name, arguments)
+    if not str(name or "").strip() and not detail:
+        return ""
+    return f"{dsh_activity_phrase(name)}（{detail}）" if detail else dsh_activity_phrase(name)
 
 
 def tool_activity_kind(name: Any) -> str:
@@ -714,7 +730,7 @@ def render_process_box(
 
     - 第 1 行组头 ``工作步骤 · <N> 步 · <类别串>``（仅当有步骤时；不带轮次号）；
     - 分隔线（30 个 ─）仅当有逐步行时出现（逐步行前；另有思考段时在其前再出现一次）；
-    - 逐步行 ``<i>. <工具名> · <参数/摘要>``（standard 用摘要，detailed/verbose 用参数）；
+    - 逐步行 ``<i>. <工具名> · <活动描述>``（standard 用 dsh 活动描述，detailed/verbose 用参数）；
     - 结果行 ``   ↳ <结果>``（仅 detailed/verbose；缩进 3 空格）；
     - 末段思考 ``思考 · <预览或全文>``（compact 仅「思考」；``thinking_text`` 为 None 表示无思考）。
 
@@ -732,9 +748,9 @@ def render_process_box(
         for i, step in enumerate(step_list, 1):
             name = str(step.get("name") or "")
             if mode == "standard":
-                summary = summarize_tool_call(step.get("arguments"))
-                if name and summary:
-                    lines.append(f"{i}. {name} · {summary}")
+                description = describe_tool_call(name, step.get("arguments"))
+                if name and description:
+                    lines.append(f"{i}. {name} · {description}")
                 elif name:
                     lines.append(f"{i}. {name}")
                 else:

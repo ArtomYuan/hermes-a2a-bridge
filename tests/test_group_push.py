@@ -12,7 +12,8 @@
 - 发框规则（无工具无思考 → 不发框；只有思考 → 发只含思考行的框）；
 - 种类映射表（tool_activity_kind）与组头类别串（group_title）逐字不变；
 - 终态强制收口；超长框分块后围栏闭合；
-- 摘要（summarize_tool_call）锚点不回归。
+- 摘要（summarize_tool_call）锚点不回归 → v0.6.0 起改为逐步行活动描述
+  （describe_tool_call，dsh 活动短语 + liveToolDetail 参数细节）。
 
 仅用标准库 ``unittest``，沿用 test_consumer.py 的 spec 加载方式。
 """
@@ -75,7 +76,8 @@ class BoxGroupTest(unittest.TestCase):
         events.append({"type": "status", "state": "completed"})
 
         sent = _std_run(events)
-        step_lines = [f"{i}. bash · echo step{i}" for i in range(1, 9)]
+        # 纯命令字符串无参数细节 → standard 逐步行只显示 dsh 活动短语。
+        step_lines = [f"{i}. bash · 执行命令（bash）" for i in range(1, 9)]
         box = _box("工作步骤 · 8 步 · 执行了命令", consumer._BOX_SEP, *step_lines)
         self.assertEqual(sent, ["🚀 第 1 轮", box, "✅ 完成"])
         # 不再有心跳行，也没有逐条 🔧 / 📋 行。
@@ -112,7 +114,7 @@ class BoxGroupTest(unittest.TestCase):
         self.assertTrue(body.startswith("```\n工作步骤 · 13 步 · 执行了命令\n"))
         # 13 条逐步行，无心跳。
         self.assertEqual(body.count("\n1. "), 1)
-        self.assertIn("\n13. bash · echo step13\n", body)
+        self.assertIn("\n13. bash · 执行命令（bash）\n", body)
         self.assertNotIn("正在执行", body)
 
 
@@ -128,7 +130,7 @@ class CloseTimingTest(unittest.TestCase):
         ]
         sent = _std_run(events)
         # 框先于 turn_end flush 出的叙述 text 行。
-        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（a.txt）")
+        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（read）")
         self.assertEqual(sent, [box, "📖 叙述正文"])
 
     def test_close_on_terminal_status_before_status_line(self):
@@ -139,7 +141,7 @@ class CloseTimingTest(unittest.TestCase):
         ]
         sent = _std_run(events)
         # 框先于终态行。
-        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
         self.assertEqual(sent, [box, "✅ 完成"])
 
     def test_thinking_does_not_split_group(self):
@@ -156,8 +158,8 @@ class CloseTimingTest(unittest.TestCase):
         box = _box(
             "工作步骤 · 2 步 · 已读取文件并执行了命令",
             consumer._BOX_SEP,
-            "1. read · 读取文件（a.txt）",
-            "2. bash · 列出目录",
+            "1. read · 读取文件（read）",
+            "2. bash · 执行命令（bash）",
             consumer._BOX_SEP,
             "思考 · 想想",
         )
@@ -172,7 +174,7 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "status", "state": "completed"},
         ]
         sent = _std_run(events)
-        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
         self.assertEqual(sent, [box, "📖 输出完成", "✅ 完成"])
 
     def test_turn_start_flushes_previous_group(self):
@@ -183,7 +185,7 @@ class CloseTimingTest(unittest.TestCase):
             {"type": "turn_start", "turn": 2},
         ]
         sent = _std_run(events)
-        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（a.txt）")
+        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（read）")
         self.assertEqual(sent, [box, "🚀 第 2 轮"])
 
 
@@ -292,8 +294,8 @@ class TerminalForceFlushTest(unittest.TestCase):
         box = _box(
             "工作步骤 · 2 步 · 执行了命令并已读取文件",
             consumer._BOX_SEP,
-            "1. bash · 列出目录",
-            "2. read · 读取文件（b.txt）",
+            "1. bash · 执行命令（bash）",
+            "2. read · 读取文件（read）",
         )
         self.assertEqual(sent, [box, "✅ 完成"])
 
@@ -304,7 +306,7 @@ class TerminalForceFlushTest(unittest.TestCase):
             {"type": "status", "state": "failed"},
         ]
         sent = _std_run(events)
-        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 列出目录")
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
         self.assertEqual(sent, [box, "❌ 失败"])
 
 
@@ -335,7 +337,7 @@ class ThinkingGroupTest(unittest.TestCase):
         box = _box(
             "工作步骤 · 1 步 · 已读取文件",
             consumer._BOX_SEP,
-            "1. read · 读取文件（a.txt）",
+            "1. read · 读取文件（read）",
             consumer._BOX_SEP,
             "思考 · 想想",
         )
@@ -358,9 +360,9 @@ class ThinkingGroupTest(unittest.TestCase):
         box = _box(
             "工作步骤 · 3 步 · 执行了命令",
             consumer._BOX_SEP,
-            "1. bash · 列出目录",
-            "2. bash · 列出目录",
-            "3. bash · 列出目录",
+            "1. bash · 执行命令（bash）",
+            "2. bash · 执行命令（bash）",
+            "3. bash · 执行命令（bash）",
             consumer._BOX_SEP,
             "思考 · 想想",
         )
@@ -421,11 +423,32 @@ class RenderProcessBoxTest(unittest.TestCase):
             [
                 _THREE_HEADER,
                 consumer._BOX_SEP,
-                "1. bash · 列出目录",
-                "2. read · 读取文件（a.txt）",
-                "3. grep · 查找（foo）",
+                # 纯命令字符串无参数细节 → 只显示 dsh 活动短语。
+                "1. bash · 执行命令（bash）",
+                "2. read · 读取文件（read）",
+                "3. grep · 搜索代码（grep）",
                 consumer._BOX_SEP,
                 "思考 · 让我先想想",
+            ],
+        )
+
+    def test_standard_step_line_uses_dsh_detail(self):
+        # 参数为 JSON 对象时，standard 逐步行按 dsh liveToolDetail 取参数细节
+        # （键序 description > command > queries > query ... > path）。
+        steps = [
+            {"name": "bash", "arguments": {"command": "df -h", "description": "看磁盘"}, "result": "x"},
+            {"name": "read", "arguments": '{"path": "/tmp/config.yaml"}', "result": "y"},
+            {"name": "grep", "arguments": {"query": "TODO"}, "result": "z"},
+        ]
+        body = consumer.render_process_box(steps, None, "standard")
+        self.assertEqual(
+            body.splitlines(),
+            [
+                "工作步骤 · 3 步 · 执行了命令，已读取文件，已搜索代码",
+                consumer._BOX_SEP,
+                "1. bash · 执行命令（看磁盘）",
+                "2. read · 读取文件（/tmp/config.yaml）",
+                "3. grep · 搜索代码（TODO）",
             ],
         )
 
@@ -535,34 +558,80 @@ class NoRegressionTest(unittest.TestCase):
         self.assertFalse(any("🔧" in line or "📋" in line for line in sent))
 
 
-class SummaryImprovementTest(unittest.TestCase):
-    """摘要小改进：对象参数无命令键时取标识性键 key=value。"""
+class DescribeToolCallAnchorTest(unittest.TestCase):
+    """逐步行活动描述锚点：短语表逐项 + dsh 参数细节键序（取代旧摘要规则表用例）。"""
 
-    def test_identifier_key_value(self):
-        self.assertEqual(consumer.summarize_tool_call({"job_id": "bash-456"}), "job_id=bash-456")
-        self.assertEqual(consumer.summarize_tool_call({"id": 123}), "id=123")
-        self.assertEqual(consumer.summarize_tool_call({"name": "foo"}), "name=foo")
-        self.assertEqual(consumer.summarize_tool_call({"query": "search term"}), "query=search term")
-        self.assertEqual(consumer.summarize_tool_call({"url": "http://x/y"}), "url=http://x/y")
+    def test_phrase_table(self):
+        cases = {
+            "bash": "执行命令",
+            "read": "读取文件",
+            "write": "写入文件",
+            "edit": "修改文件",
+            "grep": "搜索代码",
+            "run_code": "运行代码",
+            "web_search": "搜索网页",
+            "web_fetch": "访问网页",
+            "subagent": "协调子智能体",
+            "todo_write": "更新计划",
+            "ask_user_question": "提问",
+            "job_output": "调用工具",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(consumer.dsh_activity_phrase(name), expected)
 
-    def test_identifier_key_priority_order(self):
-        # job_id 优先于 name。
+    def test_detail_key_order(self):
+        # description 优先于 command（dsh LIVE_TOOL_DETAIL_KEYS 原序）。
         self.assertEqual(
-            consumer.summarize_tool_call({"name": "x", "job_id": "j1"}),
-            "job_id=j1",
+            consumer.describe_tool_call(
+                "bash", {"command": "wc -l file", "description": "统计行数"}
+            ),
+            "执行命令（统计行数）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("bash", {"command": "wc -l file"}),
+            "执行命令（wc -l file）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("read", {"path": "/a/b.txt"}),
+            "读取文件（/a/b.txt）",
+        )
+        # 字符串形式的 JSON 对象同样命中。
+        self.assertEqual(
+            consumer.describe_tool_call("bash", '{"command": "git status --short"}'),
+            "执行命令（git status --short）",
         )
 
-    def test_command_key_still_wins(self):
-        # 有命令键时不走标识性键。
-        self.assertEqual(consumer.summarize_tool_call({"command": "wc -l file", "name": "foo"}), "wc -l file")
+    def test_empty_and_unknown(self):
+        # 无名也无细节 → 空串；未知工具归 tools 且细节回落到工具名。
+        self.assertEqual(consumer.describe_tool_call("", ""), "")
+        self.assertEqual(consumer.describe_tool_call("foo_inspect", ""), "搜索代码（foo_inspect）")
 
-    def test_path_key_still_reads_file(self):
-        # path 字符串仍走「读取文件」语义（标识性键不覆盖既有行为）。
-        self.assertEqual(consumer.summarize_tool_call({"path": "/a/b.txt"}), "读取文件（b.txt）")
-
-    def test_string_json_argument_uses_identifier(self):
-        # 字符串形式的 JSON 对象同样命中标识性键。
-        self.assertEqual(consumer.summarize_tool_call('{"job_id": "bash-7"}'), "job_id=bash-7")
+    def test_phrase_table_has_every_dsh_kind(self):
+        # 短语表覆盖 dsh message.stepProcess 的全部 kind（源码枚举，缺项会在这里暴露）。
+        kinds = {
+            "thinking",
+            "read",
+            "readImage",
+            "write",
+            "search",
+            "edit",
+            "commands",
+            "code",
+            "webSearch",
+            "webFetch",
+            "subagents",
+            "plan",
+            "questions",
+            "tools",
+        }
+        self.assertEqual(set(consumer._DSH_ACTIVITY_PHRASE), kinds)
+        for kind, phrase in consumer._DSH_ACTIVITY_PHRASE.items():
+            with self.subTest(kind=kind):
+                self.assertTrue(phrase)
+                # 短语是 dsh 词干（不含体标记）。
+                for marker in ("正在", "准备", "已", "了"):
+                    self.assertNotIn(marker, phrase, f"{kind} 短语未剥离体标记: {phrase}")
 
 
 if __name__ == "__main__":

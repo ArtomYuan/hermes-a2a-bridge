@@ -268,69 +268,98 @@ _EXPECTED_SENT = [
 ]
 
 
-class ToolCallSummaryTest(unittest.TestCase):
-    """`summarize_tool_call`：规则表 + 兜底截断（内容开关关时的工具调用摘要）。"""
+class DescribeToolCallTest(unittest.TestCase):
+    """`describe_tool_call`：dsh 活动描述（活动短语 + 参数细节），取代旧「人话摘要」规则表。
 
-    def test_git_log_rule(self):
-        self.assertEqual(consumer.summarize_tool_call("git -C /x log --oneline -3"), "查看 git 提交记录")
-        self.assertEqual(consumer.summarize_tool_call("git log"), "查看 git 提交记录")
-        # 非 log 的 git 走兜底（保留命令首行）。
-        self.assertEqual(consumer.summarize_tool_call("git status"), "git status")
+    v0.6.0（A 项）：standard 档逐步行的摘要来源由桥侧启发式规则表
+    （``summarize_tool_call`` / ``_SUMMARY_*``）改为 dsh 的文案算法
+    （``message.stepProcess.<kind>`` 词干 + ``liveToolDetail`` 参数细节）。
+    参数取不到细节时 dsh 回落到**工具名**（``normalizeLiveToolDetail(name)``），
+    故纯命令字符串会渲染成 ``执行命令（bash）``。
+    """
 
-    def test_file_read_rules(self):
-        self.assertEqual(
-            consumer.summarize_tool_call("sed -n '1,18p' /a/b/CHANGELOG.md"),
-            "读取文件（CHANGELOG.md）",
-        )
-        self.assertEqual(consumer.summarize_tool_call("head -12 CHANGELOG.md"), "读取文件（CHANGELOG.md）")
-        self.assertEqual(consumer.summarize_tool_call("cat /etc/hostname"), "读取文件（hostname）")
-        self.assertEqual(consumer.summarize_tool_call("tail -f /var/log/x.log"), "读取文件（x.log）")
-        # 没有文件参数时只报动作。
-        self.assertEqual(consumer.summarize_tool_call("head"), "读取文件")
-
-    def test_grep_rules(self):
-        self.assertEqual(consumer.summarize_tool_call('grep -rn "TODO" consumer.py'), "查找（TODO）")
-        self.assertEqual(consumer.summarize_tool_call("rg --hidden foo"), "查找（foo）")
-        # 无关键词 → 兜底短语。
-        self.assertEqual(consumer.summarize_tool_call("grep -rn"), "搜索文件内容")
-
-    def test_fixed_phrase_rules(self):
+    def test_phrase_by_tool_kind(self):
+        # 短语表逐项（取 dsh message.stepProcess.<kind> 词干）。
         cases = {
-            "df -h /": "检查磁盘使用",
-            "free -h": "检查内存",
-            "du -sh /tmp/* | sort -rh | head -3": "统计目录占用",
-            "systemctl --user is-active x y": "检查服务状态",
-            "ls -la /tmp": "列出目录",
-            "ps aux | grep dsh": "查看进程",
+            "bash": "执行命令",
+            "read": "读取文件",
+            "read_image": "读取图片",
+            "write": "写入文件",
+            "grep": "搜索代码",
+            "glob": "搜索代码",
+            "edit": "修改文件",
+            "apply_patch": "修改文件",
+            "run_code": "运行代码",
+            "web_search": "搜索网页",
+            "web_fetch": "访问网页",
+            "subagent": "协调子智能体",
+            "spawn_teammate": "协调子智能体",
+            "todo_write": "更新计划",
+            "ask_user_question": "提问",
+            "job_output": "调用工具",
         }
-        for command, expected in cases.items():
-            with self.subTest(command=command):
-                self.assertEqual(consumer.summarize_tool_call(command), expected)
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(consumer.dsh_activity_phrase(name), expected)
 
-    def test_wrapper_words_are_skipped(self):
-        self.assertEqual(consumer.summarize_tool_call("sudo df -h"), "检查磁盘使用")
-        self.assertEqual(consumer.summarize_tool_call("FOO=1 ls -l"), "列出目录")
-        self.assertEqual(consumer.summarize_tool_call("/usr/bin/df -h"), "检查磁盘使用")
+    def test_full_description_matches_dsh_fallback(self):
+        # 参数不是 JSON 对象（纯命令字符串 / 空）→ 细节回落到工具名，与 dsh 逐字一致。
+        self.assertEqual(consumer.describe_tool_call("bash", "ls -la /tmp"), "执行命令（bash）")
+        self.assertEqual(consumer.describe_tool_call("bash", "git -C /x log --oneline -3"), "执行命令（bash）")
+        self.assertEqual(consumer.describe_tool_call("bash", ""), "执行命令（bash）")
+        self.assertEqual(consumer.describe_tool_call("bash", None), "执行命令（bash）")
+        self.assertEqual(consumer.describe_tool_call("bash", "   "), "执行命令（bash）")
+        self.assertEqual(consumer.describe_tool_call("read", "") , "读取文件（read）")
 
-    def test_fallback_truncates_first_line(self):
-        summary = consumer.summarize_tool_call("wc -l /home/artom/.hermes/logs/gateway.log")
-        self.assertEqual(summary, "wc -l /home/artom/.hermes/logs/gateway.log")
-        long_command = "python3 -c 'print(1)' " + "--flag=" + "x" * 80
-        summary = consumer.summarize_tool_call(long_command)
-        self.assertLessEqual(len(summary), consumer._SUMMARY_FALLBACK_LIMIT)
-        self.assertTrue(summary.endswith("…"))
-        # 多行命令只取首行。
-        self.assertEqual(consumer.summarize_tool_call("wc -l a.txt\nrm -rf /"), "wc -l a.txt")
+    def test_detail_keys_by_dsh_order(self):
+        # 键序 = dsh LIVE_TOOL_DETAIL_KEYS：description 在 command 之前。
+        self.assertEqual(
+            consumer.describe_tool_call(
+                "bash", {"command": "ls -la", "description": "List current directory contents"}
+            ),
+            "执行命令（List current directory contents）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("bash", {"command": "df -h"}),
+            "执行命令（df -h）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("read", {"file_path": "/home/artom/.hermes/config.yaml"}),
+            "读取文件（/home/artom/.hermes/config.yaml）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("grep", {"query": "search term"}),
+            "搜索代码（search term）",
+        )
+        # 字符串形式的 JSON 对象同样按 dsh 键序取细节。
+        self.assertEqual(
+            consumer.describe_tool_call("bash", '{"command": "git status --short", "timeout": 30}'),
+            "执行命令（git status --short）",
+        )
 
-    def test_json_arguments(self):
-        self.assertEqual(consumer.summarize_tool_call('{"command": "git status --short", "timeout": 30}'), "git status --short")
-        self.assertEqual(consumer.summarize_tool_call('{"path": "/home/artom/.hermes/config.yaml"}'), "读取文件（config.yaml）")
-        self.assertEqual(consumer.summarize_tool_call({"command": "df -h /"}), "检查磁盘使用")
+    def test_questions_take_first_question(self):
+        # questions 键：取首问的 question 字段（dsh questionDetail）。
+        self.assertEqual(
+            consumer.describe_tool_call(
+                "ask_user_question", {"questions": [{"question": "选哪个？"}, {"question": "其次？"}]}
+            ),
+            "提问（选哪个？）",
+        )
 
-    def test_empty_arguments(self):
-        self.assertEqual(consumer.summarize_tool_call(""), "")
-        self.assertEqual(consumer.summarize_tool_call(None), "")
-        self.assertEqual(consumer.summarize_tool_call("   "), "")
+    def test_detail_list_joined_and_truncated(self):
+        # 全字符串数组按「, 」连接；超 160 字符截断并补省略号。
+        self.assertEqual(
+            consumer.describe_tool_call("web_search", {"queries": ["dsh a2a", "bridge"]}),
+            "搜索网页（dsh a2a, bridge）",
+        )
+        long_detail = "x" * 300
+        described = consumer.describe_tool_call("bash", {"command": long_detail})
+        self.assertEqual(len(described), len("执行命令（）") + consumer._DSH_ACTIVITY_DETAIL_LIMIT)
+        self.assertTrue(described.endswith("…）"))
+
+    def test_no_name_no_detail_is_empty(self):
+        # 无名也无细节 → 空串（调用方退化为占位行）。
+        self.assertEqual(consumer.describe_tool_call("", ""), "")
 
     def test_content_true_keeps_full_command(self):
         # v0.5.0：tool_call 四档均不再单独成行（统一由代码框组承载），返回 None。
@@ -994,13 +1023,13 @@ class ConsumeStreamContentTest(unittest.TestCase):
     def test_content_false_hides_details_keeps_flow(self):
         stats, sent = self._run(False)
         # content=false（standard 档）把一轮的 tool_call + tool_result + thinking 收口
-        # 为一条无语言标记的代码框组消息（组头 + 每步「工具名 · 人话摘要」+ 思考首行预览）；
+        # 为一条无语言标记的代码框组消息（组头 + 每步「工具名 · dsh 活动描述」+ 思考首行预览）；
         # 操作流（📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常。
         box = "```\n" + "\n".join(
             [
                 "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
-                "1. shell_exec · 列出目录",
+                "1. shell_exec · 调用工具（shell_exec）",
                 consumer._BOX_SEP,
                 "思考 · 让我先想想",
             ]
@@ -1090,13 +1119,13 @@ class ConsumeStreamContentTest(unittest.TestCase):
             min_interval=0.0, content=False,
         )
         # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；工具步收口为一条代码框组
-        # 消息（shell_exec 未知 → tools 兜底 → 已调用工具；standard 逐步行 = 人话摘要），
+        # 消息（shell_exec 未知 → tools 兜底 → 已调用工具；standard 逐步行 = dsh 活动描述），
         # 框先于触发的最终文本行发出。
         box = "```\n" + "\n".join(
             [
                 "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
-                "1. shell_exec · 列出目录",
+                "1. shell_exec · 调用工具（shell_exec）",
                 consumer._BOX_SEP,
                 "思考 · 内部推理线索ALPHA",
             ]

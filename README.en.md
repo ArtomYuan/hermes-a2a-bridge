@@ -108,6 +108,38 @@ log reads `tool a2a_call completed (…s, … chars)`. See
 [CONFIGURATION.en.md](CONFIGURATION.en.md), "Troubleshooting: why does a
 conversation show no live messages?".
 
+### `context_id` shapes and parse-failure warnings (v0.7.1)
+
+The delivery target is derived from `context_id` as
+`platform/chat_id[/thread_id]`. Since v0.7.1 two shapes are accepted:
+
+| Shape | Example | Handling |
+| --- | --- | --- |
+| Standard slash | `feishu/oc_adb…/omt_19d3…`, `feishu/oc_adb…` | passed through |
+| Concatenated (the persisted session name `a2a_list` shows) | `feishuoc_adb…omt_19d3…`, `feishuoc_adb…`, `oc_adb…omt_19d3…` | normalized to `feishu/oc_adb…/omt_19d3…` (platform defaults to `feishu` when absent) |
+
+**Both shapes normalize to the same `platform/chat_id/thread_id`**, so they map to
+the same dsh session and the same Feishu conversation. The concatenated shape used
+to leave `chat_id` empty, which made live streaming go **silent**, the final result
+go undelivered, and the receipt still promise "streaming live" (the 2026-10-10
+03:55:32 incident) — fixed in v0.7.1.
+
+**When no target can be parsed, silence is no longer an option**:
+
+- `logger.warning` is emitted loudly, including the **raw string** and the
+  **failure reason** (both in `_on_pre_tool_call` and in `_stream_dsh_call`, the
+  latter being the original failure point);
+- the receipt becomes an explicit warning and **never claims "streaming live"**
+  (the receipt text itself is Chinese, as all receipts are):
+  `[dsh · context …] ⚠️ 会话标识无法解析（未能得出 platform/chat_id：…），本次不直播、结果仅落工作区。`
+  ("conversation id could not be parsed (no platform/chat_id: …); no live stream
+  this time, the result only lands in the workspace");
+- the task still runs and its report still lands in the workspace; "explicit wins,
+  never overwrite the caller's intent" is unchanged.
+
+Self-check: the `live=True/False` field at the end of each `hook stream dsh` log
+line states whether this run will actually stream.
+
 ### Live tiers and switches
 
 Progress display and intermediate-event push are both configurable

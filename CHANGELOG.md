@@ -5,6 +5,57 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.1] - 2026-10-10
+
+> ⚠️ **行为修复（升级前必读）**：修复「`context_id` 无法解析成投递目标时**直播静默、
+> 结果不送达，且回执仍承诺「过程直播中」**」的幽灵承诺。**根因**是 `context_id`
+> 只按 `split("/")` 还原路由：`a2a_list` 展示的**持久化会话名是拼接形态**
+> （`feishuoc_Xomt_Y`），代理很容易直接拿来当 `context_id`，于是 `chat_id` 解析为空、
+> `make_sender` 退化为 noop——过程一条不发、最终结果也不送达，且无任何告警。
+> **现在**：拼接形态先归一化回 `feishu/oc_X/omt_Y`（直播照常、路由正确）；确实解析
+> 不出目标时 `logger.warning` 大声告警，且受理回执改为显式警告
+> 「⚠️ 会话标识无法解析……本次不直播、结果仅落工作区」。**不新增 / 不删除配置键**，
+> 标准斜杠形态行为完全不变。
+
+### Fixed
+
+- **拼接形态 `context_id` 归一化**（新增 `_normalize_origin_token`）：接受
+  `[<platform>]oc_<id>[omt_<id>]` 形态——`feishuoc_Xomt_Y`、`feishuoc_X`、`oc_Xomt_Y`
+  一律还原为 `platform/chat_id[/thread_id]`（无 `platform` 前缀时补 `feishu`）；
+  标准斜杠形态直通。归一化幂等，且归一化发生时留一条 `info` 轨迹。
+- **解析失败不再静默**：`_on_pre_tool_call` 对无法解析的显式 `context_id` 与消息面
+  origin 各发一条 `logger.warning`（含**原始串**与**失败原因**）；
+  `_stream_dsh_call` 在派生不出 `platform+chat_id` 时再发一条（此处即原爆点），
+  日志级 `live=` 字段同步标注本次是否真会直播。
+- **受理回执文案条件化**：`⏳ 已受理……过程直播中；完成后结果会自动送达本对话`
+  **仅在目标解析成功时**给出；解析失败时改为
+  `⚠️ 会话标识无法解析（未能得出 platform/chat_id：<原因>），本次不直播、结果仅落工作区。`
+- **纵深防御**：`_stream_dsh_call` 自身也归一化入参——即便有别的调用点直接塞拼接串，
+  路由仍正确（与 `_on_pre_tool_call` 归一化后落到同一 `platform/chat_id/thread_id`）。
+- 「显式优先、不覆盖调用方意图」语义**不变**：解析失败时原串仍作为 origin 采用，
+  只是不再谎称会直播与送达。
+
+### Tests
+
+- 新增 `tests/test_origin_normalize.py`（14 例）：`_normalize_origin_token` 表驱动
+  （标准斜杠直通 / 拼接归一化 / 乱串失败带原因 / 幂等）；事故串端到端
+  （`feishuoc_adb23012c64433f9c10d16ccbe61ee8aomt_19d3188651cf5bef` →
+  `feishu/oc_adb23012c64433f9c10d16ccbe61ee8a/omt_19d3188651cf5bef`，`platform=feishu`
+  `chat_id=oc_adb…` `thread_id=omt_…`，且 `make_sender` 被调用即真发送）；
+  解析失败三断言（回执**不含**「过程直播中」、含 ⚠️ 与后果说明、`assertLogs` 捕获
+  WARNING 且原始串在日志内），以及 `_stream_dsh_call` 的 noop-sender + 告警回归。
+- 全量测试 **263 例全绿**（既有 249 + 新增 14）。
+
+### Notes
+
+- 事故对照：`~/.hermes/logs/agent.log` 中 `hook stream dsh` 行——
+  `03:55:32` 那条 `context_id='feishuoc_adb…omt_19d3188651cf5bef'` 的
+  `platform=feishuoc_adb…omt_19d3188651cf5bef chat_id=`（空）即本次现场；
+  同一文件 `00:52:30` / `03:34:26` / `04:18:22` / `04:43:04` / `05:04:09` 各条为
+  标准斜杠形态，`platform=feishu chat_id=oc_adb…` 正常。修复后 `05:12:00` 那条
+  （`omt_19d3188651cf5bef`，同 thread）也已带正确 `chat_id`。
+- **不部署**：本次仅改工作树，版本 `0.7.1` 待宿主侧验收后发布。
+
 ## [0.7.0] - 2026-10-10
 
 > ⚠️ **渲染改革（观感变更，升级前必读）**：直播过程与回复**彻底去掉代码框 / 围栏**，

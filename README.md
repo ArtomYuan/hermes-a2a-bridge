@@ -83,6 +83,29 @@ markdown 照常渲染；v0.7.0 起**一律为纯文本正文**）。超长（>80
 未被拦截时日志为 `tool a2a_call completed (…s, … chars)`。详见
 [CONFIGURATION.md](CONFIGURATION.md)「排查：某会话为何没有直播消息？」。
 
+### `context_id` 形态与解析失败告警（v0.7.1）
+
+投递目标从 `context_id` 派生出 `platform/chat_id[/thread_id]`。v0.7.1 起接受两种形态：
+
+| 形态 | 例子 | 处理 |
+|---|---|---|
+| 标准斜杠 | `feishu/oc_adb…/omt_19d3…`、`feishu/oc_adb…` | 直通 |
+| 拼接（`a2a_list` 展示的持久化会话名） | `feishuoc_adb…omt_19d3…`、`feishuoc_adb…`、`oc_adb…omt_19d3…` | 归一化为 `feishu/oc_adb…/omt_19d3…`（无平台前缀时补 `feishu`） |
+
+**两类形态都归一化到同一 `platform/chat_id/thread_id`**，因此落到同一个 dsh 会话与
+同一个飞书会话。拼接形态此前会让 `chat_id` 解析为空，导致**直播静默、最终结果不送达，
+且回执仍承诺「过程直播中」**（2026-10-10 03:55:32 事故）——v0.7.1 修复。
+
+**解析不出目标时不再静默**：
+
+- `logger.warning` 大声告警，含**原始串**与**失败原因**（`_on_pre_tool_call` 与
+  `_stream_dsh_call` 两处都会告警；后者即原爆点）；
+- 受理回执改为显式警告，**不再出现「过程直播中」的幽灵承诺**：
+  `[dsh · context …] ⚠️ 会话标识无法解析（未能得出 platform/chat_id：…），本次不直播、结果仅落工作区。`
+- 任务本身仍会执行，报告落工作区；「显式优先、不覆盖调用方意图」语义不变。
+
+日志自查：`hook stream dsh` 行末尾的 `live=True/False` 标注本次是否真会直播。
+
 ### 直播档位与开关
 
 过程展示与中间事件推送均可调整：`collector.live_detail` 控制**直播过程组的档位**

@@ -30,8 +30,14 @@ Hermes 内置 A2A 插件（``~/.hermes/hermes-agent/plugins/platforms/a2a/``）�
   cron / kanban / api_server / webhook 等非消息面一律不注入。
 - 范围：仅 ``a2a_call`` 与 ``a2a_orchestrate`` 两个工具；其余工具不动。
 - 显式优先：若调用方已显式传入非空 ``context_id`` 或 ``contextId``（别名），该值被
-  原样采用为直播 origin（不覆盖调用方意图）；非直播路径（collector 关 / 非 dsh /
+  采用为直播 origin（不覆盖调用方意图）；非直播路径（collector 关 / 非 dsh /
   ``a2a_orchestrate``）仍不覆盖调用方 context。
+- 目标解析加固（2026-10-10）：``context_id`` 会先经 ``_normalize_origin_token`` 归一化。
+  标准斜杠形态 ``feishu/oc_x/omt_y`` 直通；拼接形态 ``feishuoc_xomt_y`` /
+  ``feishuoc_x`` / ``oc_xomt_y``（``a2a_list`` 展示的持久化会话名）还原为斜杠形态。
+  **解析不出 platform+chat_id 时大声 ``logger.warning``，且受理回执不再承诺
+  「直播中、自动送达」，而是显式警告「本次不直播、结果仅落工作区」**——杜绝
+  2026-10-10 03:55:32 那类「直播静默 + 幽灵承诺」。
 - 故障放行：任何 import 失败 / 异常都 return None（不阻断工具调用），仅 logging.warning 记录。
 - 默认关：本插件不在 ``plugins.enabled`` 白名单时不会被加载，故「未启用即无副作用」。
   启用方式见 README.md。
@@ -65,9 +71,10 @@ hook 里对 dsh 目标做**单执行**：
 """
 
 import logging
+import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +87,15 @@ _TARGET_TOOLS = frozenset(
         "a2a_call",
         "a2a_orchestrate",
     }
+)
+
+# 拼接形态 context_id 的还原规则：``[<platform>]oc_<id>[omt_<id>]``。
+# platform 前缀惰性匹配（``feishuoc_…`` → platform=feishu、chat=oc_…）；
+# chat 惰性 + thread 可选 + ``$`` 锚点，保证 ``omt_`` 段不会被吞进 chat。
+_ORIGIN_CONCAT_RE = re.compile(
+    r"^(?:(?P<platform>[a-z][a-z0-9_-]*?))?"
+    r"(?P<chat>oc_[0-9A-Za-z]{3,}?)"
+    r"(?:(?P<thread>omt_[0-9A-Za-z]{3,}))?$"
 )
 
 # P2c 直播消费者门控状态：register() 读 ``collector.enabled``（默认关）后写入全局，
@@ -219,6 +235,44 @@ def _build_origin() -> str:
     return "/".join(parts)
 
 
+def _normalize_origin_token(raw: str) -> Tuple[str, str]:
+    """把 context_id 归一化为 ``platform/chat_id[/thread_id]``。
+
+    返回 ``(归一化串, 失败原因)``；失败时归一化串为 ``""``、原因为可读诊断。
+
+    接受的形态（2026-10-10 加固，事故 context_id 见 §背景）：
+      1. **标准斜杠形态** ``feishu/oc_xxx/omt_yyy``、``feishu/oc_xxx`` —— 直通；
+      2. **拼接形态** ``feishuoc_xxxomt_yyy``、``feishuoc_xxx``、``oc_xxxomt_yyy``
+         —— 还原为 ``feishu/oc_xxx/omt_yyy``（无 platform 前缀时补 ``feishu``）。
+         ``a2a_list`` 展示的持久化会话名即这种拼接形态，代理很容易直接拿来当
+         ``context_id``；此前它会让 ``chat_id`` 解析为空、直播与送达静默失效。
+
+    任何其它串（如裸 ``custom_session``）都判为失败，由调用方大声告警并按
+    「不直播、结果仅落工作区」如实回执，不再给出幽灵承诺。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", "empty"
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) not in (2, 3):
+            return "", f"slash form needs 2 or 3 segments, got {len(parts)}"
+        if any(not p.strip() for p in parts):
+            return "", "slash form has an empty segment"
+        return "/".join(p.strip() for p in parts), ""
+    m = _ORIGIN_CONCAT_RE.match(s)
+    if not m:
+        return "", (
+            "not 'platform/chat_id[/thread_id]' and not "
+            "'[platform]oc_<id>[omt_<id>]'"
+        )
+    platform = (m.group("platform") or "feishu").strip()
+    parts = [platform, m.group("chat")]
+    if m.group("thread"):
+        parts.append(m.group("thread"))
+    return "/".join(parts), ""
+
+
 def _dsh_peer() -> Optional[Dict[str, Any]]:
     """读 ``a2a_agents.dsh`` 配置条目（url / auth / capabilities）；未配置返回 None。"""
     try:
@@ -309,10 +363,30 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
 
     # 路由信息从 context_id(origin) 派生，而不是再读 ContextVar。origin 各段已被
     # _clean_segment 清理过（无 "/"），直接 split("/") 还原。
+    # 加固（2026-10-10）：先归一化拼接形态；归一化后仍切不出 platform+chat_id 时
+    # 大声告警——这正是「直播静默」的原爆点，绝不允许无声失效。
+    normalized, reason = _normalize_origin_token(context_id)
+    if normalized and normalized != context_id:
+        logger.info(
+            "hermes-a2a-bridge: context_id 归一化 %r -> %r", context_id, normalized
+        )
+        context_id = normalized
     parts = context_id.split("/") if context_id else []
     platform = parts[0] if len(parts) > 0 else ""
     chat_id = parts[1] if len(parts) > 1 else ""
     thread_id = parts[2] if len(parts) > 2 else ""
+
+    live_routable = bool(platform and chat_id)
+    if not live_routable:
+        logger.warning(
+            "hermes-a2a-bridge: context_id 未能得出 platform/chat_id，"
+            "本次直播与结果送达已禁用（任务仍会执行，报告仅落工作区）；"
+            "context_id=%r platform=%r chat_id=%r reason=%s",
+            context_id,
+            platform,
+            chat_id,
+            reason or "slash form missing a segment",
+        )
 
     consumer = _import_consumer()
     # 热读事件开关 + live_detail 档位（本任务开始时各读一次，任务中途改配置不影响
@@ -320,20 +394,22 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     # live_detail 经 _read_live_detail 解析为四档之一（含 follow-dsh 读文件）。
     events = _read_switch("collector.events", True)
     level = _read_live_detail()
-    # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
+    # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender（已在上面
+    # 告警，不会无声）。
     # v0.7.0 起直播与结果送达的正文都不含代码框，分块一律走纯文本换行边界。
     sender = (
         consumer.make_sender(_CTX)
-        if (platform and chat_id)
+        if live_routable
         else lambda p, c, t, text: {"ok": True}  # noqa: E731  # 不真实发送
     )
     logger.info(
         "hermes-a2a-bridge: hook stream dsh agent=dsh msg_len=%d context_id=%r "
-        "platform=%s chat_id=%s",
+        "platform=%s chat_id=%s live=%s",
         len(message),
         context_id,
         platform,
         chat_id,
+        live_routable,
     )
     timeout = _coerce_timeout(timeout_raw, consumer._DEFAULT_TIMEOUT)
     stats = consumer.consume_stream(
@@ -472,24 +548,59 @@ def _on_pre_tool_call(
     对 dsh 目标的 ``a2a_call``（collector 开 + origin 非空 + message 非空）走单执行：
     ``_spawn_stream_worker`` 后台直播，随后 ``{"action": "block", "message": 受理回执}``
     阻止原 a2a_call 执行（消除双执行）。origin 取 ``explicit or _build_origin()``：
-    调用方显式传入的 context_id（或 contextId 别名）不再关闭直播，而是原样采用为
+    调用方显式传入的 context_id（或 contextId 别名）不再关闭直播，而是采用为
     origin（不覆盖调用方意图）。流式失败时回退为仅注入 origin。其余情况
     （a2a_orchestrate / 非 dsh / collector 关 / 非消息面 / message 空）仅注入 origin
     或放行（显式 context_id 时不覆盖）。
+
+    目标解析加固（2026-10-10，v0.7.1）：两处 origin 都先经 ``_normalize_origin_token``
+    归一化——拼接形态 ``feishuoc_Xomt_Y`` 还原为 ``feishu/oc_X/omt_Y``，标准斜杠形态
+    直通。解析不出 ``platform+chat_id`` 时 ``logger.warning`` 大声告警，且受理回执
+    **不再承诺**「过程直播中 + 自动送达」，改为显式警告「本次不直播、结果仅落工作区」。
+    解析失败时原串仍作为 origin 采用（「显式优先」不变），只是不再谎称会直播与送达。
     """
     if tool_name not in _TARGET_TOOLS:
         return None
 
     args = args if isinstance(args, dict) else {}
 
-    # 显式 context_id（或 contextId 别名）：作为直播 origin 原样采用（不覆盖）。
-    explicit = str(args.get("context_id") or args.get("contextId") or "").strip()
+    # 显式 context_id（或 contextId 别名）：作为直播 origin 采用（不覆盖调用方意图）。
+    explicit_raw = str(args.get("context_id") or args.get("contextId") or "").strip()
+    # 目标解析加固（2026-10-10 直播静默事故）：先归一化，能还原成
+    # platform/chat_id[/thread_id] 就用归一化串（拼接形态也能正确路由）；
+    # 还原不出则大声告警，并在受理回执里如实说明，不再给幽灵承诺。
+    explicit_norm, explicit_reason = _normalize_origin_token(explicit_raw)
+    if explicit_raw and not explicit_norm:
+        logger.warning(
+            "hermes-a2a-bridge: context_id 无法解析出 platform/chat_id，"
+            "本次直播与结果送达将被禁用（任务仍会执行，报告仅落工作区）；"
+            "raw=%r reason=%s",
+            explicit_raw,
+            explicit_reason,
+        )
+    # 解析成功 → 归一化串；失败 → 保留原串（「显式优先、不覆盖调用方意图」不变，
+    # 下游 _stream_dsh_call 会因 chat_id 为空而再次告警）。
+    explicit = explicit_norm or explicit_raw
 
     # 消息面 origin（非消息面 / platform 或 chat_id 为空时返回 ""）。
     origin = _build_origin()
+    origin_norm, origin_reason = _normalize_origin_token(origin)
+    if origin and not origin_norm:
+        logger.warning(
+            "hermes-a2a-bridge: 消息面 origin 无法解析出 platform/chat_id，"
+            "本次直播与结果送达将被禁用；raw=%r reason=%s",
+            origin,
+            origin_reason,
+        )
+        origin = ""
+    else:
+        origin = origin_norm or origin
+
     # 有效 origin：显式优先，否则消息面。带显式 context_id 的调用由同步变异步
-    # （后台直播 + 受理回执 + 结果自动送达），且该 context 被原样采用。
+    # （后台直播 + 受理回执 + 结果自动送达），且该 context 被采用。
     eff_origin = explicit or origin
+    # 目标是否真的可路由：解析出 platform+chat_id 才谈得上「直播 + 送达」。
+    live_target = bool(_normalize_origin_token(eff_origin)[0])
 
     # 单执行：a2a_call 目标 dsh + collector 开 + origin 非空。
     # collector.enabled 热读：Dashboard 改配置后下一次工具调用即生效。
@@ -509,13 +620,20 @@ def _on_pre_tool_call(
                 _spawn_stream_worker(message, eff_origin)
                 # 异步单执行（2026-09-15）：回调秒回受理回执，任务在后台直播 +
                 # 完成后结果自动送达；block 阻止原 a2a_call 执行（消除双执行）。
-                return {
-                    "action": "block",
-                    "message": (
+                # 回执文案条件化（2026-10-10）：只有目标真能路由时才承诺「直播中 +
+                # 自动送达」；解析失败时如实警告，杜绝幽灵承诺。
+                if live_target:
+                    receipt = (
                         f"[dsh · context {eff_origin}] ⏳ 已受理——任务在后台执行，"
                         "过程直播中；完成后结果会自动送达本对话。"
-                    ),
-                }
+                    )
+                else:
+                    receipt = (
+                        f"[dsh · context {eff_origin}] ⚠️ 会话标识无法解析"
+                        f"（未能得出 platform/chat_id：{explicit_reason or origin_reason}），"
+                        "本次不直播、结果仅落工作区。"
+                    )
+                return {"action": "block", "message": receipt}
             except Exception as exc:
                 logger.warning(
                     "hermes-a2a-bridge: stream worker spawn failed, fallback sync: %s",

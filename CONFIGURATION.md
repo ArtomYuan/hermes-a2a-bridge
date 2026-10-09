@@ -212,6 +212,33 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
    无显式 `context_id` 时两者皆空 → 放行）。
 3. **带显式 `context_id` 不是「不直播」的理由**（v0.5.1 起）：该值会作为 origin 被
    采用并照常拦截；若这类调用未直播，按第 2 步的其它条件排查。
+4. **核对 `context_id` 形态**（v0.7.1 起）：标准斜杠形态 `feishu/oc_X[/omt_Y]` 直通；
+   拼接形态 `feishuoc_Xomt_Y` / `feishuoc_X` / `oc_Xomt_Y`（`a2a_list` 展示的持久化
+   会话名）会先归一化为斜杠形态，两者落到同一会话。若仍无直播，看该条
+   `hook stream dsh` 日志的 `live=` 字段与告警：
+   - `live=False` + `context_id 未能得出 platform/chat_id … 本次直播与结果送达已禁用`
+     → **目标解析失败**，本次不直播、结果仅落工作区；
+   - 回执出现 `⚠️ 会话标识无法解析` 即同一情况（v0.7.0 及更早这里会给出
+     「⏳ 已受理……过程直播中」的**幽灵承诺**，v0.7.1 已改为如实警告）。
+
+### `context_id` 形态与解析失败告警（v0.7.1）
+
+投递目标由 `context_id` 派生，v0.7.1 起接受两种形态并**归一到同一
+`platform/chat_id[/thread_id]`**：
+
+| 形态 | 例子 | 处理 |
+| --- | --- | --- |
+| 标准斜杠 | `feishu/oc_adb…/omt_19d3…`、`feishu/oc_adb…` | 直通 |
+| 拼接 | `feishuoc_adb…omt_19d3…`、`feishuoc_adb…`、`oc_adb…omt_19d3…` | 还原为 `feishu/oc_adb…/omt_19d3…`（无平台前缀补 `feishu`） |
+
+解析不出 `platform+chat_id` 时（如裸 `custom_session`）：
+
+- `logger.warning` 告警，含原始串与失败原因（hook 入口与 `_stream_dsh_call` 两处，
+  后者即原爆点）；
+- 受理回执改为 `[dsh · context …] ⚠️ 会话标识无法解析（未能得出 platform/chat_id：…），
+  本次不直播、结果仅落工作区。`；
+- 任务仍执行、报告仍落工作区；**「显式优先、不覆盖调用方意图」不变**（原串仍作为
+  origin 采用），只是不再谎称会直播与送达。
 
 ### 启用方式（collector 直播门控）
 

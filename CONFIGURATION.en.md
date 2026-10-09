@@ -279,6 +279,40 @@ Check them in this order:
 3. **An explicit `context_id` is not a reason for "no live output"** (as of
    v0.5.1): that value becomes the origin and the call is intercepted as usual;
    if such a call shows no live output, check the other conditions in step 2.
+4. **Check the `context_id` shape** (as of v0.7.1): the standard slash shape
+   `feishu/oc_X[/omt_Y]` is passed through; the concatenated shape
+   `feishuoc_Xomt_Y` / `feishuoc_X` / `oc_Xomt_Y` (the persisted session name
+   `a2a_list` shows) is normalized to the slash shape first, so both map to the
+   same conversation. If there is still no live output, read the `live=` field and
+   the warning on that `hook stream dsh` line:
+   - `live=False` plus `context_id 未能得出 platform/chat_id … 本次直播与结果送达已禁用`
+     → **the target could not be parsed**; no live stream this time, the result only
+     lands in the workspace;
+   - a receipt containing `⚠️ 会话标识无法解析` is the same case (in v0.7.0 and
+     earlier this spot produced the **ghost promise**
+     "⏳ 已受理……过程直播中"; v0.7.1 replaced it with an honest warning).
+
+### `context_id` shapes and parse-failure warnings (v0.7.1)
+
+The delivery target is derived from `context_id`; since v0.7.1 two shapes are
+accepted and **normalized to the same `platform/chat_id[/thread_id]`**:
+
+| Shape | Example | Handling |
+| --- | --- | --- |
+| Standard slash | `feishu/oc_adb…/omt_19d3…`, `feishu/oc_adb…` | passed through |
+| Concatenated | `feishuoc_adb…omt_19d3…`, `feishuoc_adb…`, `oc_adb…omt_19d3…` | normalized to `feishu/oc_adb…/omt_19d3…` (platform defaults to `feishu`) |
+
+When no `platform+chat_id` can be parsed (e.g. a bare `custom_session`):
+
+- `logger.warning` is emitted with the raw string and the failure reason (both at
+  the hook entry and in `_stream_dsh_call`, the latter being the original failure
+  point);
+- the receipt becomes
+  `[dsh · context …] ⚠️ 会话标识无法解析（未能得出 platform/chat_id：…），本次不直播、结果仅落工作区。`;
+- the task still runs and its report still lands in the workspace; **"explicit
+  wins, never overwrite the caller's intent" is unchanged** (the raw string is
+  still adopted as the origin) — it simply no longer claims it will stream and
+  deliver.
 
 ### Enable method (collector live gating)
 

@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -246,10 +247,10 @@ _EXPECTED_KINDS = [
     "status",
 ]
 
-# consume_stream / Throttler 期望的发送行序列（min_interval=0）。
-# 一轮内的 tool_call / tool_result / thinking 统一收口为一条无语言标记的代码框
-# 组消息（默认档 detailed），替换 v0.4.1 的「🧠 思考中… / 🔧 / 📋」逐条行。
-_BOX_BODY = "\n".join(
+# 整任务单框（v0.6.0）：一轮里的 tool_call / tool_result / thinking / 叙述与最终结果
+# 全部拼进**同一个**代码框，任务终结时一次发出（唯一一条消息）。
+# ``用时`` 是运行时值，比较前统一归一（见 ``_normalize_elapsed``）。
+_WIRE_BOX_BODY = "\n".join(
     [
         "工作步骤 · 1 步 · 已调用工具",
         consumer._BOX_SEP,
@@ -257,80 +258,140 @@ _BOX_BODY = "\n".join(
         "   ↳ total 4",
         consumer._BOX_SEP,
         "思考 · 让我先想想",
+        "📖 正在查看当前目录…",
     ]
 )
-_EXPECTED_BOX = "```\n" + _BOX_BODY + "\n```"
-_EXPECTED_SENT = [
-    _EXPECTED_BOX,
-    "📖 正在查看当前目录…",
-    "📖 输出完成",
-    "✅ 完成",
-]
+_EXPECTED_MESSAGE = "```\n" + _WIRE_BOX_BODY + "\n" + consumer._BOX_SEP + "\n" + (
+    "📬 dsh 任务完成（用时 <t>），结果如下：\n目录下有 4 个文件。\n```"
+)
+
+_ELAPSED_RE = re.compile(r"用时 \d+(?: 分 \d+)? 秒")
 
 
-class ToolCallSummaryTest(unittest.TestCase):
-    """`summarize_tool_call`：规则表 + 兜底截断（内容开关关时的工具调用摘要）。"""
+def _normalize_elapsed(text):
+    """把「用时 12 秒 / 用时 1 分 2 秒」归一成 ``用时 <t>``（时长非断言对象）。"""
+    return _ELAPSED_RE.sub("用时 <t>", text)
 
-    def test_git_log_rule(self):
-        self.assertEqual(consumer.summarize_tool_call("git -C /x log --oneline -3"), "查看 git 提交记录")
-        self.assertEqual(consumer.summarize_tool_call("git log"), "查看 git 提交记录")
-        # 非 log 的 git 走兜底（保留命令首行）。
-        self.assertEqual(consumer.summarize_tool_call("git status"), "git status")
 
-    def test_file_read_rules(self):
+def _wrap(*lines):
+    """把框内行拼成一条裸围栏代码框消息。"""
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+class ToolActivityDescriptionTest(unittest.TestCase):
+    """v0.6.0：步骤行活动描述 = dsh 活动短语（``message.stepProcess.<kind>`` 词干）
+    + dsh ``liveToolDetail`` 参数细节，不再回落到命令原文截断。"""
+
+    def test_read_write_edit_details(self):
+        # dsh liveToolDetail 直接取参数值（不做 basename 折叠），read 取 path。
         self.assertEqual(
-            consumer.summarize_tool_call("sed -n '1,18p' /a/b/CHANGELOG.md"),
-            "读取文件（CHANGELOG.md）",
+            consumer.describe_tool_call("read", '{"path": "/home/artom/.hermes/config.yaml"}'),
+            "读取文件（/home/artom/.hermes/config.yaml）",
         )
-        self.assertEqual(consumer.summarize_tool_call("head -12 CHANGELOG.md"), "读取文件（CHANGELOG.md）")
-        self.assertEqual(consumer.summarize_tool_call("cat /etc/hostname"), "读取文件（hostname）")
-        self.assertEqual(consumer.summarize_tool_call("tail -f /var/log/x.log"), "读取文件（x.log）")
-        # 没有文件参数时只报动作。
-        self.assertEqual(consumer.summarize_tool_call("head"), "读取文件")
+        self.assertEqual(
+            consumer.describe_tool_call("write", '{"file_path": "/tmp/b"}'),
+            "写入文件（/tmp/b）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("edit", {"path": "/tmp/a"}), "修改文件（/tmp/a）"
+        )
 
-    def test_grep_rules(self):
-        self.assertEqual(consumer.summarize_tool_call('grep -rn "TODO" consumer.py'), "查找（TODO）")
-        self.assertEqual(consumer.summarize_tool_call("rg --hidden foo"), "查找（foo）")
-        # 无关键词 → 兜底短语。
-        self.assertEqual(consumer.summarize_tool_call("grep -rn"), "搜索文件内容")
+    def test_commands_and_search_details(self):
+        self.assertEqual(
+            consumer.describe_tool_call("bash", '{"command": "git log --oneline -3"}'),
+            "执行命令（git log --oneline -3）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("grep", '{"query": "TODO"}'), "搜索代码（TODO）"
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("glob", '{"pattern": "**/*.py"}'),
+            "搜索代码（**/*.py）",
+        )
 
-    def test_fixed_phrase_rules(self):
-        cases = {
-            "df -h /": "检查磁盘使用",
-            "free -h": "检查内存",
-            "du -sh /tmp/* | sort -rh | head -3": "统计目录占用",
-            "systemctl --user is-active x y": "检查服务状态",
-            "ls -la /tmp": "列出目录",
-            "ps aux | grep dsh": "查看进程",
+    def test_dsh_detail_key_priority(self):
+        # 逐字对齐 dsh LIVE_TOOL_DETAIL_KEYS：title > description > command。
+        self.assertEqual(
+            consumer.describe_tool_call(
+                "bash", {"command": "df -h", "description": "查看磁盘"}
+            ),
+            "执行命令（查看磁盘）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call(
+                "bash", {"command": "df -h", "title": "磁盘检查", "description": "查看磁盘"}
+            ),
+            "执行命令（磁盘检查）",
+        )
+
+    def test_questions_takes_first_question(self):
+        arguments = {
+            "questions": [
+                {"question": "  选哪个  ", "options": []},
+                {"question": "第二个"},
+            ]
         }
-        for command, expected in cases.items():
-            with self.subTest(command=command):
-                self.assertEqual(consumer.summarize_tool_call(command), expected)
+        self.assertEqual(
+            consumer.describe_tool_call("ask_user_question", arguments),
+            "提问（选哪个）",
+        )
 
-    def test_wrapper_words_are_skipped(self):
-        self.assertEqual(consumer.summarize_tool_call("sudo df -h"), "检查磁盘使用")
-        self.assertEqual(consumer.summarize_tool_call("FOO=1 ls -l"), "列出目录")
-        self.assertEqual(consumer.summarize_tool_call("/usr/bin/df -h"), "检查磁盘使用")
+    def test_string_list_and_multiline_details_are_flattened(self):
+        # dsh normalizeLiveToolDetail：全字符串数组用 ", " 连接，空白折叠为单空格。
+        self.assertEqual(
+            consumer.describe_tool_call("web_search", {"queries": ["a", "b"]}),
+            "搜索网页（a, b）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("bash", {"command": "ls -la\n  /tmp"}),
+            "执行命令（ls -la /tmp）",
+        )
 
-    def test_fallback_truncates_first_line(self):
-        summary = consumer.summarize_tool_call("wc -l /home/artom/.hermes/logs/gateway.log")
-        self.assertEqual(summary, "wc -l /home/artom/.hermes/logs/gateway.log")
-        long_command = "python3 -c 'print(1)' " + "--flag=" + "x" * 80
-        summary = consumer.summarize_tool_call(long_command)
-        self.assertLessEqual(len(summary), consumer._SUMMARY_FALLBACK_LIMIT)
-        self.assertTrue(summary.endswith("…"))
-        # 多行命令只取首行。
-        self.assertEqual(consumer.summarize_tool_call("wc -l a.txt\nrm -rf /"), "wc -l a.txt")
+    def test_detail_truncated_to_dsh_limit(self):
+        detail = "x" * 500
+        description = consumer.describe_tool_call("bash", {"command": detail})
+        self.assertTrue(description.startswith("执行命令（"))
+        self.assertTrue(description.endswith("…）"))
+        # 正文长度 = 上限（dsh 的 160 字符含省略号）。
+        self.assertEqual(
+            len(description), len("执行命令（）") + consumer._DSH_ACTIVITY_DETAIL_LIMIT
+        )
 
-    def test_json_arguments(self):
-        self.assertEqual(consumer.summarize_tool_call('{"command": "git status --short", "timeout": 30}'), "git status --short")
-        self.assertEqual(consumer.summarize_tool_call('{"path": "/home/artom/.hermes/config.yaml"}'), "读取文件（config.yaml）")
-        self.assertEqual(consumer.summarize_tool_call({"command": "df -h /"}), "检查磁盘使用")
+    def test_no_detail_falls_back_to_phrase_without_tool_name(self):
+        # 无参数细节时 dsh 会回落到工具名；步骤行已有活动短语，不再重复展示。
+        self.assertEqual(consumer.describe_tool_call("read", "{}"), "读取文件")
+        self.assertEqual(consumer.describe_tool_call("bash", ""), "执行命令")
+        self.assertEqual(consumer.describe_tool_call("", ""), "")
 
-    def test_empty_arguments(self):
-        self.assertEqual(consumer.summarize_tool_call(""), "")
-        self.assertEqual(consumer.summarize_tool_call(None), "")
-        self.assertEqual(consumer.summarize_tool_call("   "), "")
+    def test_all_kinds_have_dsh_phrase(self):
+        cases = {
+            "read_image": "读取图片",
+            "run_code": "运行代码",
+            "web_fetch": "访问网页",
+            "subagent": "协调子智能体",
+            "todo_write": "更新计划",
+            "team_task_list": "协调子智能体",
+            "who_knows_this": "调用工具",
+        }
+        for name, phrase in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(consumer.describe_tool_call(name, "{}"), phrase)
+
+    def test_tool_activity_detail_is_dsh_faithful(self):
+        # dsh 的 dsh_activity_detail 带工具名兜底（供 b 侧复用与对照）。
+        self.assertEqual(consumer.dsh_activity_detail("read", "{}"), "read")
+        self.assertEqual(consumer.dsh_activity_detail("grep", "-rn"), "grep")
+        self.assertEqual(
+            consumer.dsh_activity_detail("bash", '{"command": "df -h"}'), "df -h"
+        )
+        self.assertEqual(
+            consumer.dsh_activity_detail("bash", '{"cmd": "df -h"}'), "df -h"
+        )
+
+    def test_phrase_table_covers_every_kind(self):
+        for kind in set(consumer._TOOL_KIND_TEXT) | set(consumer._DSH_ACTIVITY_PHRASE):
+            with self.subTest(kind=kind):
+                self.assertIn(kind, consumer._DSH_ACTIVITY_PHRASE)
 
     def test_content_true_keeps_full_command(self):
         # v0.5.0：tool_call 四档均不再单独成行（统一由代码框组承载），返回 None。
@@ -619,83 +680,118 @@ class RenderLineContentTest(unittest.TestCase):
             )
 
 
-class ThrottlerTest(unittest.TestCase):
-    def _run(self, events, min_interval=0.0):
-        throttler = consumer.Throttler(min_interval=min_interval)
-        sent = []
+class TaskBoxTest(unittest.TestCase):
+    """v0.6.0 全任务单框：feed 只累积（恒不发消息），finish 一次给出唯一一条消息。"""
+
+    def _box(self, events, level=None, final_text="", state=""):
+        box = consumer.TaskBox(level=level)
         for event in events:
-            line = consumer.render_line(event)
-            for text in throttler.feed(event, line):
-                sent.append(text)
-        return sent
+            line = consumer.render_line(event, level=level)
+            self.assertIsNone(box.feed(event, line))
+        return box
 
-    def test_text_aggregation_and_high_signal_passthrough(self):
+    def test_wire_sequence_single_message(self):
         events = list(consumer.normalize_events(iter(_wire_sequence())))
-        sent = self._run(events)
-        self.assertEqual(sent, _EXPECTED_SENT)
+        box = self._box(events)
+        message = box.finish("目录下有 4 个文件。", "completed", 0.0)
+        self.assertEqual(_normalize_elapsed(message), _EXPECTED_MESSAGE)
 
-    def test_text_flushes_only_at_terminal(self):
-        # 两个非 final text 块之间不 flush；直到 completed 才 flush 成一条。
+    def test_body_excludes_result_section(self):
+        events = list(consumer.normalize_events(iter(_wire_sequence())))
+        body = self._box(events).body()
+        self.assertNotIn("📬", body)
+        self.assertIn("工作步骤 · 1 步 · 已调用工具", body)
+        self.assertIn("📖 正在查看当前目录…", body)
+
+    def test_multi_round_accumulates_into_one_box(self):
         events = [
+            {"type": "turn_start", "turn": 1},
+            {"type": "tool_call", "name": "read", "arguments": '{"path": "/a.txt"}'},
+            {"type": "tool_result", "name": "read", "text": "A"},
+            {"type": "turn_start", "turn": 2},
+            {"type": "tool_call", "name": "bash", "arguments": '{"command": "ls"}'},
+            {"type": "tool_result", "name": "bash", "text": "B"},
+        ]
+        message = self._box(events, level="standard").finish("完成", "completed", 3.0)
+        self.assertEqual(
+            message,
+            _wrap(
+                "🚀 第 1 轮",
+                "工作步骤 · 1 步 · 已读取文件",
+                consumer._BOX_SEP,
+                "1. read · 读取文件（/a.txt）",
+                "🚀 第 2 轮",
+                "工作步骤 · 1 步 · 执行了命令",
+                consumer._BOX_SEP,
+                "1. bash · 执行命令（ls）",
+                consumer._BOX_SEP,
+                "📬 dsh 任务完成（用时 3 秒），结果如下：",
+                "完成",
+            ),
+        )
+
+    def test_thinking_only_round_has_no_group_header(self):
+        events = [
+            {"type": "turn_start", "turn": 1},
+            {"type": "thinking", "text": "只有思考"},
+        ]
+        body = self._box(events, level="standard").body()
+        self.assertEqual(body, "🚀 第 1 轮\n思考 · 只有思考")
+
+    def test_narratives_keep_arrival_order_after_process(self):
+        events = [
+            {"type": "tool_call", "name": "x", "arguments": '{"command": "ls"}'},
             {"type": "text", "text": "第一块", "final": False},
             {"type": "text", "text": "第二块", "final": False},
-            {"type": "status", "state": "completed"},
-        ]
-        sent = self._run(events)
-        self.assertEqual(sent, ["📖 第一块 第二块", "✅ 完成"])
-
-    def test_turn_end_flushes(self):
-        events = [
-            {"type": "text", "text": "块内容", "final": False},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
+            {"type": "text", "text": "最终正文", "final": True},
         ]
-        sent = self._run(events)
-        self.assertEqual(sent, ["📖 块内容"])
+        box = self._box(events, level="standard")
+        self.assertEqual(box.body().splitlines()[-2:], ["📖 第一块", "📖 第二块"])
+        message = box.finish("最终正文", "completed", 0.0)
+        self.assertTrue(message.endswith("📬 dsh 任务完成（用时 0 秒），结果如下：\n最终正文\n```"))
 
-    def test_high_signal_each_passed(self):
-        # v0.5.0：thinking / tool_call / tool_result 进组缓冲，turn_start 触发收口为
-        # 一条代码框组消息，随后才是轮次标记行。
+    def test_status_and_final_text_do_not_leak_into_body(self):
         events = [
-            {"type": "thinking", "text": "a"},
-            {"type": "tool_call", "name": "x", "arguments": "ls"},
-            {"type": "tool_result", "name": "x", "text": "r"},
-            {"type": "turn_start", "turn": 1},
-        ]
-        sent = self._run(events)
-        box = "```\n" + "\n".join(
-            [
-                "工作步骤 · 1 步 · 已调用工具",
-                consumer._BOX_SEP,
-                "1. x · ls",
-                "   ↳ r",
-                consumer._BOX_SEP,
-                "思考 · a",
-            ]
-        ) + "\n```"
-        self.assertEqual(sent, [box, "🚀 第 1 轮"])
-
-    def test_rate_limit_drops_nothing_with_zero_interval(self):
-        # min_interval=0 → 不等待；thinking 全部进组缓冲（不收口则不发出）。
-        events = [{"type": "thinking", "text": str(i)} for i in range(5)]
-        sent = self._run(events, min_interval=0.0)
-        self.assertEqual(len(sent), 0)
-
-    def test_verbose_flush_does_not_truncate(self):
-        # verbose 档：非 final text 聚合 flush 不截断；其余档截断 120。
-        long_text = "x" * 300
-        events = [
-            {"type": "text", "text": long_text, "final": False},
             {"type": "status", "state": "completed"},
+            {"type": "text", "text": "最终", "final": True},
         ]
-        verbose = consumer.Throttler(min_interval=0.0, level="verbose")
-        detailed = consumer.Throttler(min_interval=0.0, level="detailed")
-        sent_v = []
-        sent_d = []
-        for event in events:
-            sent_v += verbose.feed(event, consumer.render_line(event, level="verbose"))
-            sent_d += detailed.feed(event, consumer.render_line(event, level="detailed"))
-        self.assertEqual(sent_v[0], "📖 " + long_text)
-        self.assertLessEqual(len(sent_d[0]), len("📖 ") + 120)
+        box = self._box(events)
+        self.assertEqual(box.body(), "")
+
+    def test_verbose_narrative_not_truncated(self):
+        long_text = "x" * 300
+        events = [{"type": "text", "text": long_text, "final": False}]
+        verbose = self._box(events, level="verbose").body()
+        detailed = self._box(events, level="detailed").body()
+        self.assertEqual(verbose, "📖 " + long_text)
+        self.assertLessEqual(len(detailed), len("📖 ") + 120)
+
+    def test_empty_task_still_sends_head_line(self):
+        message = self._box([]).finish("", "failed", 61.0)
+        self.assertEqual(
+            message,
+            _wrap("📬 dsh 任务已结束（失败 · 用时 1 分 1 秒）——本次无文本输出。"),
+        )
+
+    def test_result_head_variants(self):
+        box = consumer.TaskBox(level="standard")
+        self.assertTrue(
+            _normalize_elapsed(box.finish("x", "canceled", 5.0)).startswith(
+                "```\n📬 dsh 任务已结束（已取消 · 用时 <t>），输出如下："
+            )
+        )
+        self.assertTrue(
+            box.finish("# 报告", "completed", 5.0).endswith("# 报告\n```")
+        )
+
+    def test_inner_fence_in_result_is_escaped(self):
+        box = consumer.TaskBox(level="standard")
+        message = box.finish("前\n```\n代码\n```\n后", "completed", 0.0)
+        # 外层围栏闭合：整条消息只有尾部一行闭合围栏。
+        self.assertEqual(message.count("\n```"), 1)
+        self.assertTrue(message.startswith("```\n"))
+        self.assertTrue(message.endswith("\n```"))
 
 
 class SenderTest(unittest.TestCase):
@@ -832,10 +928,12 @@ class ConsumeStreamTest(unittest.TestCase):
             consumer.iter_sse_data = consumer._orig_iter_sse_data
             del consumer._orig_iter_sse_data
 
-    def test_consume_stream_stats(self):
-        results = _wire_sequence()
+    def _install(self, results):
         consumer._orig_iter_sse_data = consumer.iter_sse_data
         consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+
+    def test_consume_stream_stats(self):
+        self._install(_wire_sequence())
         sent = []
 
         def sender(platform, chat_id, thread_id, text):
@@ -851,22 +949,24 @@ class ConsumeStreamTest(unittest.TestCase):
             chat_id="oc_x",
             thread_id="",
             sender=sender,
-            min_interval=0.0,
         )
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
-        self.assertEqual(stats["messages_sent"], 4)
+        # v0.6.0：全过程 + 结果 = 唯一一条消息。
+        self.assertEqual(stats["messages_sent"], 1)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
-        self.assertEqual(sent, _EXPECTED_SENT)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(_normalize_elapsed(sent[0]), _EXPECTED_MESSAGE)
+        self.assertIn("工作步骤 · 1 步 · 已调用工具", stats["box_body"])
 
     def test_consume_stream_bad_event_does_not_crash(self):
-        results = [
-            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
-            {"artifactUpdate": {"artifact": {"parts": [{"data": {"kind": "unknown_kind"}}]}}},
-            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
-        ]
-        consumer._orig_iter_sse_data = consumer.iter_sse_data
-        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+        self._install(
+            [
+                {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+                {"artifactUpdate": {"artifact": {"parts": [{"data": {"kind": "unknown_kind"}}]}}},
+                {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+            ]
+        )
         sent = []
 
         def sender(platform, chat_id, thread_id, text):
@@ -876,21 +976,26 @@ class ConsumeStreamTest(unittest.TestCase):
         stats = consumer.consume_stream(
             url="http://x/", token="t", message="m", context_id="c",
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
-            min_interval=0.0,
         )
         self.assertEqual(stats["events_seen"], 2)
         self.assertEqual(stats["states"], ["submitted", "completed"])
-        # unknown_kind 事件被跳过，不产生发送。
-        self.assertEqual(sent, ["✅ 完成"])
+        # unknown_kind 不进过程正文：框内只剩结果段（无文本输出）。
+        self.assertEqual(stats["box_body"], "")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(
+            _normalize_elapsed(sent[0]),
+            _wrap("📬 dsh 任务已结束（完成 · 用时 <t>）——本次无文本输出。"),
+        )
+        self.assertEqual(stats["messages_sent"], 1)
 
-    def test_consume_stream_send_failure_not_counted(self):
-        # sender 返回 {"ok": False} 时只记 warning、不累计 messages_sent。
-        results = [
-            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
-            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
-        ]
-        consumer._orig_iter_sse_data = consumer.iter_sse_data
-        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+    def test_consume_stream_send_failure_retries_once_and_not_counted(self):
+        # sender 返回 {"ok": False} 时重试一次、仍失败只记 warning，messages_sent 不累计。
+        self._install(
+            [
+                {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+                {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+            ]
+        )
         sent = []
 
         def sender(platform, chat_id, thread_id, text):
@@ -900,14 +1005,37 @@ class ConsumeStreamTest(unittest.TestCase):
         stats = consumer.consume_stream(
             url="http://x/", token="t", message="m", context_id="c",
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
-            min_interval=0.0,
         )
-        self.assertEqual(sent, ["✅ 完成"])
+        # 重试一次 ⇒ 两次投递尝试，内容同一条。
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0], sent[1])
         self.assertEqual(stats["messages_sent"], 0)
+
+    def test_consume_stream_sender_exception_retried(self):
+        self._install(
+            [
+                {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+                {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+            ]
+        )
+        calls = []
+
+        def sender(platform, chat_id, thread_id, text):
+            calls.append(text)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return {"ok": True}
+
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stats["messages_sent"], 1)
 
 
 class ConsumeStreamEventsTest(unittest.TestCase):
-    """consume_stream 的 events 开关：false 安静模式只推最终结果，true 与现状一致。"""
+    """consume_stream 的 events 开关：false 安静模式只留结果段，true 过程全进同一框。"""
 
     def tearDown(self):
         if hasattr(consumer, "_orig_iter_sse_data"):
@@ -933,7 +1061,6 @@ class ConsumeStreamEventsTest(unittest.TestCase):
             chat_id="oc_x",
             thread_id="",
             sender=sender,
-            min_interval=0.0,
         )
         if events is not None:
             kw["events"] = events
@@ -945,182 +1072,161 @@ class ConsumeStreamEventsTest(unittest.TestCase):
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
-        self.assertEqual(stats["messages_sent"], 2)
-        # 只有最终结果，无任何中间事件。
-        self.assertEqual(sent, ["📖 输出完成", "✅ 完成"])
+        self.assertEqual(stats["box_body"], "")
+        self.assertEqual(stats["messages_sent"], 1)
+        self.assertEqual(
+            _normalize_elapsed(sent[0]),
+            _wrap(
+                "📬 dsh 任务完成（用时 <t>），结果如下：",
+                "目录下有 4 个文件。",
+            ),
+        )
 
     def test_events_true_matches_current(self):
         stats, sent = self._run(True)
-        self.assertEqual(stats["messages_sent"], 4)
-        self.assertEqual(sent, _EXPECTED_SENT)
+        self.assertEqual(stats["messages_sent"], 1)
+        self.assertEqual(_normalize_elapsed(sent[0]), _EXPECTED_MESSAGE)
 
 
 class ConsumeStreamContentTest(unittest.TestCase):
-    """consume_stream 的 content 开关：false（standard 档）把工具步收敛为组推送
-    （每 6 步心跳 + turn_end/终态收口），操作流（thinking / 叙述 text / final /
-    起止标记）照常；stats 完整性不变。true（detailed 档）与现状一致。"""
+    """consume_stream 的 content 开关：false（standard 档）逐步行用 dsh 活动描述且无
+    结果行（细节不外泄）；true（detailed 档）用参数 + 结果行。两者都是**一个**全任务框。"""
 
     def tearDown(self):
         if hasattr(consumer, "_orig_iter_sse_data"):
             consumer.iter_sse_data = consumer._orig_iter_sse_data
             del consumer._orig_iter_sse_data
 
-    def _run(self, content=None):
-        results = _wire_sequence()
+    def _install(self, results):
         consumer._orig_iter_sse_data = consumer.iter_sse_data
         consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
+
+    def _capture(self):
         sent = []
 
         def sender(platform, chat_id, thread_id, text):
             sent.append(text)
             return {"ok": True}
 
-        kw = dict(
-            url="http://127.0.0.1:8092/",
-            token="fake-token",
-            message="列出当前目录",
-            context_id="feishu/oc_x",
-            platform="feishu",
-            chat_id="oc_x",
-            thread_id="",
-            sender=sender,
-            min_interval=0.0,
-        )
-        if content is not None:
-            kw["content"] = content
-        stats = consumer.consume_stream(**kw)
-        return stats, sent
+        return sent, sender
 
-    def test_content_false_hides_details_keeps_flow(self):
-        stats, sent = self._run(False)
-        # content=false（standard 档）把一轮的 tool_call + tool_result + thinking 收口
-        # 为一条无语言标记的代码框组消息（组头 + 每步「工具名 · 人话摘要」+ 思考首行预览）；
-        # 操作流（📖 叙述 / 📖 最终）+ 起止标记 ✅ 照常。
-        box = "```\n" + "\n".join(
-            [
+    def test_content_false_standard_density(self):
+        self._install(_wire_sequence())
+        sent, sender = self._capture()
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+            content=False,
+        )
+        message = _normalize_elapsed(sent[0])
+        self.assertEqual(
+            message,
+            _wrap(
                 "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
-                "1. shell_exec · 列出目录",
+                "1. shell_exec · 调用工具",
                 consumer._BOX_SEP,
                 "思考 · 让我先想想",
-            ]
-        ) + "\n```"
-        self.assertEqual(
-            sent,
-            [
-                box,
                 "📖 正在查看当前目录…",
-                "📖 输出完成",
-                "✅ 完成",
-            ],
+                consumer._BOX_SEP,
+                "📬 dsh 任务完成（用时 <t>），结果如下：",
+                "目录下有 4 个文件。",
+            ),
         )
-        # 细节不泄露：standard 无结果行，命令正文 / 输出正文不出现。
-        for line in sent:
-            self.assertNotIn("ls\n", line)
-            self.assertNotIn("total 4", line)
-            self.assertNotIn("file1.txt", line)
-        # 不再有 🔧 / 📋 / 🧠 逐条行（统一由框承载）。
-        self.assertFalse(any("🔧" in line for line in sent))
-        self.assertFalse(any("📋" in line for line in sent))
-        self.assertFalse(any("🧠" in line for line in sent))
-        # stats 完整性不变：final_text / events_seen / states 仍完整统计。
+        # standard 无结果行：命令正文 / 输出正文不出现。
+        self.assertNotIn("total 4", message)
+        self.assertNotIn("file1.txt", message)
+        # 不再有 🔧 / 📋 / 🧠 逐条行（统一由单框承载）。
+        for marker in ("🔧", "📋", "🧠"):
+            self.assertNotIn(marker, message)
         self.assertEqual(stats["final_text"], "目录下有 4 个文件。")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "working", "completed"])
-        self.assertEqual(stats["messages_sent"], 4)
+        self.assertEqual(stats["messages_sent"], 1)
 
-    def test_content_false_turn_end_flushes_narrative(self):
-        # 非 final text 仍被喂入 Throttler（操作流不关）→ turn_end 正常 flush 成 📖 行。
-        results = [
-            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
-            _artifact_update([_text_part("中间正文一")], last_chunk=False),
-            _artifact_update([_text_part("中间正文二")], last_chunk=False),
-            _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
-            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
-        ]
-        consumer._orig_iter_sse_data = consumer.iter_sse_data
-        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
-        sent = []
-
-        def sender(platform, chat_id, thread_id, text):
-            sent.append(text)
-            return {"ok": True}
-
+    def test_content_false_narratives_stay_in_the_single_box(self):
+        self._install(
+            [
+                {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+                _artifact_update([_text_part("中间正文一")], last_chunk=False),
+                _artifact_update([_text_part("中间正文二")], last_chunk=False),
+                _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
+                {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+            ]
+        )
+        sent, sender = self._capture()
         stats = consumer.consume_stream(
             url="http://x/", token="t", message="m", context_id="c",
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
-            min_interval=0.0, content=False,
+            content=False,
         )
-        self.assertEqual(sent, ["📖 中间正文一 中间正文二", "✅ 完成"])
+        self.assertEqual(
+            _normalize_elapsed(sent[0]),
+            _wrap(
+                "📖 中间正文一",
+                "📖 中间正文二",
+                consumer._BOX_SEP,
+                "📬 dsh 任务已结束（完成 · 用时 <t>）——本次无文本输出。",
+            ),
+        )
         self.assertEqual(stats["final_text"], "")
         self.assertEqual(stats["events_seen"], 5)
+        self.assertEqual(stats["messages_sent"], 1)
 
-    def test_content_true_matches_current(self):
-        stats, sent = self._run(True)
-        self.assertEqual(stats["messages_sent"], 4)
-        self.assertEqual(sent, _EXPECTED_SENT)
-
-    def test_content_false_mixed_stream_with_turn_start(self):
-        # 混合流：turn_start + thinking + tool_call + tool_result + 非 final text
-        # + final text + turn_end + 终态 status。content=false（standard 档）下
-        # 一轮收口为一条代码框组消息（组头 + 逐步行摘要 + 思考首行预览）；操作流
-        # （🚀 起止标记 / 📖 叙述与最终）照常；框先于触发的最终文本行发出。
-        results = [
-            {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
-            _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
-            _artifact_update([_data_part({"kind": "thinking", "turn": 1, "text": "内部推理线索ALPHA"})], last_chunk=False),
-            _artifact_update([_data_part({"kind": "tool_call", "turn": 1, "name": "shell_exec", "arguments": "ls /tmp"})], last_chunk=False),
-            _artifact_update([_data_part({"kind": "tool_result", "turn": 1, "name": "shell_exec", "text": "输出正文 file1.txt"})], last_chunk=False),
-            _artifact_update([_text_part("中间叙述正文")], last_chunk=False),
-            _artifact_update([_text_part("最终结果正文")], last_chunk=True),
-            _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
-            {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
-        ]
-        consumer._orig_iter_sse_data = consumer.iter_sse_data
-        consumer.iter_sse_data = lambda url, body, headers, timeout: iter(results)
-        sent = []
-
-        def sender(platform, chat_id, thread_id, text):
-            sent.append(text)
-            return {"ok": True}
-
+    def test_content_true_detailed_density(self):
+        self._install(_wire_sequence())
+        sent, sender = self._capture()
         stats = consumer.consume_stream(
             url="http://x/", token="t", message="m", context_id="c",
             platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
-            min_interval=0.0, content=False,
+            content=True,
         )
-        # 操作流保留：📖 叙述 / 最终、🚀 与 ✅ 起止标记都在；工具步收口为一条代码框组
-        # 消息（shell_exec 未知 → tools 兜底 → 已调用工具；standard 逐步行 = 人话摘要），
-        # 框先于触发的最终文本行发出。
-        box = "```\n" + "\n".join(
+        self.assertEqual(_normalize_elapsed(sent[0]), _EXPECTED_MESSAGE)
+        self.assertEqual(stats["messages_sent"], 1)
+
+    def test_mixed_stream_with_turn_start_single_box(self):
+        self._install(
             [
+                {"task": {"status": {"state": "TASK_STATE_SUBMITTED"}}},
+                _artifact_update([_data_part({"kind": "turn_start", "turn": 1})], last_chunk=False),
+                _artifact_update([_data_part({"kind": "thinking", "turn": 1, "text": "内部推理线索ALPHA"})], last_chunk=False),
+                _artifact_update([_data_part({"kind": "tool_call", "turn": 1, "name": "shell_exec", "arguments": "ls /tmp"})], last_chunk=False),
+                _artifact_update([_data_part({"kind": "tool_result", "turn": 1, "name": "shell_exec", "text": "输出正文 file1.txt"})], last_chunk=False),
+                _artifact_update([_text_part("中间叙述正文")], last_chunk=False),
+                _artifact_update([_text_part("最终结果正文")], last_chunk=True),
+                _artifact_update([_data_part({"kind": "turn_end", "turn": 1, "reason": "stop"})], last_chunk=False),
+                {"statusUpdate": {"status": {"state": "TASK_STATE_COMPLETED"}}},
+            ]
+        )
+        sent, sender = self._capture()
+        stats = consumer.consume_stream(
+            url="http://x/", token="t", message="m", context_id="c",
+            platform="feishu", chat_id="oc_x", thread_id="", sender=sender,
+            content=False,
+        )
+        message = _normalize_elapsed(sent[0])
+        self.assertEqual(
+            message,
+            _wrap(
+                "🚀 第 1 轮",
                 "工作步骤 · 1 步 · 已调用工具",
                 consumer._BOX_SEP,
-                "1. shell_exec · 列出目录",
+                "1. shell_exec · 调用工具",
                 consumer._BOX_SEP,
                 "思考 · 内部推理线索ALPHA",
-            ]
-        ) + "\n```"
-        self.assertEqual(
-            sent,
-            [
-                "🚀 第 1 轮",
-                box,
-                "📖 输出完成",
                 "📖 中间叙述正文",
-                "✅ 完成",
-            ],
+                consumer._BOX_SEP,
+                "📬 dsh 任务完成（用时 <t>），结果如下：",
+                "最终结果正文",
+            ),
         )
-        # standard 无结果行：命令正文 / 输出正文不出现；无 🧠 单独行。
-        for line in sent:
-            self.assertNotIn("ls /tmp", line)
-            self.assertNotIn("file1.txt", line)
-        self.assertFalse(any("🧠" in line for line in sent))
-        # stats 完整：final_text 仍记录（📬 送达依赖它）。
+        # standard 无结果行：命令正文 / 输出正文不出现；🚀 与 📬 都并入框内。
+        self.assertNotIn("ls /tmp", message)
+        self.assertNotIn("file1.txt", message)
         self.assertEqual(stats["final_text"], "最终结果正文")
         self.assertEqual(stats["events_seen"], 9)
         self.assertEqual(stats["states"], ["submitted", "completed"])
-        self.assertEqual(stats["messages_sent"], 5)
+        self.assertEqual(stats["messages_sent"], 1)
 
 
 class LiveDetailLevelTest(unittest.TestCase):
@@ -1359,20 +1465,27 @@ class SenderChunkingTest(unittest.TestCase):
 
 
 def _print_event_render_table():
-    """打印「事件序列 → 渲染消息样例」对照表（供人工核对）。"""
+    """打印「事件序列 → 渲染行 / 框内片段」对照表（供人工核对）。
+
+    v0.6.0：过程中不发消息，故逐事件只展示 ``render_line`` 的行或「并入框内」；
+    表格末尾再打印整任务单框的实际渲染结果。
+    """
     results = _wire_sequence()
     events = list(consumer.normalize_events(iter(results)))
     print("\n=== 事件序列 → 渲染消息样例 对照表 ===")
     print(f"{'#':<2} {'归一化事件':<52} 渲染行")
-    throttler = consumer.Throttler(min_interval=0.0)
-    idx = 0
+    box = consumer.TaskBox()
+    final_text = ""
     for event in events:
-        idx += 1
         line = consumer.render_line(event)
-        emitted = throttler.feed(event, line)
+        if event.get("type") == "text" and event.get("final"):
+            final_text = str(event.get("text") or "")
+        box.feed(event, line)
         label = json.dumps(event, ensure_ascii=False)
-        rendered = emitted[0] if emitted else (line if line else "（不发）")
-        print(f"{idx:<2} {label:<52} → {rendered}")
+        rendered = line if line else "（并入框内）"
+        print(f"{'':<2} {label:<52} → {rendered}")
+    print("--- 整任务单框（唯一一条消息）---")
+    print(_normalize_elapsed(box.finish(final_text, "completed", 0.0)))
     print("=" * 44)
 
 

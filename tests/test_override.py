@@ -10,6 +10,16 @@
 / ``_COLLECTOR_ENABLED``，以验证 ``_on_pre_tool_call`` 的 dsh 单执行（block）分支、
 流式失败回退、显式 context_id 作为 origin 拦截（原样采用）、非 dsh / collector 关 /
 a2a_orchestrate / 非消息面仅注入 origin，以及 ``_stream_dsh_call`` 的格式化结果与缺配置抛错。
+
+v0.6.0 为何改
+-------------
+``__init__.py`` 删除了 ``_format_result_message`` / ``_deliver_final_result`` /
+``_box_result_body`` / ``_STATE_ZH``：结果送达并入 ``consumer.consume_stream`` 的
+**全任务单框**——每个任务只有一个 sender、终结时只发一条消息（失败重试一次，重发
+同一条框）。因此原先「直播 sender + 结果送达 sender 两条路径」「📬 头行在框外」的
+断言，改为「同一任务唯一 sender」+ 对 ``consumer.format_task_message``（单框渲染
+底层）的等价覆盖：completed / 非 completed / 空文本三态、头行与结果同框、内层围栏
+转义、超长分块后围栏闭合。
 """
 
 import importlib.util
@@ -26,8 +36,8 @@ _spec = importlib.util.spec_from_file_location("hermes_a2a_bridge", _MODULE_PATH
 _MODULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_MODULE)
 
-# 结果送达的围栏形态由 consumer._fence 提供（生产同源）。这里加载真实 consumer，
-# 让 _FakeConsumer 暴露同一实现——断言测的是真实围栏，而非替身自造的围栏。
+# 结果框形态由真实 consumer 提供（生产同源）。这里加载真实 consumer，让结果送达
+# 断言测的是 ``format_task_message`` 的真实单框渲染，而非替身自造的框。
 _CONSUMER_PATH = os.path.join(_WORKTREE, "consumer.py")
 _consumer_spec = importlib.util.spec_from_file_location(
     "hermes_a2a_bridge_consumer_override", _CONSUMER_PATH
@@ -108,13 +118,14 @@ class _SettingsCtx:
 
 
 class _FakeConsumer:
-    """假 consumer 模块：记录 make_sender / consume_stream 调用。"""
+    """假 consumer 模块：记录 make_sender / consume_stream 调用。
+
+    v0.6.0：每个任务只有一个发送面（``consume_stream`` 终结时的全任务单框），
+    故 ``make_sender`` 每任务只被调用一次；结果框形态由真实 ``consumer`` 的
+    ``format_task_message`` 覆盖，本替身不再自造围栏。
+    """
 
     _DEFAULT_TIMEOUT = 300  # 与真实 consumer 一致，供 _coerce_timeout 的 default 兜底
-
-    # 与真实 consumer 同源的围栏渲染（结果送达正文用它包框）。
-    _fence = staticmethod(_REAL_CONSUMER._fence)
-    _split_fenced_chunks = staticmethod(_REAL_CONSUMER._split_fenced_chunks)
 
     def __init__(self):
         self.consume_stream_calls = []
@@ -123,8 +134,9 @@ class _FakeConsumer:
         self.stats = {
             "final_text": "收到",
             "events_seen": 5,
-            "messages_sent": 2,
+            "messages_sent": 1,
             "states": ["working", "completed"],
+            "box_body": "",
         }
 
     def make_sender(self, ctx, code_blocks=True):
@@ -318,19 +330,13 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call["events"], True)
         self.assertEqual(call["level"], "detailed")
         self.assertIs(call["code_blocks"], True)
-        # 消息面（platform/chat_id 非空）→ 真 sender：直播与结果送达都构造一次，
-        # 两条路径都固定 code_blocks=True（内部样式：围栏感知分块）。
-        self.assertEqual(len(consumer.make_sender_calls), 2)
+        # v0.6.0：消息面（platform/chat_id 非空）只构造**一个** sender——发送面唯一
+        # （整任务单框由 consume_stream 在任务终结时一次发出），固定 code_blocks=True。
+        self.assertEqual(len(consumer.make_sender_calls), 1)
         self.assertIs(consumer.make_sender_calls[0][1], True)
-        self.assertIs(consumer.make_sender_calls[1][1], True)
         self.assertIs(call["sender"], consumer.senders[0][1])
-        # 结果主动送达：📬 头行在框**前** + 正文进裸围栏代码框，发到同一消息面。
-        sent = consumer.senders[1][2]
-        self.assertEqual(len(sent), 1)
-        p, c, t, text = sent[0]
-        self.assertEqual((p, c, t), ("feishu", "oc_x", "omt_y"))
-        self.assertIn("📬 **dsh 任务完成，结果如下**", text)
-        self.assertTrue(text.endswith("\n\n```\n收到\n```"))
+        # 结果送达不再由 __init__ 二次发送：唯一 sender 归 consume_stream。
+        self.assertEqual(consumer.senders[0][2], [])
 
     # 12. peer 配置的 timeout 传给 consume_stream（缺省回退 300）。
     def test_stream_dsh_call_passes_peer_timeout(self):
@@ -389,15 +395,13 @@ class HookTest(unittest.TestCase):
             result = _MODULE._stream_dsh_call("hi", "feishu/oc_x")
         finally:
             _MODULE._CTX = None
-        # 直播确实按 content=false 映射出的 standard 档渲染…
+        # 过程渲染按 content=false 映射出的 standard 档…
         self.assertIs(consumer.consume_stream_calls[0]["level"], "standard")
-        # …但结果送达照旧：一条消息、📬 头行 + 最终全文、发到同一消息面；
-        # v0.5.3 起正文以裸围栏代码框渲染，正文完整性不变。
-        delivered = consumer.senders[1][2]
-        self.assertEqual(len(delivered), 1)
-        self.assertEqual(delivered[0][:3], ("feishu", "oc_x", ""))
-        self.assertIn("📬 **dsh 任务完成，结果如下**", delivered[0][3])
-        self.assertTrue(delivered[0][3].endswith("\n\n```\n收到\n```"))
+        # …但送达不受档位影响：唯一 sender 交给 consume_stream（它在任务终结时把
+        # 全过程 + 结果拼成同一个框发出），__init__ 不再二次发送。
+        self.assertEqual(len(consumer.make_sender_calls), 1)
+        self.assertIs(consumer.consume_stream_calls[0]["sender"], consumer.senders[0][1])
+        self.assertEqual(consumer.senders[0][2], [])
         self.assertIn("收到", result)
 
     # 13. register() 读 collector.enabled / content / events 配置。
@@ -438,20 +442,22 @@ class HookTest(unittest.TestCase):
         self.assertIs(_MODULE._EVENTS, True)
         self.assertIs(_MODULE._CONTENT, True)
 
-    # 15. _format_result_message：完成 / 异常态 / 空文本三态（正文进裸围栏代码框）。
-    def test_format_result_message_variants(self):
-        done = _MODULE._format_result_message("# 报告\n正文", "completed", 90)
+    # 15. format_task_message：完成 / 异常态 / 空文本三态——整任务一个框，
+    #     结果头与正文都在框内（v0.6.0；头行不再留在框外）。
+    def test_format_task_message_variants(self):
+        done = _REAL_CONSUMER.format_task_message("", "# 报告\n正文", "completed", 90)
         self.assertTrue(
-            done.startswith("📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）\n\n```\n")
+            done.startswith("```\n📬 dsh 任务完成（用时 1 分 30 秒），结果如下：\n")
         )
         self.assertTrue(done.endswith("# 报告\n正文\n```"))
-        failed = _MODULE._format_result_message("x", "failed", 5)
-        self.assertIn("已结束（失败）", failed)
-        self.assertIn("用时 5 秒", failed)
-        self.assertTrue(failed.endswith("```\nx\n```"))
-        empty = _MODULE._format_result_message("", "completed", 3)
+        failed = _REAL_CONSUMER.format_task_message("", "x", "failed", 5)
+        self.assertIn("已结束（失败 · 用时 5 秒），输出如下：", failed)
+        self.assertTrue(failed.endswith("\nx\n```"))
+        empty = _REAL_CONSUMER.format_task_message("", "", "completed", 3)
         self.assertIn("无文本输出", empty)
-        self.assertNotIn("```", empty)  # 无文本不发空框
+        # 即使无文本也发一个框（头行在框内）——「完成之后不静默」。
+        self.assertTrue(empty.startswith("```\n"))
+        self.assertEqual(empty.count("```"), 2)
 
     # 16. _stream_worker：流式异常被吞掉（只记日志，不向线程外抛）。
     def test_stream_worker_swallows_exception(self):
@@ -461,51 +467,45 @@ class HookTest(unittest.TestCase):
         _MODULE._stream_dsh_call = boom
         _MODULE._stream_worker("hi", "feishu/oc_x")  # 不应抛出
 
-    # 17. _deliver_final_result：发送失败重试一次（第二次成功即返回）。
-    def test_result_delivery_retries_once(self):
-        consumer = _FakeConsumer()
-        attempts = []
-
-        def flaky_sender(p, c, t, text):
-            attempts.append(text)
-            return {"ok": len(attempts) > 1, "error": "send_failed"}
-
-        consumer.make_sender = lambda ctx, code_blocks=True: flaky_sender
-        _MODULE._CONSUMER_MODULE = consumer
-        _MODULE._deliver_final_result(
-            "feishu", "oc_x", "omt_y", "报告", "completed", 0.0
+    # 17. 结果与过程同框：过程正文在结果段之前，中间以 30 个 ─ 分隔。
+    def test_format_task_message_merges_body_and_result(self):
+        message = _REAL_CONSUMER.format_task_message(
+            "工作步骤 · 1 步 · 执行了命令", "报告", "completed", 7
         )
-        self.assertEqual(len(attempts), 2)
-        self.assertIn("📬", attempts[1])
-        # 重试发的是同一条（已框化）消息，正文不变。
-        self.assertEqual(attempts[0], attempts[1])
-        self.assertTrue(attempts[1].endswith("```\n报告\n```"))
+        lines = message.splitlines()
+        self.assertEqual(lines[0], "```")            # 裸围栏：信息位为空
+        self.assertEqual(lines[1], "工作步骤 · 1 步 · 执行了命令")
+        self.assertEqual(lines[2], _REAL_CONSUMER._BOX_SEP)
+        self.assertEqual(lines[3], "📬 dsh 任务完成（用时 7 秒），结果如下：")
+        self.assertEqual(lines[4], "报告")
+        self.assertEqual(lines[-1], "```")
+        self.assertEqual(message.count("```"), 2)
+        self.assertNotIn("```text", message)
 
-    # 18. 结果以**裸围栏代码框**送达：头行在框前、围栏无语言标记、内层围栏转义。
-    def test_final_result_delivered_in_bare_fence_box(self):
+    # 18. 结果正文里的内层三反引号被转义，外层围栏保持成对闭合。
+    def test_inner_fence_in_result_is_escaped(self):
         body = "第一行\n```\n第二行"
-        msg = _MODULE._format_result_message(body, "completed", 7)
-        lines = msg.split("\n")
-        self.assertEqual(lines[0], "📬 **dsh 任务完成，结果如下**（用时 7 秒）")
-        self.assertEqual(lines[1], "")
-        self.assertEqual(lines[2], "```")  # 裸围栏：信息位为空，无语言标记
-        self.assertEqual(lines[-1], "```")  # 围栏成对闭合
-        self.assertNotIn("```text", msg)
-        # 正文内层三反引号被转义（插入零宽空格），故全文只剩外层的一对围栏。
-        self.assertIn("`\u200b``", msg)
-        self.assertEqual(msg.count("```"), 2)
+        message = _REAL_CONSUMER.format_task_message("", body, "completed", 7)
+        self.assertIn("`\u200b``", message)
+        self.assertEqual(message.count("```"), 2)
+        self.assertTrue(message.endswith("\n```"))
 
     # 19. 长结果不截断，且经围栏感知分块后每块围栏成对闭合（框不裂）。
-    def test_long_final_result_chunked_with_closed_fences(self):
+    def test_long_result_chunked_with_closed_fences(self):
         body = "\n".join(f"第 {i} 行 " + "x" * 200 for i in range(80))  # ~16k 字符
-        msg = _MODULE._format_result_message(body, "completed", 12)
-        self.assertTrue(msg.endswith(body + "\n```"))  # 正文逐字不截断
-        chunks = _REAL_CONSUMER._split_fenced_chunks(msg, limit=800)
+        message = _REAL_CONSUMER.format_task_message("", body, "completed", 12)
+        self.assertTrue(message.endswith(body + "\n```"))  # 正文逐字不截断
+        chunks = _REAL_CONSUMER._split_fenced_chunks(message, limit=800)
         self.assertGreater(len(chunks), 1)
-        self.assertTrue(chunks[0].startswith("📬"))  # 头行在首块
         for chunk in chunks:
             self.assertEqual(chunk.count("```") % 2, 0)  # 每块围栏闭合
         self.assertTrue(chunks[-1].rstrip().endswith("```"))
+        # 结果头在首块（与过程正文同框）。
+        self.assertIn("📬 dsh 任务完成", chunks[0])
+
+    # 20. 发送失败重试一次已随发送面迁到 consumer：见 test_consumer.py 的
+    #     ConsumeStreamTest.test_consume_stream_send_failure_retries_once_and_not_counted
+    #     与 test_consume_stream_sender_exception_retried。
 
 
 if __name__ == "__main__":

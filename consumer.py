@@ -291,12 +291,16 @@ DSH_PROFILE_DEFAULT = "web"
 #   - ``liveToolDetail(name, argsRaw)`` 参数细节（client.js:10519-10590）
 # --------------------------------------------------------------------------
 
-# dsh ``message.stepProcess.<kind>`` 的活动短语：取 dsh 词干、剥离体标记
-# （正在 / 已 / 准备 / 了）。dsh 的组头是**实时进行体**（「正在读取文件」）或
-# **关闭态完成体**（「已读取文件」），逐条步骤行需要名词性活动描述
-# （管理员样例「读取文件（config.yaml）」「搜索代码（xxx）」「执行命令（…）」），
-# 故只剥体标记、不改词干：命令档取 done.commands「执行了命令」→「执行命令」，
-# 读档取 read「读取文件」。
+# dsh ``message.stepProcess.<kind>`` 的活动短语：逐 kind 取 dsh 的**名词性活动描述**。
+# dsh 同一 kind 有三套体（进行体 ``<kind>``「正在读取文件」/ 完成体 ``done.<kind>``
+# 「已读取文件」/ 准备体 ``prepare.<kind>``「准备读取文件」），逐条步骤行需要不带体的
+# 名词短语（管理员样例「读取文件（config.yaml）」「搜索代码（xxx）」「执行命令（…）」），
+# 故按 kind 在 dsh 原生三套体里择一取词干，**不改词干**：
+#   - 14 个 kind 中 11 个取进行体词干（读取文件 / 搜索代码 / 写入文件 / 调用工具 …）；
+#   - ``edit`` 取 done.edit「修改了文件」→「修改文件」、``commands`` 取 done.commands
+#     「执行了命令」→「执行命令」（与同框组头类别串的 done 体一致，且匹配管理员样例）；
+#   - ``questions`` 取 prepare.questions「准备提问」→「提问」（进行体是「等待你的操作」，
+#     不是活动描述）。
 _DSH_ACTIVITY_PHRASE = {
     "thinking": "分析请求",        # message.stepProcess.thinking「正在分析请求」
     "read": "读取文件",            # 「正在/已读取文件」
@@ -557,7 +561,7 @@ def dsh_activity_detail(name: Any, arguments: Any) -> str:
 
 
 def dsh_activity_phrase(name: Any) -> str:
-    """活动种类 → dsh 活动短语（见 ``_DSH_ACTIVITY_PHRASE`` 的逐项 dsh 出处）。"""
+    """活动种类 → 名词性活动描述（逐项 dsh 出处见 ``_DSH_ACTIVITY_PHRASE`` 上方的体选择说明）。"""
     kind = tool_activity_kind(name)
     return _DSH_ACTIVITY_PHRASE.get(kind, _DSH_ACTIVITY_PHRASE["tools"])
 

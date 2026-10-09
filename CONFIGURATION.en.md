@@ -1,34 +1,27 @@
 # hermes-a2a-bridge Configuration & Mechanics
 
-> Status: **P2c-fix — pre_tool_call hook single execution (async), double
-> execution eliminated**. The P2b origin→contextId injection is retained; the P2c
-> live consumer now sends only **one** `SendStreamingMessage` to the dsh target
-> inside the `pre_tool_call` hook: the hook returns an "accepted" receipt
-> immediately while a background thread consumes the SSE stream and pushes
-> intermediate progress back to Feishu / QQ (gated by `collector.enabled`, off by
-> default); when the task finishes, the final result is actively delivered to the
-> messaging surface in a code block (v0.5.3) — the task runs only once, and there is
-> no silence after "done". As of v0.4.0 the live progress lines are trimmed by
-> **four tiers** (`collector.live_detail`, default `follow-dsh` to follow dsh's
-> "Work details"; see "Live-detail tier"); as of v0.5.0 all four tiers use the
-> same **code-box group** form — a turn's tool steps and its **settled thinking
-> preview are folded into one code block**, one group per message (group header +
-> step lines + thinking segment); there are no more heartbeat / closing lines
-> (`standard`) or per-step tool lines (`detailed` / `verbose`) — use a higher
-> tier for denser **in-box** content. **As of v0.5.1 an explicit `context_id` no
-> longer turns live streaming off** — `pre_tool_call` always gates on the same
-> condition (`a2a_call` + `collector.enabled` + a dsh target + a non-empty
-> `message`), and the origin is the caller's explicit `context_id` **when
-> present**, otherwise the current messaging-surface origin; the explicit value
-> is **adopted as-is, never overwritten**, so the message still lands in the same
-> conversation. The trade-off is that such calls go from **synchronous** to
-> **asynchronous** (instant "⏳ accepted" → background execution + live progress →
-> result delivered automatically on completion). Previously (v0.5.0 and earlier)
-> an explicit `context_id` made the hook return early and pass through, so live
-> streaming **never started (zero messages)**. The override approach
-> (`register_tool(override=True)`)
-> was abandoned because the registration mechanism is unreliable on the real
-> gateway.
+> Status: **v0.6.0 — one box for the whole task (whole-task single box)**.
+> The P2c-fix `pre_tool_call` hook single execution (async) and the P2b
+> origin→contextId injection are retained: the hook sends only **one**
+> `SendStreamingMessage` to the dsh target and returns an "accepted" receipt
+> immediately while a background thread consumes the SSE stream (gated by
+> `collector.enabled`, off by default). **Nothing is sent while the task runs**:
+> every turn's tool steps / thinking / narratives stay in a buffer, and when the task
+> terminates they are joined with the **final result** into **one** bare-fence code box
+> and sent as **a single message** — the `🚀 第 N 轮` turn marker and the `📬` result
+> header are folded into the box, with no text outside it; the task runs only once,
+> and there is no silence after "done". The four tiers (`collector.live_detail`,
+> default `follow-dsh`) only decide the **in-box density**; there are no more
+> per-turn boxes / heartbeat lines / per-step tool lines.
+> **Behavior-change note**: a long task is **completely silent** until it finishes
+> (the acceptance receipt is still the tool return value and is unaffected); to get
+> the "one box per turn" live form back, roll back to v0.5.3.
+> An explicit `context_id` is still intercepted — the origin is the caller's explicit
+> `context_id` **when present**, otherwise the current messaging-surface origin; the
+> explicit value is **adopted as-is, never overwritten**, and the task still receives
+> the whole-task box at the end. The override approach
+> (`register_tool(override=True)`) was abandoned because the registration mechanism is
+> unreliable on the real gateway.
 
 ## Behavior
 
@@ -59,15 +52,14 @@ The Hermes built-in A2A plugin exposes 5 outbound client tools to the agent
   desktop / cron / kanban / api_server / webhook and the like never inject.
   Injection is also skipped when either `HERMES_SESSION_PLATFORM` or
   `HERMES_SESSION_CHAT_ID` is empty.
-- **Explicit `context_id`: adopted as-is and used as the live origin**: when the
+- **Explicit `context_id`: adopted as-is and used as the origin**: when the
   caller already passes a non-empty `context_id` or `contextId` (alias; the
   handler accepts both `args.get("context_id") or args.get("contextId")`), it is
-  **not overwritten** — the value serves both as the **live origin** and as the
+  **not overwritten** — the value serves both as the **origin** and as the
   dsh-side session-reuse key, so the message still lands in the conversation the
-  caller named. **As of v0.5.1 a dsh call carrying an explicit `context_id` is
-  intercepted and streamed live too** (see "Live consumer → Gate condition");
-  in v0.5.0 and earlier such calls returned early and passed through, so live
-  streaming never started.
+  caller named. **A dsh call carrying an explicit `context_id` is intercepted
+  too** (see "Live consumer → Gate condition"), and receives the whole-task box
+  when the task ends.
 - **Off by default**: when this plugin is not in the `plugins.enabled` allowlist
   it is not loaded, so "not enabled = no side effects".
 - **Fail-open**: any import failure / exception returns `None` (does not block the
@@ -163,10 +155,10 @@ variable `A2A_SERVER_TOKEN`), `provider` / `model` / `preset` / `cwd` /
    dsh session (continuous context); different conversations → different
    contextId → isolation.
 4. When `context_id` / `contextId` is passed explicitly, the caller's semantics
-   are preserved (actively resume an existing session or specify a key); as of
-   v0.5.1 that value also serves as the **live origin** — an `a2a_call` carrying
-   an explicit `context_id` is intercepted and streamed live too (see "Live
-   consumer → Gate condition").
+   are preserved (actively resume an existing session or specify a key); that value
+   also serves as the **live origin** — an `a2a_call` carrying an explicit
+   `context_id` is intercepted too (see "Live consumer → Gate condition") and
+   receives the whole-task box when the task ends.
 
 ## Live consumer (P2c-fix: pre_tool_call hook single execution)
 
@@ -179,94 +171,96 @@ a2a platform's deferred load `register_tools` overwrites the override back to th
 original handler), so override was abandoned and single execution was moved into
 the `pre_tool_call` hook:
 
-- **Gate condition (v0.5.1, frozen)**: `tool_name == "a2a_call"` +
+- **Gate condition (frozen)**: `tool_name == "a2a_call"` +
   `collector.enabled` true + a dsh target + a non-empty `message`. When it holds,
-  the live-stream decision is entered; the **live origin is the caller's explicit
+  the live-stream decision is entered; the **origin is the caller's explicit
   `context_id` when present, otherwise the current messaging-surface origin**
   (`{platform}/{chat_id}[/{thread_id}]`) — a non-empty origin means the call is
-  intercepted (`block`) and streamed live, and when both are empty the call is
-  **not intercepted** and passes through unchanged. An explicit
+  intercepted (`block`) and a background stream task is started, and when both are
+  empty the call is **not intercepted** and passes through unchanged. An explicit
   `context_id` is **adopted as-is, never overwritten**, so the message still lands
-  in the same conversation. **The v0.5.1 fix**: the v0.5.0-and-earlier rule "an
-  explicit `context_id` / `contextId` returns early and passes through" was
-  removed — such calls previously produced **no live output at all (zero
-  messages)**.
+  in the same conversation.
 - **dsh-target single execution (async)**: the `pre_tool_call` hook immediately
   spawns a background daemon thread running `_stream_dsh_call` (sends only **one**
-  `SendStreamingMessage`, consumes SSE events while rendering intermediate
-  progress back to Feishu / QQ; live, gated by `collector.enabled`, off by
+  `SendStreamingMessage`, consumes SSE events and accumulates steps / thinking /
+  narratives in a **whole-task buffer**; gated by `collector.enabled`, off by
   default), and right away blocks the original `a2a_call` with
-  `{"action": "block", "message": receipt}`. When the task finishes, the final
-  result is actively delivered to the messaging surface in a code block (see
-  "Receipt & result delivery"). The hook callback returns instantly — framework
-  hook callbacks have a 30 s cap; synchronously waiting on a long task triggers a
-  timeout fail-closed that cascades into skipping other tool calls. Async is the
-  fix.
+  `{"action": "block", "message": receipt}`. **Nothing is sent while the task runs**;
+  when the task terminates `consume_stream` joins every turn's process with the final
+  result into **the same** code box and sends exactly one message (see "Receipt &
+  result delivery"). The hook callback returns instantly — framework hook callbacks
+  have a 30 s cap; synchronously waiting on a long task triggers a timeout
+  fail-closed that cascades into skipping other tool calls. Async is the fix.
 - **Non-dsh targets** (e.g. `agent="ivan"`): do not block, only inject origin,
   and run the original `SendMessage` full logic (security.audit / persist_message
   / metrics / redact).
 - **Degraded fallback**: for a dsh target missing url / message, or when streaming
   fails (network / SSE parse error), fall back to origin-injection only and let
   the original `a2a_call` run the synchronous `SendMessage` — functionality is
-  preserved (no live output but **no double execution**).
+  preserved (no process box but **no double execution**).
 
 ### Receipt & result delivery
 
 After the `pre_tool_call` hook returns `{"action": "block", "message": M}`, the
 framework turns `M` into the tool result `{"error": M}`
-(`agent/tool_executor.py` `json.dumps({"error": block_message})`). In the async
-version `M` is an "accepted" receipt (origin + a note that the result will be
-delivered automatically) — the final text no longer travels this path (the
-synchronous hand-back necessarily times out on long tasks; see the fix note
-above).
+(`agent/tool_executor.py` `json.dumps({"error": block_message})`). `M` is an
+"accepted" receipt (origin + a note that the result will be delivered
+automatically) — the final text no longer travels this path (the synchronous
+hand-back necessarily times out on long tasks; see the fix note above).
 
-The final result travels an independent path: when the task finishes,
-`_stream_dsh_call` calls `_deliver_final_result`, sending a
-`📬 **dsh 任务完成，结果如下**（用时 …）` header line + the full result to the
-messaging surface. **As of v0.5.3 the result body is rendered as a code block**
-(the same **bare** fence as the live process boxes: `_format_result_message` wraps
-it via `consumer._fence`, and `make_sender(code_blocks=True)` does fence-aware
-chunking):
+The final result is **no longer a message of its own**: when the task terminates,
+`consume_stream` calls `format_task_message` to wrap the process body + result segment
+into **one bare-fence code box** (`consumer._fence` wraps it,
+`make_sender(code_blocks=True)` does fence-aware chunking) and sends **exactly one**
+message:
 
 ````text
-📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
-
 ```
+<process body: per-turn 🚀 markers + group headers + step lines + thinking segments + narrative lines>
+──────────────────────────────
+📬 dsh 任务完成（用时 1 分 30 秒），结果如下：
 <full result body: untruncated; inner triple backticks escaped so the outer fence stays closed>
 ```
 ````
 
-- **Header before the box**: matching the live layout ("`📖 输出完成`" line + box);
-  status / elapsed time are metadata and do not belong in a monospace box.
-- **Body never truncated**: only trailing newlines are stripped; long bodies (>8000)
-  reuse the existing chunking (`_split_fenced_chunks`), joined with `⏩ 续` and with
-  the **fence kept closed** in every chunk.
-- **No empty box**: with no text output the message is just the header
-  (`…——本次无文本输出。`).
-- **Chunk shape for very long results**: `_split_fenced_chunks` flushes the plain
-  lines accumulated before the fence as their own chunk, so the **header becomes a
-  standalone first message** (without the `⏩ 续` marker) and the following chunks are
-  fence-balanced box segments — existing chunking behavior (same for an over-long live
-  final), nothing is lost.
-- **Delivery timing, content completeness and the redact flow are unchanged**:
-  still "delivered as soon as the task finishes", one retry on failure, warning-only
+The three states of the trailing result header (all inside the box):
+
+| Case | Result header |
+| --- | --- |
+| completed with text | `📬 dsh 任务完成（用时 …），结果如下：` |
+| non-completed with text (failed / canceled) | `📬 dsh 任务已结束（失败/已取消 · 用时 …），输出如下：` |
+| no text output | `📬 dsh 任务已结束（完成 · 用时 …）——本次无文本输出。` |
+
+- **Both `🚀` and `📬` are folded into the box**: there is **no text outside it**
+  (the process body and the result segment are separated by 30 `─`); there is no
+  separate result message with a "header before the box" any more.
+- **Body never truncated**: only trailing newlines are stripped; long bodies (>8000 per
+  message) reuse the existing chunking (`_split_fenced_chunks`), joined with `⏩ 续`
+  and with the **fence kept closed** in every chunk (the whole message is itself one
+  fenced block, so there is no "standalone header chunk" shape any more).
+- **Quiet mode (`collector.events=false`) keeps only the result segment in the box**:
+  the process body is empty, so the box goes straight to the `📬` header + full result.
+- **No text output is still not silence**: a box containing only the result header is
+  still sent (`…——本次无文本输出。`).
+- **Delivery timing, content completeness and the redact flow are unchanged**: still
+  "delivered as soon as the task finishes", one retry on failure, warning-only
   afterwards — no silence after "done".
 
-### A style switch for result delivery? (Conclusion: no)
+### A style switch for the whole-task box? (Conclusion: no)
 
 `code_blocks` has been an **internal style parameter** since v0.3.0, not
-config-controlled; the two earlier shape changes (code-box group, bare fence) also
-added no config key. Same here: **no new `collector.*` key** — that would drag in a
-hot-read switch, a fourth Dashboard switch and write-back validation for a mere
-rendering shape. To revert to the v0.5.2 plain-text result message, change one line:
-in `_deliver_final_result` switch `make_sender(_CTX, code_blocks=True)` back to
-`code_blocks=False` and have `_format_result_message` return `final_text` directly
-(without `_box_result_body`).
+config-controlled; none of the later shape changes (per-turn code-box group,
+bare-fence result box, whole-task single box) added a config key either. Same here:
+**no new `collector.*` key** — that would drag in a hot-read switch, a fourth
+Dashboard switch and write-back validation for a mere rendering shape. To get the
+**live** "one box per turn" form back, the host must roll the whole plugin back to
+v0.5.3 (both the shape and the push timing changed; no one-line style switch can do
+it).
 
-### Troubleshooting: why does a conversation show no live messages? (v0.5.1)
+### Troubleshooting: why does a conversation show no live messages?
 
 The entry point of the live chain is the `pre_tool_call` **interception** — an
-`a2a_call` that was **not intercepted** definitely has no live output. First
+`a2a_call` that was **not intercepted** definitely has no task box. First
 confirm whether that call was intercepted; the two signatures are mutually
 exclusive:
 
@@ -279,20 +273,25 @@ Check them in this order:
 
 1. Look at that call's lines in `~/.hermes/logs/agent.log` — a
    `tool a2a_call completed (…s, … chars)` means it was **not intercepted** and no
-   live output will start; a
+   task box will be sent; a
    `Tool a2a_call returned error {"error":"[dsh · context …` means it was
-   intercepted and the live chain started.
+   intercepted and the chain started (a `task box delivered` log line should follow
+   when the task terminates).
 2. When it was not intercepted, walk the gate condition: is `collector.enabled`
    true (Dashboard switch or `config.yaml`), is the target dsh, is `message`
    non-empty, and is the origin non-empty (on a non-messaging surface with no
    explicit `context_id` both are empty → pass through).
-3. **An explicit `context_id` is not a reason for "no live output"** (as of
-   v0.5.1): that value becomes the origin and the call is intercepted as usual;
-   if such a call shows no live output, check the other conditions in step 2.
+3. **An explicit `context_id` is not a reason for "no task box"**: that value
+   becomes the origin and the call is intercepted as usual; if such a call gets no
+   task box, check the other conditions in step 2.
+4. **The task box only comes when the task terminates**: as of v0.6.0 the process is
+   **completely silent**, so seeing no process message before a long task finishes is
+   expected; the box is sent in one go at termination (split into several chunks when
+   over-long, joined with `⏩ 续`).
 
 ### Enable method (collector live gating)
 
-Live sending is **off** by default. Enable it from the "A2A live switches" panel
+Task-box sending is **off** by default. Enable it from the "A2A live switches" panel
 at the top of the Hermes Dashboard "Plugins" page (see "Dashboard visual
 switches" below), or by editing `~/.hermes/config.yaml`:
 
@@ -303,7 +302,7 @@ plugins:
     hermes-a2a-bridge:
       settings:
         collector:
-          enabled: true           # live-send gate
+          enabled: true           # task-box sending gate
 ```
 
 > All three collector switches are **hot-read**: saving (Dashboard toggle or a
@@ -312,17 +311,17 @@ plugins:
 
 When `collector.enabled` is absent / explicitly `false`, the dsh target does
 **not** take the single-execution branch; `pre_tool_call` only injects origin and
-the original `a2a_call` runs the synchronous `SendMessage` (no live output, no
+the original `a2a_call` runs the synchronous `SendMessage` (no task box, no
 double execution); non-dsh targets are unaffected.
 
 ### Live-detail tier (collector.live_detail)
 
 Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.live_detail`.
 
-This key controls the **granularity of live progress**. Its four tiers map **one-to-one**
-onto dsh's "Work details" — the `config.transcriptView` of the `- id: ui-chat` entry in
-`$DSH_HOME/profiles/<profile>/cordis.patch.yml` (default `follow-dsh`: follow dsh's
-current tier):
+This key controls the **in-box process-display granularity**. Its four tiers map
+**one-to-one** onto dsh's "Work details" — the `config.transcriptView` of the
+`- id: ui-chat` entry in `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+(default `follow-dsh`: follow dsh's current tier):
 
 | `collector.live_detail` | Meaning | dsh `transcriptView` |
 | --- | --- | --- |
@@ -349,98 +348,112 @@ plugins:
 > `profiles/<profile>/cordis.patch.yml` and read its `config.transcriptView`. dsh's
 > legacy values `normal` / `expanded` are read as `detailed`. A dsh tier affects
 > **client-side rendering only** (the event stream itself is always complete); the
-> bridge trims its own live lines under the same names.
+> bridge trims its own **in-box** process lines under the same names.
 
-Four tiers → rendering form (as of v0.5.0 all use the **code-box group**, carrying
-the existing density definitions; tool / thinking events no longer become lines of
-their own on the broadcast path — see "Code-box group rendering" below):
+Four tiers → rendering form (**one code box for the whole task**, carrying the
+existing density definitions; tool / thinking events no longer become messages of their
+own — see "Whole-task single-box rendering" below):
 
 | Event | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
-| `turn_start` | 🚀 turn marker | same | same | same |
-| `tool_call` | **into the box buffer** (not per step; no step line in the box) | **into the box buffer** (not per step; the box step line takes "tool · plain-language summary") | **into the box buffer** (not per step; the step line takes "tool · arguments" plus a result line) | = `detailed` (arguments / results **not truncated**) |
-| `tool_result` | **into the box buffer** (not per step) | **into the box buffer** (plain-language summary) | **into the box buffer** (result line `↳ first result line`) | **into the box buffer** (full result line) |
+| `turn_start` | 🚀 turn marker (folded into its segment) | same | same | same |
+| `tool_call` | **into the whole-task buffer** (not per step; no step line in the box) | **into the whole-task buffer** (the box step line takes "tool · dsh activity description") | **into the whole-task buffer** (the step line takes "tool · raw arguments" plus a result line) | = `detailed` (arguments / results **not truncated**) |
+| `tool_result` | **into the whole-task buffer** (not per step) | **into the whole-task buffer** (no result line) | **into the whole-task buffer** (result line `↳ first result line`) | **into the whole-task buffer** (full result line) |
 | `thinking` | **into the same box** (label "思考" only, no preview) | **into the same box** (`思考 · first-line preview`) | **into the same box** (`思考 · first-line preview`) | **into the same box** (`思考 · preview + full text`) |
-| `text` (narrative / final) | sent | sent | sent (non-final truncated to ≤120) | sent (non-final **not truncated**) |
-| `status` terminal / errors | **always sent** | **always sent** | **always sent** | **always sent** |
+| `text` (narrative / final) | narrative folded into the box; final goes to the trailing result segment | same | same (non-final truncated to ≤120) | same (non-final **not truncated**) |
+| `status` terminal / errors | carried by the trailing `📬` result header (completed / failed / canceled + elapsed) | same | same | same |
 
-- **Constant across tiers (never swallowed)**: task terminal states (✅ / ❌ / ⚠️),
-  error messages, `final_text` delivery, and stats completeness (`events_seen` /
-  `states`, etc.).
+- **Constant across tiers (nothing is lost)**: the task terminal state and error
+  information are **kept** — expressed by the trailing `📬` result header
+  (`完成` / `失败` / `已取消` + elapsed time) instead of a separate ✅ / ❌ / ⚠️ line;
+  `final_text` delivery and stats completeness (`events_seen` / `states`, etc.) are
+  unchanged.
 - **Orthogonal switch**: `collector.events: false` (quiet mode) still **outranks the
-  tier** — quiet mode pushes the final result only, whatever the tier.
+  tier** — quiet mode leaves only the result segment in the box, whatever the tier.
 - **Compatibility anchor (density, not byte-identity)**: the four tiers keep their
   existing **content-density** definitions — `detailed` still corresponds to the old
   `content: true` information (arguments / results in full) and `compact` is still
-  stricter than the old `content: false`. But **v0.5.0 changes the rendering form**:
-  all four tiers become "one code-box group per turn", so `detailed` / `verbose`
-  **no longer** send per-step messages and are **no longer** byte-equivalent to
-  v0.3.3's `content: true`; the difference is now **in-box density**, so use a
-  higher tier for finer detail.
-- **Step-summary rules for the `standard` tier** (generated heuristically in the
-  bridge; no extra field required from dsh): the step line's
-  `<plain-language summary>` yields a fixed phrase when a rule matches, otherwise the
-  command's first line is truncated to ~50 characters; when the arguments are an
-  object with no command key, identifying-key `key=value` wins (see "Summary
-  improvement").
-
-  | Command | Summary |
-  | --- | --- |
-  | `git … log …` | 查看 git 提交记录 (view git log) |
-  | `sed` / `head` / `tail` / `cat` / `less` / `more` | 读取文件（文件名） (read file (name)) |
-  | `grep` / `rg` / `ag` | 查找（关键词） (find (keyword)); without a keyword → 搜索文件内容 (search file contents) |
-  | `df` | 检查磁盘使用 (check disk usage) |
-  | `free` | 检查内存 (check memory) |
-  | `du` | 统计目录占用 (measure directory usage) |
-  | `systemctl` | 检查服务状态 (check service status) |
-  | `ls` | 列出目录 (list directory) |
-  | `ps` | 查看进程 (view processes) |
-  | anything else | first line of the command, truncated (~50 chars) |
-
-  Leading `sudo` / `env` / `VAR=x` wrappers are skipped; when `arguments` is JSON the
-  `command` / `cmd` / `script` key wins, and a path-only object summarises as a file
-  read. The summaries themselves are Chinese, matching the plugin's other chat copy.
+  stricter than the old `content: false`. But the **rendering form** is now "one code
+  box for the whole task", so `detailed` / `verbose` **no longer** send per-step
+  messages and are **no longer** byte-equivalent to v0.3.3's `content: true`; the
+  difference is now **in-box density**, so use a higher tier for finer detail.
+- **The `standard` step line = dsh activity description** (as of v0.6.0 it **ports the
+  dsh algorithm verbatim**; no bridge-side command heuristic any more): the step line
+  is `<i>. <tool name> · <activity description>`, where the activity description =
+  **activity phrase** + **argument detail**:
+  - **Activity phrase** comes from the dsh UI copy `message.stepProcess.<kind>`
+    (`dsh-client-ui-chat`) with the aspect marker stripped: `read`→读取文件、
+    `read_image`→读取图片、`write`→写入文件、`grep`/`glob`/`*_inspect`→搜索代码、
+    `edit`/`apply_patch`→修改文件、`bash`/`pwsh`/`exec_command`/`write_stdin`/
+    `terminal_*`→执行命令、`run_code`→运行代码、`web_search`→搜索网页、
+    `web_fetch`→访问网页、`subagent*`→协调子智能体、`todo_write`/`create_goal`/
+    `update_goal`/`get_goal`→更新计划、`ask_user_question`/`request_user_input`→提问,
+    anything else (fallback) → 调用工具; the bridge-side extensions
+    (`spawn_teammate`/`send_message`/`wait_agent`/`list_agents`/`interrupt_agent`/
+    `team_task_*`) count as 协调子智能体.
+  - **Argument detail** ports dsh `liveToolDetail` verbatim: it takes the first
+    non-empty value in the fixed key order `title > description > objective > task >
+    task_name > name > question > questions > prompt > message > command > cmd >
+    queries > query > pattern > url > uri > file_path > path > target > action >
+    status` (`questions` takes the first question), collapses whitespace to single
+    spaces, and truncates beyond **160 characters** with `…`; **with no argument
+    object it falls back to the tool name**, in which case the step line shows only the
+    activity phrase (the tool name is not repeated). **Paths are not basename-folded**
+    (dsh supplies the `path` value as-is).
+  - Examples: `read` + `{"path":"/home/artom/.hermes/config.yaml"}` →
+    `读取文件（/home/artom/.hermes/config.yaml）`; `bash` + `{"command":"df -h"}` →
+    `执行命令（df -h）`; `grep` + `{"query":"TODO"}` → `搜索代码（TODO）`.
+  - **Unaffected**: `detailed` / `verbose` still show "tool · raw arguments" + the
+    `↳` result line; the group-header kind string and the dsh `processTitle` algorithm
+    are byte-for-byte unchanged; the four-tier density definitions and `compact`
+    having no step line are unchanged.
 - **When it takes effect**: same level as `events` — hot-read once at the start of
   each stream task (with `follow-dsh`, the dsh file is resolved at the same time);
   changing it mid-task does not affect the running task, and the next task picks up
   the new value immediately (no gateway restart).
 
-### Code-box group rendering (v0.5.0)
+### Whole-task single-box rendering (v0.6.0)
 
-All four tiers now share one **rendering form** (as of v0.5.0): a turn's tool steps
-and its thinking are **folded into one code block**, serving as **one group in one
-message**; the per-tier density definitions are unchanged. Feishu / QQ collapse or
-expand long code blocks, so the "box" is the collapsible carrier of the "group", and
-the first line inside it is the group header — visible even when collapsed.
+All four tiers share one **rendering form**: **one code box for the whole task, sent as
+a single message**. Every turn's tool steps, thinking and narratives accumulate in
+arrival order, and at task termination they are joined with the result segment into
+the same box; Feishu / QQ collapse or expand long code blocks, so the "box" is the
+collapsible carrier of the whole task process + result. Inside the box **each turn**
+is a segment starting with `🚀 第 N 轮`, and the first line of a segment is the group
+header — visible even when collapsed.
 
 #### Four-tier density
 
-| Tier | Group header | Step line | Result line | Thinking segment | Empty-box handling |
+| Tier | Group header | Step line | Result line | Thinking segment | Empty-turn handling |
 | --- | --- | --- | --- | --- | --- |
-| `compact` | ✅ (step count + kind string) | ❌ | ❌ | ✅ label "思考" only | a header alone is fine (**never an empty box**: suppressed only when there is no tool and no thinking) |
-| `standard` | ✅ | ✅ `tool · plain-language summary` | ❌ | ✅ `思考 · first-line preview` | — |
-| `detailed` | ✅ | ✅ `tool · arguments (truncated)` | ✅ `↳ first result line (truncated)` | ✅ `思考 · first-line preview` | — |
-| `verbose` | ✅ | ✅ `tool · full arguments` | ✅ `↳ full result` | ✅ `思考 · preview + full text` | — |
+| `compact` | ✅ (step count + kind string) | ❌ | ❌ | ✅ label "思考" only | a turn with no step, no thinking and no narrative is omitted entirely |
+| `standard` | ✅ | ✅ `tool · dsh activity description` | ❌ | ✅ `思考 · first-line preview` | same |
+| `detailed` | ✅ | ✅ `tool · arguments (truncated)` | ✅ `↳ first result line (truncated)` | ✅ `思考 · first-line preview` | same |
+| `verbose` | ✅ | ✅ `tool · full arguments` | ✅ `↳ full result` | ✅ `思考 · preview + full text` | same |
 
 #### In-box layout (frozen)
 
 ```text
-Line 1: group header = 工作步骤 · <N> 步 · <kind string>   (N = tool steps of the turn; kind string uses dsh's verbatim algorithm)
+Per-turn segment start (turns with content): 🚀 第 N 轮     (turn marker folded into the box; no text outside)
+Group header (when the turn has steps):  工作步骤 · <N> 步 · <kind string>  (N = tool steps of the turn; kind string uses dsh's verbatim algorithm)
 Fence:                three backticks with an empty info string (no language label; Feishu shows no label)
-Separator:            ──────────────────────────────   (exactly 30 ─, only when there are step lines)
-Step line:            <i>. <tool name> · <that tier's arguments/summary>
+Separator:            ──────────────────────────────   (exactly 30 ─, before the step lines / before the thinking segment)
+Step line:            <i>. <tool name> · <that tier's activity description/arguments>
 Result line (detailed/verbose):   ↳ <that tier's result>   (indented 3 spaces)
 Last segment (when thinking):     思考 · <preview or full text>   (compact: "思考" only, no preview)
-Separator:            appears only "after the step lines, before the thinking"
+Narrative line:       <that turn's 📖 line>          (in arrival order, after the thinking segment)
+Trailing (process vs result):     ──────────────────────────────
+Result segment:       📬 <state · elapsed>，结果如下： + <full final result>
 ```
 
-- The group header carries **no turn number** — the independent `🚀 第 N 轮` marker
-  already sits directly above it, so a repeat is avoided.
+- Each turn's segment start **carries the turn number** (`🚀 第 N 轮`); the group
+  header line carries **no turn number** — the segment's marker already sits directly
+  above it, so a repeat is avoided.
 - The kind string is composed from the turn's **tool-step** kinds using dsh's
   verbatim `processTitle` algorithm; `thinking` does not enter it (its presence is
   shown by the last "思考" segment).
 - A turn with thinking but **no tool step** has **no group header** (an `N = 0`
-  header is meaningless); its box contains only the thinking line.
+  header is meaningless); its segment contains only the thinking line.
 - Multi-line arguments / results are flattened to one line inside the box; under
   `verbose` the full result and the full thinking text keep their original
   multi-line indentation.
@@ -451,12 +464,16 @@ Separator:            appears only "after the step lines, before the thinking"
   `_fence`'s language-less fence). On the Feishu side the info string is a
   **programming-language parsing** slot, not free-form text (hence not a custom word
   such as 工作步骤).
+- **The trailing result segment is fixed**: the `📬` header + the full final result;
+  the process body and the result segment are separated by 30 `─`. With no process
+  body (quiet mode / no process events) the box contains only the result segment.
 
 #### Sample rendering per tier
 
-> The same turn is shown throughout: `turn 1 = thinking + bash + read + grep + bash +
-> edit + bash + write + bash` (8 steps). The copy inside the box stays Chinese so it
-> matches the implementation; English notes follow each example.
+> Only **one turn** of the whole-task box is shown below (`turn 1 = thinking + bash +
+> read + grep + bash + edit + bash + write + bash`, 8 steps); the real box then keeps
+> appending later turns and ends with the result segment. The copy inside the box stays
+> Chinese so it matches the implementation; English notes follow each example.
 
 **`compact` (terse) — group header + thinking label (no preview)**
 
@@ -470,29 +487,30 @@ Separator:            appears only "after the step lines, before the thinking"
 > Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; last
 > line: "Thinking". There is no step line.
 
-**`standard` — group header + "tool · plain-language summary" per step**
+**`standard` — group header + "tool · dsh activity description" per step**
 
 ````text
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（git log --oneline -3）
+2. read · 读取文件（/home/artom/.hermes/config.yaml）
+3. grep · 搜索代码（TODO）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
 ```
 ````
 
-> Step summaries: 1. "view git log"; 2. "read file (config.yaml)"; 3. "find
-> (TODO)"; 4–8. `echo 2` / `/tmp/a` / `echo 3` / `/tmp/b` / `echo 4`. The last
-> segment is "Thinking · <first-line preview>". Two separators bracket the step
-> lines.
+> Examples: 1. "run command (git log --oneline -3)"; 2. "read file
+> (/home/artom/.hermes/config.yaml)"; 3. "search code (TODO)". The activity
+> description is the dsh activity phrase + the `liveToolDetail` argument detail; with
+> no argument object only the phrase is shown. The last segment is
+> "Thinking · <first-line preview>". Two separators bracket the step lines.
 
 **`detailed` — group header + "tool · arguments" per step + first result line**
 
@@ -540,22 +558,25 @@ Separator:            appears only "after the step lines, before the thinking"
 > truncated, and narrative text is not truncated either (the old rule). Multi-line
 > results and the full thinking text keep their original indentation.
 
-#### Box emission rules
+#### Box emission rules (whole-task single box)
 
-- **One turn = one box = one message** (the tool steps and thinking accumulated
-  between `turn_start` and that turn's close).
-- **Close points** (the existing trigger set): `turn_end`, a terminal `status`, a
-  final `text`, or a new `turn_start` (if the previous turn's box has not been sent,
-  send it first).
-- **Empty rule**: a turn with **neither a tool step nor thinking** → **no box** (to
-  avoid an empty box — this is the handling of "a tier is empty under this form");
-  **a tool step → always send**; **thinking only, no tool step → send a box
-  containing only the "思考…" line**.
-- **Order**: the box is always sent **before** the narrative `text` / terminal line
-  that triggered it.
-- **Message size**: the box is split by the existing chunking mechanism
-  (`_split_fenced_chunks`, limit 8000) with the **fence kept closed** (every chunk
-  is still a valid code block).
+- **One task = one box = one message** (every turn's process accumulated between
+  `turn_start` and task termination).
+- **The only send point is task termination**: after the stream ends (`turn_end` /
+  terminal `status` / final `text`) the box is sent in one go; **nothing is ever sent
+  while the task runs** (no heartbeat, no per-turn box, no out-of-box `🚀` line).
+- **Segmentation rule**: every turn with content becomes a segment in order (segment
+  start `🚀 第 N 轮` → group header + step lines → thinking segment → narrative
+  lines); **a turn with no step, no thinking and no narrative is omitted entirely**;
+  **when the whole task's process is empty** (quiet mode / no process events) the box
+  contains **only the result segment**.
+- **Order**: within a segment, arrival order; the result segment is fixed at the box
+  tail.
+- **Message size**: the whole box is split by the existing chunking mechanism
+  (`_split_fenced_chunks`, limit 8000) with the **fence kept closed** (every chunk is
+  still a valid code block, joined with `⏩ 续`).
+- **One retry on failure**: the same box is re-sent; warning-only afterwards — no
+  silence after "done".
 
 `follow-dsh` and the priority chain (explicit tier > `follow-dsh` > legacy
 `content` > default) are unchanged.
@@ -602,44 +623,46 @@ English wording for the same kind:
 `list_agents` / `interrupt_agent` / `team_task_*` → `subagents` (dsh has no such
 tools; this mapping is a bridge-side extension).
 
-The kind copy matches dsh's `message.stepProcess.done.*`; this table feeds the
-**group-header kind string**; the argument / result text of in-box step lines uses
-the raw input and is unaffected by it.
+The kind copy matches dsh's `message.stepProcess.done.*`; this table provides both the
+**group-header kind string** (the settled done form) and the **activity-phrase stems**
+for `standard` step lines (body markers stripped, e.g. `执行了命令` → `执行命令`); the
+argument / result text of `detailed` / `verbose` step lines uses the raw input and is
+unaffected by it.
 
 #### Correspondence with dsh group semantics (a design trade-off)
 
 - On the dsh side, `standard` folds the **whole turn** into **one group header** in the
   GUI, and that header **updates in place** while running to show the current step. The
   bridge is an **append-only, non-updatable** chat stream and cannot rewrite a message
-  it has already sent, so it uses **"one code-box group per turn"** as the equivalent:
-  the first line inside the box is the group header (visible even when collapsed) and
-  the box body carries the step lines and the thinking segment. **This is an inherent
-  trade-off of an append-only chat stream, not a defect** — no step information is
-  lost.
-- **Thinking shares the box with the tool steps**: in dsh's semantics reasoning **is a
-  member of the group** (`groupPart: "reasoning"`), alongside the tool steps; so the
-  settled thinking preview is **folded into the same box** (never a box of its own),
-  letting a user expand once to see the whole process. **This is an explicit
+  it has already sent, so it uses **"one code box for the whole task"** as the
+  equivalent: the box is sent in one go at task termination, segmented by turn inside
+  (`🚀 第 N 轮` segment start + group header + step lines + thinking segment), with the
+  result segment fixed at the tail. **This is an inherent trade-off of an append-only
+  chat stream, not a defect** — no step information is lost.
+- **Thinking shares the segment with the tool steps**: in dsh's semantics reasoning
+  **is a member of the group** (`groupPart: "reasoning"`), alongside the tool steps; so
+  the settled thinking preview is **folded into the same segment** (never a box of its
+  own), letting a user expand once to see the whole process. **This is an explicit
   trade-off**: thinking thus sits in the same perspective as the tool steps, at the
   cost of having to expand a box even when only thinking is present.
 
 #### Invariants
 
-- **Terminal states and errors are unaffected by any tier**: task terminal states
-  (✅ / ❌ / ⚠️), error messages, `final_text` delivery, and stats (`events_seen` /
+- **Terminal states and errors are never lost under any tier**: the task terminal
+  state (completed / failed / canceled) and error information are carried by the
+  trailing `📬` result header, and `final_text` delivery and stats (`events_seen` /
   `messages_sent`, etc.) are **unchanged under every tier**.
-- **The box buffer is force-closed at terminal state**: `turn_end` / a terminal
-  `status` always flushes any unsent box, and **step information already seen is never
-  dropped**.
+- **Task termination always produces a box**: `turn_end` / a terminal `status` /
+  final `text` triggers the single send, and **step information already seen is never
+  dropped**; one retry on failure, warning-only afterwards.
 - **`collector.events: false` (quiet mode) still outranks the tier** (unchanged).
 
-#### Summary improvement
+#### Step-line activity description
 
-When the tool `arguments` are an object with **no command key** (`command` / `cmd` /
-`script`), the `standard` step-line summary prefers the identifying key's `key=value`, in the
-order `job_id` → `id` → `name` → `path` / `file_path` → `query` → `url`; if none is
-present it degrades to the existing single-line JSON truncation. This affects only the
-`standard` step-line summary; `detailed` / `verbose` use the raw text and are unaffected.
+The `standard` step line no longer uses a bridge-side heuristic summary (the rule table /
+command-first-line truncation / identifying-key `key=value` order are all removed); it is
+composed from the dsh activity phrase + the `liveToolDetail` argument detail, see "the
+`standard` step line = dsh activity description" under "Live-detail tier".
 
 ### follow-dsh resolution rules
 
@@ -669,47 +692,46 @@ both the dsh Web default and the look of v0.3.3 `content: true`.
 | --- | --- |
 | `live_detail` explicitly set to one of the four tiers | that tier (the dsh file is not read) |
 | `live_detail: follow-dsh` | resolve the dsh file; `detailed` on failure |
-| `live_detail` unset, `content` explicitly set | the `content` mapping (the tier choice is unchanged; for `standard` see the v0.5.0 note below) |
+| `live_detail` unset, `content` explicitly set | the `content` mapping (the tier choice is unchanged; for `standard` see the v0.6.0 note below) |
 | both unset | `follow-dsh` (the new v0.4.0 default) |
 
 The legacy `collector.content` boolean **keeps working**: `true` → `detailed`,
-`false` → `standard` (the **mapping is unchanged**). **As of v0.5.0 all four tiers use
-"one code-box group per turn"**, so `content: true` (→ `detailed`), `content: false`
-(→ `standard`) and "neither set" deployments all become **box groups** after the
-upgrade: there are no more v0.4.1 heartbeat / closing lines (`standard`), nor per-step
-tool lines (`detailed` / `verbose`). The difference is now only **in-box density** —
-use `detailed` for arguments + first result line in the box, `verbose` for the fully
-expanded form. **Note**: the dsh tier in production today is `standard`, so a "neither
-set" deployment gets `standard`-density boxes.
+`false` → `standard` (the **mapping is unchanged**). **As of v0.6.0 all four tiers use
+"one code box for the whole task"**, so `content: true` (→ `detailed`), `content:
+false` (→ `standard`) and "neither set" deployments all become the **whole-task
+single-box** form after the upgrade: no more per-turn boxes, no more in-process push.
+The difference is now only **in-box density** — use `detailed` for arguments + first
+result line in the box, `verbose` for the fully expanded form. **Note**: the dsh tier
+in production today is `standard`, so a "neither set" deployment gets `standard`-density
+boxes.
 
 - **Stats stay complete**: tiers never change what is counted; `final_text` /
-  `events_seen` / `states` are still fully recorded (`_stream_dsh_call` relies on
-  `final_text` for result delivery).
-- **Boundary: the receipt and the final-result delivery are unaffected by the tier**
-  (administrator's explicit requirement). A tier constrains only the **progress lines in
-  the live stream**; the two never-silent paths are constant:
+  `events_seen` / `states` are still fully recorded (`consume_stream` relies on
+  `final_text` for result-segment rendering).
+- **Boundary: the receipt and the final result are unaffected by the tier**
+  (administrator's explicit requirement). A tier constrains only the **process lines in
+  the box**; the two never-silent paths are constant:
   - **① Instant acceptance receipt**: the dsh single-execution branch returns
     `{"action": "block", "message": "[dsh · context …] ⏳ accepted — …"}` straight from
     `pre_tool_call`. It is gated by `collector.enabled` **alone**, so the receipt is
     byte-identical for any tier value and its latency is unchanged.
-  - **② Final-result delivery on completion**: `_deliver_final_result` still pushes the
-    "📬 task completed + full result" message to the same conversation; **no tier ever
-    strips that body**. As of v0.5.3 the body is rendered in a bare-fence code block
-    (shape independent of the tier; see "Receipt and result delivery").
+  - **② Final-result delivery at task termination**: at termination `consume_stream`
+    still sends the "process body + 📬 header + full result" as the same task box, and
+    **no tier ever strips that body** (shape independent of the tier; see "Receipt and
+    result delivery").
 - **Legacy key ignored**: `collector.code_blocks` is deprecated as of v0.3.0 and
   **ignored entirely** — never read, never an error, never migrated, never a fallback.
   Its semantics changed (old `false` = plain-text lines; using it as a fallback would
   silently turn all content off — a wrong migration); a residual `code_blocks` key in
   the config file has no side effects and no exceptions.
-- **Code-block rendering stays as internal style**: operation content (tool commands /
-  execution results / long final text) is still rendered as fenced code blocks
-  (fence-aware chunking) and is no longer a standalone switch; as of v0.5.0 **the turn's
-  process itself is a code-box group** — all four tiers have that box, and only the
-  in-box density differs (`compact`: header + "思考" label; `standard`: plain-language
-  step summaries; `detailed`: arguments + first result line; `verbose`: arguments /
-  results and full thinking text untruncated). **As of v0.5.3 the body of the result
-  delivery goes into the same kind of bare-fence code block** (header before the box),
-  matching the process boxes.
+- **Code-block rendering stays as internal style**: operation content (tool steps /
+  execution results / long narratives / final text) is still rendered as fenced code
+  blocks (fence-aware chunking) and is no longer a standalone switch; as of v0.6.0
+  **the whole task (process + result) is itself one code box** — all four tiers have
+  that box, and only the in-box density differs (`compact`: header + "思考" label;
+  `standard`: dsh activity descriptions; `detailed`: arguments + first result line;
+  `verbose`: arguments / results and full thinking text untruncated), with the `📬`
+  result header and the full result fixed at the tail.
 
 When unset and the legacy `content` is also unset, `follow-dsh` is used (the new v0.4.0
 default).
@@ -718,17 +740,16 @@ default).
 
 Full key path: `plugins.entries.hermes-a2a-bridge.settings.collector.events`.
 
-Whether "intermediate events" are pushed is controlled separately by this key
+**Whether the process enters the box** is controlled separately by this key
 (default `true`). It is orthogonal to `collector.live_detail`: `live_detail` controls
-the **granularity of progress lines** (four tiers), while `events` controls the
-**push scope** (push intermediate events + final result, or push only the final
-result). The two keys compose independently: with `events: false` **quiet mode
-outranks the tier** — only the final result is pushed whatever the tier; with
-`live_detail: compact` the box has no step line (header + "思考" label only) while
-`text` / terminal lines still are; with `live_detail: standard` tool steps go into
-**one code-box group per turn** (see "Code-box group rendering") while `text` /
-terminal lines still flow; with both combined only the final result is pushed (its
-progress lines rendered per the tier) — the 📬 delivery is unaffected.
+the **in-box granularity of process lines** (four tiers), while `events` controls
+**whether the process takes part** (process + result both enter the box, or the box
+holds only the result segment). The two keys compose independently: with
+`events: false` **quiet mode outranks the tier** — only the result segment is in the
+box whatever the tier; with `live_detail: compact` the box has a group header + "思考"
+label but no step line; with `live_detail: standard` the tool steps enter the same
+whole-task box (see "Whole-task single-box rendering"); with both combined the box
+again holds only the result segment.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -738,17 +759,15 @@ plugins:
       settings:
         collector:
           enabled: true
-          events: true            # default true: push intermediate events + final result
+          events: true            # default true: process + result in the same box
 ```
 
-- `true` (default): current behavior — intermediate events (one process code-box group
-  per turn, including its thinking segment / 📖 intermediate text / status lines) and
-  the final result (📖 output complete / ✅ done card) are all pushed.
-- `false` (quiet mode): push only the final result (📖 output complete + terminal
-  status line); intermediate events are not pushed (no spam). The done card's
-  style stays code blocks (internal rendering, no longer configurable; quiet mode
-  outranks the tier — see "Live-detail tier"); the 📬 result delivery is boxed the
-  same way and is unaffected by this switch.
+- `true` (default): one box for the whole task — every turn's process (per-turn 🚀
+  markers / group headers / step lines / thinking segments / 📖 narrative lines) is
+  sent together with the trailing `📬` result segment.
+- `false` (quiet mode): the box holds **only the result segment** (`📬` header + full
+  result); the process does not take part (no spam); at task termination this single
+  box is still sent, never silent.
 
 When unset it stays `true`, keeping existing deployments' behavior unchanged.
 
@@ -798,59 +817,50 @@ a2a_call (pre_tool_call hook)
                         |
               normalize_events (task/statusUpdate/artifactUpdate -> unified events)
                         |
-              render_line (T0 line language)
+              render_line (T0 line language: 🚀 markers / 📖 narratives; status only records state)
                         |
-              Throttler (per-turn box buffer: accumulate step details and thinking / text aggregation / global rate limit)
+              TaskBox (whole-task buffer: per-turn markers / steps / thinking / narratives; nothing is sent while running)
+                        |
+              task terminates -> format_task_message (process body + 30 ─ + 📬 result header + full result, wrapped in a bare fence)
                         |
               redact_sensitive_text(force=True)
                         |
-              +-- sender (really sends to Feishu/QQ when collector.enabled; otherwise noop)
-              |
-              +-- stats.final_text -> result message (📬 header + bare-fence code-block body, fence-aware chunks) --> delivered
-                        to the messaging surface (no silence after "done"; the receipt carries only "accepted")
+              make_sender(code_blocks=True) (fence-aware chunking, over-long chunks joined with ⏩ 续)
+                        |
+              adapter.send --> sends exactly one whole-task box --> Feishu / QQ
+                        (one retry on failure; no silence after "done"; the receipt carries only "accepted")
 ```
 
-### T0 line-language mapping
+### T0 line-language mapping (text fragments folded into the box)
 
-| Event | Rendered line |
-| --- | --- |
-| `turn_start` (no turn) | `Starting execution` |
-| `turn_start` (with turn N) | `Turn N` |
-| `thinking` | `Thinking...` |
-| `tool_call` | `Calling tool \`{name}\`` (with args, the command goes into a code block) |
-| `tool_result` | `\`{name}\` done` (with non-empty result, the output body goes into a code block; empty result = marker only) |
-| `text` (non-final) | `{text truncated to <=120}` (flush only at terminal state; no truncation under `verbose`) |
-| `text` (final, lastChunk) | `Output complete` (the final result is not dumped in full) |
-| `status` completed | `Done` |
-| `status` failed | `Failed` |
-| `status` canceled | `Canceled` |
-| `status` working / submitted | (not sent separately) |
+| Event | Rendered fragment | Position in the box |
+| --- | --- | --- |
+| `turn_start` (no turn) | `Starting execution` | segment-start marker |
+| `turn_start` (with turn N) | `Turn N` | segment-start marker |
+| `thinking` | (no line of its own) | carried by the process box's "思考" segment |
+| `tool_call` | (no line of its own) | carried by a process-box step line |
+| `tool_result` | (no line of its own) | carried by the process box's `↳` result line (detailed / verbose) |
+| `text` (non-final) | `📖 {text truncated to <=120}` (no truncation under `verbose`) | that turn's narrative line, after the thinking segment |
+| `text` (final, lastChunk) | (no line of its own) | enters the trailing result segment (`📬` header + full text) |
+| `status` completed / failed / canceled | (no line of its own) | decides the state word of the trailing `📬` result header |
+| `status` working / submitted | (not sent separately) | — |
 
-> As of v0.5.0 `thinking` / `tool_call` / `tool_result` **no longer become lines of
-> their own** on the broadcast path: all four tiers fold them into **one code-box
-> group per turn** (see below and "Code-box group rendering").
+> As of v0.6.0 these lines are **no longer messages of their own**: all four tiers fold
+> the process fragments into **one code box for the whole task**, sent in one go at
+> task termination (see "Whole-task single-box rendering"). **Terminal states and
+> errors are carried by the trailing `📬` result header under every tier and are never
+> lost** (no more separate ✅ / ❌ / ⚠️ lines).
 
-How a tier affects those lines is given by the four-tier table under "Live-detail
-tier": as of v0.5.0 `tool_call` / `tool_result` / `thinking` are **never sent as lines
-of their own under any tier** but are collected into **one process code-box group per
-turn** (`compact`: no step line, header + "思考" label only; `standard`: plain-language
-step summaries; `detailed`: arguments + `↳ first result line`; `verbose`: arguments /
-results and full thinking text untruncated); the box precedes the `text` / terminal
-line that triggered it. **Terminal lines (✅ / ❌ / ⚠️) and errors are always sent,
-whatever the tier**, and the box buffer is force-closed at terminal state without
-losing step information.
+### Throttling and soft limits (v0.6.0: nothing is sent while running, so no throttling is needed)
 
-### Throttling and soft limits
-
-- `turn_start` and terminal `status` are passed through one by one; **all four tiers
-  put `tool_call` / `tool_result` / `thinking` into the box buffer** (accumulating the
-  turn's step details and thinking) and emit **one code-box group** when the turn
-  closes (see "Code-box group rendering").
-- Low-signal `text` (non-final) is only accumulated, not sent one by one; it is
-  flushed as one `📖` line at `turn_end` or a status terminal state.
-- Global rate limit: adjacent sends are at least `min_interval` seconds apart
-  (default 2.0).
-- A soft limit (at most 30 messages per task) is not implemented yet (TODO P2c).
+- **Nothing is ever sent while the task runs**: `turn_start` / `tool_call` /
+  `tool_result` / `thinking` / non-final `text` all go into the whole-task buffer; at
+  task termination **exactly one** whole-task box is sent (see "Whole-task single-box
+  rendering"), so in-process rate limiting / message coalescing is no longer needed.
+- `min_interval` and the global rate limit were removed with the whole-task single box
+  (`consume_stream` no longer takes that parameter).
+- The soft limit (at most 30 messages per task) is no longer relevant:
+  `messages_sent` is now **0 or 1**.
 
 ### Window-period verification checklist
 
@@ -860,19 +870,18 @@ losing step information.
    `plugins.entries.hermes-a2a-bridge.settings`.
 3. Behavior confirmation: in a Feishu / QQ conversation, have the agent call
    `a2a_call(agent="dsh", ...)` and observe ① the agent receives the "accepted"
-   receipt within seconds (no more long blocking); ② the conversation receives
-   `🚀 第 N 轮` → **one process code-box group per turn** (header
-   `工作步骤 · N 步 · <类别串>` + step lines + a final `思考 · …` segment; the in-box
-   density follows the live-detail tier: `compact` no step line, `standard`
-   plain-language summaries, `detailed` arguments + first result line, `verbose`
-   untruncated) → `📖 输出完成` → `✅ 完成` (by default `follow-dsh` follows dsh's
-   current tier), and that **dsh executes
-   only once** (the dsh-a2a-server log shows only one task submission); ③ when the
-   task finishes, the conversation receives the "📬 dsh 任务完成，结果如下" result
-   message (header before the box + body inside a bare-fence code block, body
-   untruncated). Also (v0.5.1): have an `a2a_call` carrying an
-   **explicit `context_id`** trigger the same receipt and live stream, with the
-   message landing in the same conversation that `context_id` names.
+   receipt within seconds (no more long blocking); ② **the conversation sends no
+   message at all while the task runs** (complete silence before a long task finishes
+   is expected); ③ at task termination the conversation receives **exactly one**
+   whole-task box (`🚀 第 N 轮` segments + group headers
+   `工作步骤 · N 步 · <类别串>` + step lines + `思考 · …` + `📖` narrative lines, with
+   the trailing `📬 dsh 任务完成（用时 …），结果如下：` + full result; the in-box density
+   follows the live-detail tier: `compact` no step line, `standard` dsh activity
+   descriptions, `detailed` arguments + first result line, `verbose` untruncated; by
+   default `follow-dsh` follows dsh's current tier), and that **dsh executes only
+   once** (the dsh-a2a-server log shows only one task submission). Also: have an
+   `a2a_call` carrying an **explicit `context_id`** trigger the same receipt and task
+   box, with the message landing in the same conversation that `context_id` names.
 4. redact confirmation: tokens in progress text do not appear in plaintext.
 5. Degradation confirmation: temporarily turn off `collector.enabled` (Dashboard
    toggle or a config edit) and confirm the dsh target only injects origin and
@@ -889,26 +898,25 @@ losing step information.
    restart (backend mounting and plugin discovery are one-shot).
 7. Live-detail tier confirmation: set `collector.live_detail` to `compact` /
    `standard` / `detailed` / `verbose` in turn and confirm the rendering matches the
-   "Code-box group rendering" section (all four tiers send **one code-box group per
-   turn**, with no v0.4.1 heartbeat / closing lines; in-box density: `compact`
-   header + "思考" label only, `standard` plain-language step summaries, `detailed`
-   step arguments + `↳ first result line`, `verbose` arguments / results and full
-   thinking text untruncated); confirm that **a turn with no tool and no thinking
-   sends no box**, **thinking-only sends a box containing only the thinking line**,
-   the box **precedes** the triggering `text` / terminal line, a long box keeps its
-   **fence closed** after chunking, and that **terminal states and
-   errors are still delivered under every tier** and the "📬 dsh 任务完成，结果如下"
-   message is unaffected; also confirm the box buffer is force-closed at
-   `turn_end` / terminal state without losing step information. Set it back to
+   "Whole-task single-box rendering" section (all four tiers send **exactly one
+   whole-task box**: process body + trailing result segment; in-box density:
+   `compact` header + "思考" label only, `standard` dsh activity descriptions,
+   `detailed` step arguments + `↳ first result line`, `verbose` arguments / results and
+   full thinking text untruncated); confirm **zero messages while running**, that **a
+   turn with no step / no thinking / no narrative is omitted entirely**, that a long
+   box keeps its **fence closed** after chunking, and that **terminal states and errors
+   are carried by the trailing `📬` result header under every tier and never lost**;
+   in quiet mode (`collector.events: false`) the box holds **only the result segment**.
+   Set it back to
    `follow-dsh` and confirm the tier follows `config.transcriptView` of the `ui-chat`
    entry in `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (legacy values `normal` /
    `expanded` read as `detailed`); then force one of missing file / corrupt YAML /
    no `ui-chat` entry / no key / illegal value and confirm it **falls back to
    `detailed`**, logs once, and never blocks the task. If a legacy
    `collector.content` is kept while `live_detail` is unset, confirm the `content`
-   mapping is used (`true` → `detailed`, `false` → `standard`; both become the box
-   form after the upgrade). A residual `collector.code_blocks` key in the config file
-   has no side effects (ignored, no error).
+   mapping is used (`true` → `detailed`, `false` → `standard`; both become the
+   whole-task single-box form after the upgrade). A residual `collector.code_blocks`
+   key in the config file has no side effects (ignored, no error).
 
 ## Unit tests
 
@@ -922,21 +930,20 @@ python3 tests/test_dashboard_api.py
 
 `test_origin_injection.py` covers origin→contextId injection (pure static, injects
 a fake `gateway.session_context` via `sys.modules`). `test_consumer.py` drives
-`parse_sse_lines` + `normalize_events` + `render_line` + `Throttler` +
+`parse_sse_lines` + `normalize_events` + `render_line` + `TaskBox` +
 `make_sender` with synthetic SSE `data:` strings matching dsh-a2a-server's real
 format (a mock sender records the send list), covering normalized event kinds and
 order, rendered-line emoji prefixes, text aggregation flushing only at terminal
 state, redact invocation, two-level sender fallback
-(no gateway → `no_gateway`), no crash on abnormal events, four-tier **code-box group**
-rendering (one box per turn, group header `工作步骤 · N 步 · <类别串>`, separator, step
-lines, `↳` result lines, thinking segment; the in-box density differences — `compact`
-no step line / `standard` no result line / `detailed` has result lines / `verbose`
-untruncated; box emission rules — no box when there is neither a tool nor thinking,
-thinking-only sends a box with only the thinking line; the box preceding the
-`text` / `turn_end` / terminal line; forced close of the box buffer at terminal
-state; fence closure after chunking a long box; the activity-kind mapping and
-group-header kind-string composition (1 / 2 / 3 / >3 kinds), and the summary
-improvement), the
+(no gateway → `no_gateway`), no crash on abnormal events, four-tier **whole-task
+single-box** rendering (one box for the whole task, group header
+`工作步骤 · N 步 · <类别串>`, separator, step lines, `↳` result lines, thinking
+segments, `🚀` markers and the `📬` result header folded into the box; the in-box
+density differences — `compact` no step line / `standard` no result line / `detailed`
+has result lines / `verbose` untruncated; emission rules — nothing sent while running,
+empty turns omitted entirely, exactly one box at task termination; fence closure after
+chunking a long box; the activity-kind mapping, group-header kind-string composition
+(1 / 2 / 3 / >3 kinds), and the `standard` step line's dsh activity description), the
 legacy `content` mapping (`true` → `detailed` / `false` → `standard`), **terminal
 states and errors surviving every tier**, and outputs an "event sequence → rendered
 message sample" mapping table.
@@ -949,12 +956,11 @@ falls back to origin injection, **an explicit `context_id` is intercepted too**
 collector on returns block and spawns the worker; interception still happens when
 the messaging surface is empty and only the explicit value supplies the origin),
 non-dsh / collector off / a2a_orchestrate / non-messaging surface injects origin
-only, and
-`_stream_dsh_call` formats the result, result delivery (`_format_result_message`
-three variants + **bare-fence code-box body** — no language tag, inner fences
-escaped, body untruncated / worker swallows exceptions / delivery retries once /
-long results chunk fence-aware with every chunk closed), and raises
-on missing dsh config.
+only, and `_stream_dsh_call` -> `consume_stream`'s **whole-task single-box**
+delivery (`format_task_message` three result-header states + **bare-fence code-box
+body** — no language tag, inner fences escaped, body untruncated / worker swallows
+exceptions / delivery retries once / an over-long box chunks fence-aware with every
+chunk closed), and raises on missing dsh config.
 
 `test_hot_read.py` covers the hot-read rework: `_read_switch` returns the new
 value after changing a FakeCtx's config, falls back to the module-level globals
@@ -998,28 +1004,28 @@ end-to-end verification under the real gateway is deferred to the window period
   built-in A2A plugin renames its tools, `_TARGET_TOOLS` in `__init__.py` must be
   updated accordingly.
 - Single execution applies only to the dsh target of `a2a_call`;
-  `a2a_orchestrate` still runs the original handler (no live output), but the
+  `a2a_orchestrate` still runs the original handler (no task box), but the
   pre_tool_call origin injection applies to it as well.
 - Single execution returns instantly from the `pre_tool_call` hook: a background
   daemon thread sends the streaming request (not blocking that tool-call path,
   not freezing the gateway main loop, and never touching the framework's 30 s
   hook-callback cap); routing info is derived from origin (not re-reading the
-  ContextVar). Both live and result sending go through `consumer.make_sender`,
+  ContextVar). Task-box sending goes through `consumer.make_sender`,
   which uses `safe_schedule_threadsafe` to schedule across threads onto the
   gateway main loop, avoiding a new loop that would cause cross-thread failure.
 - Trigger condition: a dsh target is judged by `a2a_call`'s `agent=="dsh"` or its
   URL; non-dsh targets are not blocked, only inject origin, and do not trigger
-  streaming.
-- An explicit `context_id` does not change the trigger condition (v0.5.1): it
-  only decides the live **origin** (the explicit value outranks the
+  a streaming task.
+- An explicit `context_id` does not change the trigger condition: it
+  only decides the **origin** (the explicit value outranks the
   messaging-surface origin), never disables interception; the value is passed to
   dsh **as-is, never overwritten**, so the session-reuse key is unchanged.
 - On spawn failure / missing dsh config, fall back to origin-injection only; the
   task still executes once via the original synchronous `a2a_call`
-  (functionality preserved), just without live output.
+  (functionality preserved), just without a task box.
 - Receipt and result are separate: the "accepted" receipt is returned via
-  `{"error": ...}` (instantly); the final result travels the delivery path back
-  to the messaging surface (see the "Receipt & result delivery" section).
+  `{"error": ...}` (instantly); the final result is folded into the same task box
+  (see the "Receipt & result delivery" section).
 
 ## Known Issues (observation items, watch but do not fix)
 

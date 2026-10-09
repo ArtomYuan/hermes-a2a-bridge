@@ -2,75 +2,80 @@
 
 **English** | [简体中文](README.md)
 
-A bridge plugin on the Hermes side that connects to the dsh A2A server: it streams
-dsh task execution live to Feishu / QQ and maps "one Hermes conversation ↔ one dsh
-session" continuity onto `contextId`.
+A bridge plugin on the Hermes side that connects to the dsh A2A server: when a dsh
+task **finishes**, it delivers the execution process of every turn together with the
+final result to Feishu / QQ in one go (**one code box for the whole task**), and maps
+"one Hermes conversation ↔ one dsh session" continuity onto `contextId`.
+
+Current version: **0.6.0**.
 
 ## Preview
 
-### Live stream
+### One box for the whole task (v0.6.0: no live push any more)
 
-When a dsh task is submitted, this plugin consumes the SSE stream and pushes
-intermediate progress back to the messaging surface in real time. As of v0.5.0 a
-turn's **tool steps and its settled thinking are folded into one code block**,
-serving as **one group in one message** (the first line inside is the group header,
-visible even when collapsed). The live sequence a user sees in Feishu / QQ looks
-roughly like this (`standard`, the default tier of the dsh in production today):
+When a dsh task is submitted, this plugin consumes the SSE stream but **sends no
+message at all while it runs** — every turn's tool steps, thinking and narratives stay
+in a buffer, and only when the task terminates are they joined with the **final
+result** into **one** bare-fence code box and sent as **a single message**. So there
+is **no live progress push any more**: a long task stays completely silent until it
+finishes, and you see the whole process + result in one shot (the acceptance receipt
+is still the `a2a_call` tool return value and is unaffected). The example below uses
+`standard`, the default tier of the dsh in production today:
 
 ````text
-🚀 第 1 轮
 ```
+🚀 第 1 轮
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（git log --oneline -3）
+2. read · 读取文件（/home/artom/.hermes/config.yaml）
+3. grep · 搜索代码（TODO）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
+📖 <that turn's narrative line>
+🚀 第 2 轮
+…
+──────────────────────────────
+📬 dsh 任务完成（用时 3 分 12 秒），结果如下：
+<full final result>
 ```
-📖 输出完成
-✅ 完成
 ````
 
-> Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; the step
-> summaries are plain-language (1. "view git log"; 2. "read file (config.yaml)";
-> 3. "find (TODO)"; 4–8. `echo 2` / `/tmp/a` / `echo 3` / `/tmp/b` / `echo 4`); the
-> last segment is "Thinking · <first-line preview>".
-
-All four tiers (`compact` / `standard` / `detailed` / `verbose`) send this one box;
-only the **in-box density** differs: `compact` is the header plus a "思考" label only
-(no step line), `standard` uses plain-language step summaries, `detailed` adds step
-arguments + `↳ first result line`, and `verbose` leaves arguments / results and the
-full thinking text untruncated. A turn with **neither a tool step nor thinking sends
-no box** (never an empty box); thinking with no tool sends a box containing only the
-thinking line. The group header carries **no turn number** — the independent
-`🚀 第 N 轮` marker already sits above it.
+Both the `🚀 第 N 轮` turn marker and the `📬` result header are **folded into the
+box**; there is **no text outside it**. All four tiers (`compact` / `standard` /
+`detailed` / `verbose`) send this **one** box; only the **in-box density** differs:
+`compact` is the header plus a "思考" label only (no step line), `standard` shows
+**dsh activity descriptions** (`读取文件（/path）` / `执行命令（df -h）` /
+`搜索代码（TODO）`), `detailed` shows raw arguments + `↳ first result line`, and
+`verbose` leaves arguments / results and the full thinking text untruncated. The
+group header carries **no turn number** — the `🚀 第 N 轮` marker already sits above
+it. **A turn with neither a tool step nor thinking nor narrative is omitted
+entirely** (it produces no empty segment).
 
 Long text exceeding the gateway's per-message limit is split at code-block
 boundaries; continuation chunks are joined with a `⏩ 续` marker, so code blocks
 never break across chunks (the fence stays closed).
 
-### An explicit `context_id` is streamed live too (v0.5.1)
+### An explicit `context_id` enters the single-box chain too
 
 The `pre_tool_call` gate condition is `a2a_call` + `collector.enabled` + a dsh
-target + a non-empty `message`; the live origin is the caller's explicit
+target + a non-empty `message`; the origin is the caller's explicit
 `context_id` **when present**, otherwise the current messaging-surface origin.
-So **a call carrying an explicit `context_id` is intercepted and streamed live
-too** — in v0.5.0 and earlier such calls passed through and live streaming never
-started; that is the behavior v0.5.1 fixes.
+So **a call carrying an explicit `context_id` is intercepted too**: the task runs
+as usual and receives the whole-task box at the end.
 
 The trade-off: a call with an explicit `context_id` goes from **synchronous** to
-**asynchronous** (instant "⏳ accepted" receipt → background execution + live
-progress → the result is delivered automatically to this conversation on
-completion); the `context_id` the caller supplies is **adopted as-is, never
-overwritten**, so the message still lands in the same conversation.
+**asynchronous** (instant "⏳ accepted" receipt → background execution → the
+completed-task box delivered to this conversation); the `context_id` the caller
+supplies is **adopted as-is, never overwritten**, so the message still lands in the
+same conversation.
 
-Troubleshooting: if a conversation shows no live messages, first confirm whether
+Troubleshooting: if a conversation shows no task-box message, first confirm whether
 that `a2a_call` was intercepted — when it was, the tool result is the "⏳
 accepted" receipt (log like
 `Tool a2a_call returned error {"error":"[dsh · context …`); when it was not, the
@@ -80,9 +85,11 @@ conversation show no live messages?".
 
 ### Code blocks
 
-Operation content — tool commands, execution results, and final text — is
-automatically rendered as code blocks; **the body of the "📬 result delivery"
-message is boxed the same way** (since v0.5.3, matching the process boxes):
+All operation content — tool steps, execution results, thinking, narratives and the
+final text — is rendered inside **the same** code box; **the result segment at task
+termination (the `📬` header line + the full final result) is inside that box too**
+(since v0.6.0 it is merged with the process into one whole-task box, with no text
+outside it):
 
 - **Feishu**: fenced content triggers post rich text; code blocks are scrollable;
 - **QQ / other mainstream gateways**: markdown code blocks render as code blocks;
@@ -91,16 +98,16 @@ message is boxed the same way** (since v0.5.3, matching the process boxes):
   block's language name in the top-left corner, so the info string is left empty
   (no meaningless "text" label), matching the operation-output boxes.
 
-Shape of the result-delivery message (header **before** the box, body in a
-**bare** fence, body **never truncated**):
+The three states of the trailing result header (all inside the box):
 
-````text
-📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
+| Case | Trailing result header |
+| --- | --- |
+| completed with text | `📬 dsh 任务完成（用时 …），结果如下：` |
+| non-completed with text (failed / canceled) | `📬 dsh 任务已结束（失败/已取消 · 用时 …），输出如下：` |
+| no text output | `📬 dsh 任务已结束（完成 · 用时 …）——本次无文本输出。` |
 
-```
-<full result body>
-```
-````
+The result body is **never truncated**; inner triple backticks are escaped (a
+zero-width space is inserted) so the outer fence stays closed.
 
 Sample code-block content (an `ls -la` output block):
 
@@ -113,17 +120,18 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 
 > Actual rendering depends on each gateway's client.
 
-Progress display and intermediate-event push are both configurable
-(`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
-`standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
-default `follow-dsh` to follow dsh's current tier; all four use **one code-box group
-per turn**, whose first line is the group header `工作步骤 · N 步 · <类别串>`, differing
-only in in-box density: `compact` header + "思考" label, `standard` plain-language
-step summaries, `detailed` arguments + `↳ first result line`, `verbose` arguments /
-results and full thinking text untruncated; `collector.events` for the event stream —
-off is quiet mode, pushing the final result only, and it **outranks the tier**;
-code-block rendering stays as the internal style for a tier (**result delivery
-uses the same box shape**) and is no longer a standalone switch), and can be
+Progress display and the result push are both configurable
+(`collector.live_detail` for the **in-box process-display tier** — four tiers
+`compact` / `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work
+details", default `follow-dsh` to follow dsh's current tier; all four use **one code
+box for the whole task**, whose first line is the group header
+`工作步骤 · N 步 · <类别串>`, differing only in in-box density: `compact` header +
+"思考" label, `standard` **dsh activity descriptions**, `detailed` raw arguments +
+`↳ first result line`, `verbose` arguments / results and full thinking text
+untruncated; `collector.events` controls **whether the process enters the box** —
+off is quiet mode, the box holds **only the result segment**, and it **outranks the
+tier**; code-block rendering is the internal style for a tier (**the result segment
+and the process share one box**) and is no longer a standalone switch), and can be
 toggled or selected from the "A2A live switches" panel
 on the Dashboard "Plugins" page (instant effect) — see
 [CONFIGURATION.en.md](CONFIGURATION.en.md).
@@ -141,7 +149,7 @@ hard-bound; combine them as needed:
 | --- | --- |
 | dsh-a2a-server only | A standard A2A interface callable by any A2A client |
 | This plugin only | Not applicable — it relies on dsh-a2a-server as its server |
-| Both together | Full experience: task submission + live progress (🔧 / 📖 / ✅) + session continuity (one conversation ↔ one dsh session) + single execution |
+| Both together | Full experience: task submission + one whole-task box (🚀 / 📖 / 📬) + session continuity (one conversation ↔ one dsh session) + single execution |
 
 ## Installation
 
@@ -180,9 +188,10 @@ hard-bound; combine them as needed:
 
 ## Live switches (Dashboard, instant effect)
 
-Once the plugin is loaded, the three live-stream switches — `collector.enabled`
-(master switch) / `collector.events` (intermediate events) / `collector.live_detail`
-(live-detail tier; a dropdown with 5 options: follow dsh / terse / standard /
+Once the plugin is loaded, the task's three switches — `collector.enabled`
+(master switch) / `collector.events` (whether the process enters the box; off = the
+box holds only the result segment) / `collector.live_detail`
+(in-box tier; a dropdown with 5 options: follow dsh / terse / standard /
 detailed / fully expanded) — can be toggled or selected directly from the "A2A
 live switches" panel at the top of the Hermes
 Dashboard "Plugins" page; saving takes effect **immediately (no gateway restart

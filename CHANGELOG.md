@@ -5,6 +5,83 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-10-10
+
+> ⚠️ **渲染改革（观感变更，升级前必读）**：直播过程与回复**彻底去掉代码框 / 围栏**，
+> 改为逐行复刻 dsh 客户端「工作步骤展示」的行形态——一条消息 = 一个过程组（组头
+> `⌄ <processTitle>` + 步骤行 `▸ <工具标题> · <摘要>` + 思考行 `✦ 思考 · <首行>` +
+> 结果体缩进 2 空格），收束行 `▸ 已完成` / `▸ 已完成，用时 <n>秒` / `▸ 处理失败` /
+> `▸ 已停止` 一轮一条；`turn_start` 的 `🚀 第 N 轮` 行与 `status` 终态的 `✅ 完成` /
+> `❌ 失败` / `⚠️ 已取消` 行**移除**；「📬 结果送达」改为头行 + 空行 + **结果原文**
+> （普通 markdown、不截断）。**不新增 / 不删除配置键**。
+
+### Changed
+
+- **直播过程改为 dsh 行形态（去代码框）**：一轮内的工具步骤与思考收口为**一条**过程组
+  消息（`consumer.render_process_group`），行结构逐行对齐 dsh：
+  - 组头行 `⌄ <processTitle>`：`⌄` = dsh `IconChevronDown` 文本等效；
+  - 步骤行 `▸ <工具标题> · <摘要>`：标题 = dsh `tool.title.*`，摘要 = dsh
+    `deriveSummary`（`SUMMARY_KEYS` 键序 / `search` 变体的 `queries` 数组 / 标题回落到
+    `工具调用` 时补工具名）；非 `verbose` 摘要截断 160 补 `…`；
+  - 思考行 `✦ 思考 · <首行>`：`compact` 只出 `✦ 思考`，`verbose` 出全文（续行缩进
+    2 空格）；
+  - 结果体：`detailed` 结果首行、`verbose` 结果全文，均缩进 2 空格挂在步骤行后。
+- **档位密度重排**：`compact` = 组头 + `✦ 思考`；`standard` = 组头 + 步骤行 + 思考
+  首行；`detailed` = standard + 结果体；`verbose` = **无组头** + 步骤行（摘要不截断）+
+  思考全文 + 结果全文。
+- **步骤行口径改回 dsh 工具行摘要**：v0.6.0 的 `describe_tool_call`
+  「`<活动短语>（<liveToolDetail 参数细节>）`」口径**整体删除**，相关活动短语 / 参数
+  细节常量随之移除。
+- **组头类别串（`group_title` / dsh `processTitle`）**：种类按**去重后出现次数降序**
+  取类；1 类用完成文案、2 类 `A并B`（两段都以「已」开头时第二段去「已」）、3 类 `，`
+  连接、>3 类取前 3 + `等`、空（无工具步）= `已完成分析`；思考不计入组头类别串。
+- **收束行（`render_turn_close`，逐字对齐 dsh `TurnProcessNodeView`）**：`▸ 已完成` /
+  `▸ 已完成，用时 <n>秒` / `▸ 处理失败` / `▸ 已停止`，一轮一条（`turn_end` 优先、终态
+  `status` 兜底）；时长下限 1 秒，文案对齐 dsh `formatRunDuration`（`12秒` / `1分5秒` /
+  `1小时2分3秒`）。
+- **叙述 / final 文本不再有 `📖` 前缀、也不再包任何块**：原样 markdown；`verbose` 不
+  截断，其余档非 final 截断 120。
+- **「📬 结果送达」去框**：`_format_result_message` 改为 `📬 **…**（用时 …）` 头行 +
+  空行 + 结果原文（普通 markdown、不截断）；超长（>8000）走**纯文本换行边界分块**
+  （`_split_plain_chunks`，块间 `⏩ 续`）。
+- 中英四份文档（README / CONFIGURATION）同步新基线（dsh 行形态、四档密度表、真实样例、
+  排版冻结表）；`plugin.yaml` 与 `dashboard/manifest.json` 版本号 bump 到 `0.7.0`。
+
+### Removed
+
+- `turn_start` 的 `🚀 第 N 轮` 行；`status` 终态的 `✅ 完成` / `❌ 失败` / `⚠️ 已取消`
+  行（信息由收束行承载）。
+- 代码框 / 围栏渲染与围栏感知分块（旧 `render_process_box` 等）——分块统一为纯文本
+  换行边界。
+- v0.6.0 的 `describe_tool_call` 步骤行口径及其活动短语 / 参数细节常量。
+
+### Fixed
+
+- **`compact` 档「只有工具步、无思考」时过程组（含组头）被整组丢弃**：成员行在
+  `compact` 折叠，但组头行必须可见（对齐 dsh `stepGrouping=collapsed`），且工具仍计入
+  组头类别串。修正前该轮只剩收束行，工具过程完全不显示。
+
+### Breaking
+
+- **消息形态与条数变化**：一轮 2 步工具调用的直播从「`🚀 第 1 轮` + 代码框 + 最终文本 +
+  `✅ 完成`」变为「过程组 + 最终文本 + `▸ 已完成`」；依赖旧代码框 / `🚀` / `✅` 行文本
+  的下游消费者需按新行形态适配。
+
+### Unchanged
+
+- 三个配置键（`collector.enabled` / `events` / `live_detail`）与遗留 `content` 映射、
+  历史遗留别名 `collector.code_blocks`（**已废弃**、一律忽略）、`follow-dsh` 与优先级链、
+  Dashboard 三开关与写回校验均不变；**不新增 / 不删除任何配置键**。
+- 发组规则（一轮一组、收口时机、无工具无思考不发组）、过程组先于触发行、`redact` 流程、
+  stats 完整性、终态强制收口不变。
+
+### Tests
+
+- 测试断言同步更新到 v0.7.0 形态：dsh 行渲染（组头 / 步骤行 / 思考行 / 结果体 / 收束行、
+  四档密度、纯文本分块）、结果送达无框、`turn_start` 与终态 status 不再产出旧行；新增
+  「已删 API 防回归」与「面板档位值域 ≡ `consumer.LIVE_DETAIL_MODES`」契约用例；
+  `compact` 只有工具步的用例改为断言组头行照发。
+
 ## [0.6.0] - 2026-10-10
 
 > ⚠️ **文案变更（形态不变）**：`standard` 档逐步行的摘要由桥侧「命令原文 / 人话

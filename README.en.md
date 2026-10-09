@@ -11,59 +11,79 @@ session" continuity onto `contextId`.
 ### Live stream
 
 When a dsh task is submitted, this plugin consumes the SSE stream and pushes
-intermediate progress back to the messaging surface in real time. As of v0.5.0 a
-turn's **tool steps and its settled thinking are folded into one code block**,
-serving as **one group in one message** (the first line inside is the group header,
-visible even when collapsed). The live sequence a user sees in Feishu / QQ looks
-roughly like this (`standard`, the default tier of the dsh in production today):
+intermediate progress back to the messaging surface in real time. As of v0.7.0 it
+**uses plain-text rows throughout**: a turn's tool steps and thinking are
+rendered as one **dsh line-form** process group, replicating line by line the row
+structure and glyphs of the dsh client's "Work details" view (group header `⌄` /
+step row `▸` / thinking row `✦`). The live sequence a user sees in Feishu / QQ looks
+roughly like this (`standard`, the default tier of the dsh in production today; the
+process group and the closing row are each one message):
 
-````text
-🚀 第 1 轮
+```text
+⌄ 执行了命令，已读取文件，已搜索代码等
+▸ 运行命令 · 查看提交
+▸ 读取 · /tmp/a
+▸ 搜索文件内容 · foo
+▸ 运行命令 · echo 2
+▸ 编辑 · /tmp/a
+▸ 运行命令 · echo 3
+▸ 写入 · /tmp/b
+▸ 运行命令 · echo 4
+✦ 思考 · 我先把目录结构列出来确认范围，再决定改哪几个文件。
 ```
-工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
-──────────────────────────────
-1. bash · 执行命令（查看提交）
-2. read · 读取文件（/tmp/a）
-3. grep · 搜索代码（foo）
-4. bash · 执行命令（echo 2）
-5. edit · 修改文件（/tmp/a）
-6. bash · 执行命令（echo 3）
-7. write · 写入文件（/tmp/b）
-8. bash · 执行命令（echo 4）
-──────────────────────────────
-思考 · 我先把目录结构列出来确认范围…
+
+```text
+▸ 已完成，用时 12秒
 ```
-📖 输出完成
-✅ 完成
-````
 
-Each `standard` step line is **byte-for-byte aligned with dsh's activity
-description**: `<dsh activity phrase>（<dsh argument detail>）` (e.g.
-`执行命令（df -h）`, `读取文件（config.yaml）`, `搜索代码（TODO）`; when no key yields
-a value — e.g. a plain string argument — dsh's fallback chain shows the **tool name
-itself**, as in `执行命令（bash）`). This replaces
-v0.5.x's bridge-side heuristic summary rule table (v0.6.0). The box above is
-the actual `standard` output of `consumer.render_process_box`.
+The two blocks above are the **actual output** of
+`consumer.render_process_group(members, "standard")` and
+`consumer.render_turn_close("completed", 12)` respectively (not hand-written).
+Here:
 
-> Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; the step
-> lines are dsh activity descriptions (1. `执行命令（查看提交）`, where the
-> `description` argument outranks `command`; 2. `读取文件（/tmp/a）`;
-> 3. `搜索代码（foo）`; 4–8. `执行命令（echo 2）` / `修改文件（/tmp/a）` /
-> `执行命令（echo 3）` / `写入文件（/tmp/b）` / `执行命令（echo 4）`); the last segment
-> is "Thinking · <first-line preview>".
+- **Group header** `⌄ <processTitle>`: `⌄` is the text equivalent of dsh's
+  `IconChevronDown`; `processTitle` is composed from tool kinds in **descending
+  order of occurrence** (1 kind uses its done copy, 2 kinds `A并B`, 3 kinds joined
+  by `，`, >3 kinds take the top 3 plus `等`, no tool means `已完成分析`; thinking
+  does not count).
+- **Step row** `▸ <tool title> · <summary>`: one row per step, unnumbered; the title
+  comes from dsh `tool.title.*` and the summary from dsh `deriveSummary` (e.g.
+  `description` outranks `command`).
+- **Thinking row** `✦ 思考 · <first line>`: `compact` emits just `✦ 思考`, `verbose`
+  emits the full text.
+- **Closing row** `▸ 已完成` (or `▸ 已完成，用时 <n>秒` / `▸ 处理失败` / `▸ 已停止`):
+  one per turn, separate from the process group. `turn_start` no longer emits a
+  `🚀 第 N 轮` row, and a terminal `status` no longer emits `✅ 完成` / `❌ 失败` /
+  `⚠️ 已取消` rows — the closing row carries that information.
 
-All four tiers (`compact` / `standard` / `detailed` / `verbose`) send this one box;
-only the **in-box density** differs: `compact` is the header plus a "思考" label only
-(no step line), `standard` uses dsh activity descriptions, `detailed` adds step
-arguments + `↳ first result line`, and `verbose` leaves arguments / results and the
-full thinking text untruncated. A turn with **neither a tool step nor thinking sends
-no box** (never an empty box); thinking with no tool sends a box containing only the
-thinking line. The group header carries **no turn number** — the independent
-`🚀 第 N 轮` marker already sits above it.
+All four tiers (`compact` / `standard` / `detailed` / `verbose`) use this one process
+group; only the **in-group density** differs: `compact` is the header + `✦ 思考`
+(no step row, no preview); `standard` adds step rows + a first-line thinking preview;
+`detailed` adds the result body (first line, indented 2 spaces); `verbose` has **no
+group header**, with step-row summaries untruncated and the full thinking / result
+text (continuation lines indented 2 spaces). A turn with **neither a tool step nor
+thinking sends no group**; thinking with no tool sends a group containing only the
+thinking row (`compact`: `⌄ 已完成分析` + `✦ 思考`). The group header carries **no
+turn number**.
 
-Long text exceeding the gateway's per-message limit is split at code-block
-boundaries; continuation chunks are joined with a `⏩ 续` marker, so code blocks
-never break across chunks (the fence stays closed).
+Long text exceeding the gateway's per-message limit is split at **plain-text newline
+boundaries**; continuation chunks are joined with a `⏩ 续` marker (plain-text chunking, so
+nothing can break across chunks).
+
+### Result delivery (plain markdown, untruncated)
+
+When the task finishes, this plugin actively delivers the final result to the
+messaging surface as plain markdown: a
+`📬 **dsh 任务完成，结果如下**（用时 …）` header line + a blank line + the **full result
+body** (untruncated; its own markdown renders as usual; as of v0.7.0 the body is **plain
+text throughout**). Long bodies (>8000) are split at newline boundaries
+with `⏩ 续` between chunks; with no text output the message is just the header.
+
+```text
+📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
+
+<full result body>
+```
 
 ### An explicit `context_id` is streamed live too (v0.5.1)
 
@@ -88,53 +108,15 @@ log reads `tool a2a_call completed (…s, … chars)`. See
 [CONFIGURATION.en.md](CONFIGURATION.en.md), "Troubleshooting: why does a
 conversation show no live messages?".
 
-### Code blocks
-
-Operation content — tool commands, execution results, and final text — is
-automatically rendered as code blocks; **the body of the "📬 result delivery"
-message is boxed the same way** (since v0.5.3, matching the process boxes):
-
-- **Feishu**: fenced content triggers post rich text; code blocks are scrollable;
-- **QQ / other mainstream gateways**: markdown code blocks render as code blocks;
-- **plain-text platforms**: automatically degraded to plain text (no garbling);
-- **no language tag on fences**: Feishu shows the fence info string as the code
-  block's language name in the top-left corner, so the info string is left empty
-  (no meaningless "text" label), matching the operation-output boxes.
-
-Shape of the result-delivery message (header **before** the box, body in a
-**bare** fence, body **never truncated**):
-
-````text
-📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
-
-```
-<full result body>
-```
-````
-
-Sample code-block content (an `ls -la` output block):
-
-```text
-total 4
-drwxrwxrwt  2 root root 40 Sep 11 14:00 .
-drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
--rw-r--r--  1 root root  0 Sep 11 14:00 demo.txt
-```
-
-> Actual rendering depends on each gateway's client.
+### Live tiers and switches
 
 Progress display and intermediate-event push are both configurable
-(`collector.live_detail` for the **progress-display tier** — four tiers `compact` /
+(`collector.live_detail` for the **process-group tier** — four tiers `compact` /
 `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
-default `follow-dsh` to follow dsh's current tier; all four use **one code-box group
-per turn**, whose first line is the group header `工作步骤 · N 步 · <类别串>`, differing
-only in in-box density: `compact` header + "思考" label, `standard` dsh activity
-descriptions, `detailed` arguments + `↳ first result line`, `verbose` arguments /
-results and full thinking text untruncated; `collector.events` for the event stream —
-off is quiet mode, pushing the final result only, and it **outranks the tier**;
-code-block rendering stays as the internal style for a tier (**result delivery
-uses the same box shape**) and is no longer a standalone switch), and can be
-toggled or selected from the "A2A live switches" panel
+default `follow-dsh` to follow dsh's current tier; `collector.events` for the event
+stream — off is quiet mode, pushing the final result only, and it **outranks the
+tier**; the dsh line form itself is fixed and is no longer a standalone switch).
+Both can be toggled or selected from the "A2A live switches" panel
 on the Dashboard "Plugins" page (instant effect) — see
 [CONFIGURATION.en.md](CONFIGURATION.en.md).
 
@@ -151,7 +133,7 @@ hard-bound; combine them as needed:
 | --- | --- |
 | dsh-a2a-server only | A standard A2A interface callable by any A2A client |
 | This plugin only | Not applicable — it relies on dsh-a2a-server as its server |
-| Both together | Full experience: task submission + live progress (🔧 / 📖 / ✅) + session continuity (one conversation ↔ one dsh session) + single execution |
+| Both together | Full experience: task submission + live progress (dsh line-form process group + closing row) + session continuity (one conversation ↔ one dsh session) + single execution |
 
 ## Installation
 

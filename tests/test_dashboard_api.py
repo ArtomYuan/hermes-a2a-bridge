@@ -243,6 +243,14 @@ class DashboardApiTest(unittest.TestCase):
                     {"live_detail": value},
                 )
 
+    def test_live_detail_domain_matches_consumer_modes(self):
+        # 面板值域 = follow-dsh + consumer 的四档；渲染改革 v0.7.0 未改档位枚举，
+        # 此处把两侧绑成显式契约（consumer 增删档位时面板校验必须同步）。
+        self.assertEqual(
+            set(self.api._LIVE_DETAIL_VALUES),
+            {"follow-dsh"} | set(_REAL_CONSUMER.LIVE_DETAIL_MODES),
+        )
+
     def test_validate_rejects_illegal_live_detail(self):
         for bad in ("banana", "normal", "expanded", "", 1, None, True):
             with self.subTest(bad=bad):

@@ -1,13 +1,14 @@
-"""hermes-a2a-bridge「直播静默」修复真实流回归测试（纯 stdlib unittest）.
+"""hermes-a2a-bridge 真实流回归测试（v0.7.0 dsh 行形态，纯 stdlib unittest）.
 
 运行方式
 --------
     python3 tests/test_real_stream.py
 
 用 ``tests/fixtures/real-stream-2026-10-08.jsonl`` 驱动 ``consume_stream``
-（``level="standard"``、桩 sender、``min_interval=0``），验证「代码框组」形态在一轮
-2 步工具调用流下：``events_seen == 10``、收口恰好 1 个框（含 ``工作步骤 · 2 步`` 与 2 条
-逐步行）、全流程消息数 == 4（``🚀 第 1 轮`` + 框 + 最终文本 + ``✅ 完成``）。
+（桩 sender、``min_interval=0``），验证一轮 2 步工具调用流在 v0.7.0 基线下的形态：
+``events_seen == 10``、收口恰好 1 条过程组（组头 ``⌄ 执行了命令`` + 2 条未编号步骤行，
+**无代码框**）、收束行（``▸ 已完成，用时 …``，turn_end 优先、终态 status 兜底）、
+最终文本原样 markdown（无 ``📖`` 前缀）——standard 档全流程 3 条消息。
 
 fixture 来源：真机沙箱录得的原始帧 ``bridge-silence-1008/REAL-STREAM.jsonl`` 的前
 10 帧（turn 1，即「task(submitted) → statusUpdate(working) → turn_start →
@@ -39,6 +40,16 @@ _FIXTURE_PATH = os.path.join(
 _spec = importlib.util.spec_from_file_location("hermes_a2a_bridge_consumer", _CONSUMER_PATH)
 consumer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(consumer)
+
+# standard 档过程组：两个 bash 工具步（真实帧参数带 description，dsh 键序 description
+# 优先于 command）→ 组头「执行了命令」+ 两条未编号步骤行。
+_STANDARD_GROUP = "\n".join(
+    [
+        "⌄ 执行了命令",
+        "▸ 运行命令 · List current directory contents",
+        "▸ 运行命令 · Read first 6 lines of os-release",
+    ]
+)
 
 
 def _load_fixture_results(path):
@@ -90,30 +101,50 @@ class RealStreamRegressionTest(unittest.TestCase):
         # 最终文本完整记录（供上层「📬 结果送达」使用），非空。
         self.assertTrue(stats["final_text"])
         self.assertIn("只读", stats["final_text"])
-        # 收口恰好 1 个框：以裸 ``` 围栏起始的消息恰一条。
-        boxes = [m for m in sent if m.startswith("```")]
-        self.assertEqual(len(boxes), 1)
-        box = boxes[0]
-        self.assertIn("工作步骤 · 2 步", box)
-        # 2 条逐步行（standard 档 = 工具名 + dsh 活动描述；真实帧两工具均为 bash，
-        # 参数带 description 且 dsh 键序 description 先于 command）。
-        self.assertIn("1. bash · 执行命令（List current directory contents）", box)
-        self.assertIn("2. bash · 执行命令（Read first 6 lines of os-release）", box)
-        # 全流程消息数 == 4：🚀 第 1 轮 + 框 + 最终文本 + ✅ 完成。
-        self.assertEqual(len(sent), 4)
-        self.assertEqual(sent[0], "🚀 第 1 轮")
-        self.assertEqual(sent[1], box)
-        # 最终文本消息（真实 Result 为多行长文本 → 以代码框输出，前缀固定）。
-        self.assertTrue(sent[2].startswith("📖 输出完成"))
-        self.assertEqual(sent[3], "✅ 完成")
-        # 框内不泄露工具输出正文（standard 档无结果行）。
-        self.assertNotIn("PRETTY_NAME", box)
-        self.assertNotIn("drwxrwxr-x", box)
+        # 全流程 3 条消息：过程组 + 收束行 + 最终文本。
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0], _STANDARD_GROUP)
+        # 收束行由 turn_end 产出（一轮一条），带时长。
+        self.assertRegex(sent[1], r"^▸ 已完成，用时 \d+秒$")
+        # 最终文本原样 markdown（无 📖 前缀、不截断、内容完整）。
+        self.assertEqual(sent[2], stats["final_text"])
+        self.assertNotIn("```", sent[0])
+        # standard 档无结果体：工具输出正文不泄露到过程组。
+        self.assertNotIn("PRETTY_NAME", sent[0])
+        self.assertNotIn("drwxrwxr-x", sent[0])
 
-    def test_messages_sent_is_4(self):
+    def test_messages_sent_is_3(self):
         stats, sent = self._run("standard")
-        self.assertEqual(stats["messages_sent"], 4)
-        self.assertEqual(len(sent), 4)
+        self.assertEqual(stats["messages_sent"], 3)
+        self.assertEqual(len(sent), 3)
+
+    def test_detailed_group_carries_result_bodies(self):
+        stats, sent = self._run("detailed")
+        group = sent[0].splitlines()
+        self.assertEqual(group[0], "⌄ 执行了命令")
+        self.assertEqual(group[1], "▸ 运行命令 · List current directory contents")
+        self.assertEqual(group[2], "  total 8")  # 结果体：缩进 2 空格，detailed 只出首行
+        self.assertEqual(group[3], "▸ 运行命令 · Read first 6 lines of os-release")
+        self.assertEqual(group[4], '  PRETTY_NAME="Ubuntu 26.04 LTS"')
+        self.assertEqual(stats["messages_sent"], 3)
+
+    def test_verbose_group_has_no_header_and_full_results(self):
+        stats, sent = self._run("verbose")
+        group = sent[0].splitlines()
+        # verbose 不出组头行。
+        self.assertEqual(group[0], "▸ 运行命令 · List current directory contents")
+        self.assertIn("  drwxrwxr-x 2 artom artom 4096 Oct  8 19:06 .", group)
+        self.assertIn('  NAME="Ubuntu"', group)
+        self.assertEqual(stats["messages_sent"], 3)
+
+    def test_compact_tool_only_group_keeps_header(self):
+        # compact 折叠成员行，但组头行照发（工具仍计入类别串）——组不可丢。
+        stats, sent = self._run("compact")
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0], "⌄ 执行了命令")
+        self.assertRegex(sent[1], r"^▸ 已完成，用时 \d+秒$")
+        self.assertEqual(sent[2], stats["final_text"])
+        self.assertEqual(stats["messages_sent"], 3)
 
 
 if __name__ == "__main__":

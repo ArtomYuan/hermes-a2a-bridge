@@ -11,8 +11,11 @@
 - ``get_config`` 抛错：回退传入 default，不阻断。
 
 以及两个读取点（``_on_pre_tool_call`` 的 enabled 判断、``_stream_dsh_call`` 的
-events / content）确实走热读；register() 写全局的既有行为不回归；残留旧键
+events / level）确实走热读；register() 写全局的既有行为不回归；残留旧键
 ``collector.code_blocks`` 被忽略（content 取默认 true，不报错）。
+
+v0.7.0：``make_sender`` 签名去掉 ``code_blocks``（结果送达正文也不再包代码框），
+本文件的假 consumer 与生产签名同步。
 """
 
 import importlib.util
@@ -29,14 +32,6 @@ _MODULE_PATH = os.path.join(_WORKTREE, "__init__.py")
 _spec = importlib.util.spec_from_file_location("hermes_a2a_bridge", _MODULE_PATH)
 _MODULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_MODULE)
-
-# 结果送达的围栏形态由 consumer._fence 提供（生产同源）。加载真实 consumer，让
-# _FakeConsumer 暴露同一实现——断言测的是真实围栏，而非替身自造的围栏。
-_consumer_spec = importlib.util.spec_from_file_location(
-    "hermes_a2a_bridge_consumer_hot_read", os.path.join(_WORKTREE, "consumer.py")
-)
-_REAL_CONSUMER = importlib.util.module_from_spec(_consumer_spec)
-_consumer_spec.loader.exec_module(_REAL_CONSUMER)
 
 # 记录加载插件前就存在的相关模块（如有），便于测试尾部还原，避免污染其它用例。
 _PREEXISTING = {
@@ -92,12 +87,13 @@ class FakeCtx:
 
 
 class _FakeConsumer:
-    """假 consumer 模块：记录 make_sender / consume_stream 调用（test_override 同款）。"""
+    """假 consumer 模块：记录 make_sender / consume_stream 调用（test_override 同款）。
+
+    v0.7.0：``make_sender`` 只收 ``ctx``（``code_blocks`` 参数已删除），结果送达正文
+    是普通文本。
+    """
 
     _DEFAULT_TIMEOUT = 300
-
-    # 与真实 consumer 同源的围栏渲染（结果送达正文用它包框）。
-    _fence = staticmethod(_REAL_CONSUMER._fence)
 
     def __init__(self):
         self.consume_stream_calls = []
@@ -105,8 +101,8 @@ class _FakeConsumer:
         self.stats = {"final_text": "收到", "events_seen": 1, "messages_sent": 1,
                       "states": ["completed"]}
 
-    def make_sender(self, ctx, code_blocks=True):
-        self.make_sender_calls.append((ctx, code_blocks))
+    def make_sender(self, ctx):
+        self.make_sender_calls.append((ctx,))
         return lambda p, c, t, text: {"ok": True}
 
     def consume_stream(self, **kw):
@@ -223,17 +219,18 @@ class HotReadTest(unittest.TestCase):
         call = consumer.consume_stream_calls[0]
         self.assertEqual(call["level"], "standard")
         self.assertIs(call["events"], False)
-        # 直播 sender 与结果送达 sender 都固定 code_blocks=True（内部样式：
-        # 结果正文也是裸围栏代码框，需围栏感知分块）。
-        self.assertIs(consumer.make_sender_calls[0][1], True)
-        self.assertIs(consumer.make_sender_calls[1][1], True)
+        # 直播 sender 与结果送达 sender 都经 make_sender(ctx) 各构造一次（v0.7.0 无
+        # code_blocks 参数）。
+        self.assertEqual(len(consumer.make_sender_calls), 2)
+        self.assertIs(consumer.make_sender_calls[0][0], ctx)
+        self.assertIs(consumer.make_sender_calls[1][0], ctx)
         # 改配置 → 下一个任务拿新值。
         ctx.settings.update({"collector.events": True})
         _MODULE._stream_dsh_call("hi2", "feishu/oc_x")
         call = consumer.consume_stream_calls[1]
         self.assertEqual(call["level"], "detailed")
         self.assertIs(call["events"], True)
-        self.assertIs(consumer.make_sender_calls[2][1], True)
+        self.assertEqual(len(consumer.make_sender_calls), 4)
 
     # 7. 同一任务只各热读一次（任务中途改配置不影响进行中任务）。
     def test_stream_dsh_call_reads_each_switch_once_per_task(self):

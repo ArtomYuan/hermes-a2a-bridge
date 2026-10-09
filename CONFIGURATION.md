@@ -4,12 +4,13 @@
 > origin→contextId 注入保留；P2c 直播消费者改在 `pre_tool_call` hook 内对 dsh 目标
 > 只发**一条** `SendStreamingMessage`：hook 秒回「已受理」回执，任务在后台线程边消费
 > SSE 流边把中间进度推回飞书 / QQ（`collector.enabled` 门控，默认关），结束时把最终
-> 结果以**代码框**主动送达消息面——任务只跑一遍，「完成」之后不静默。
+> 结果以**普通 markdown**（`📬` 头行 + 结果原文）主动送达消息面——任务只跑一遍，
+> 「完成」之后不静默。
 > v0.4.0 起直播过程展示按**四档**裁剪（`collector.live_detail`，默认 `follow-dsh`
-> 跟随 dsh「工作步骤展示」；见「直播档位」）。v0.5.0 起四档统一改为**代码框组**——
-> 一轮内的工具步骤与**落定的思考预览折叠渲染进同一个代码框**、作为**一条消息的一个
-> 组**（组头 + 逐步行 + 思考段），不再有 v0.4.1 的心跳行 / 收口行（`standard`）与
-> 逐条工具行（`detailed` / `verbose`）；想要更细的**框内**密度请用更高档位。
+> 跟随 dsh「工作步骤展示」；见「直播档位」）。**v0.7.0 起直播过程与回复一律为
+> 纯文本行**，逐行复刻 dsh 客户端「工作步骤展示」的行形态（组头行 ⌄ /
+> 步骤行 ▸ / 思考行 ✦ / 结果体缩进 / 收束行 ▸），工具与思考事件不再逐条成行；想要
+> 更细的**组内**密度请用更高档位。
 > **v0.5.1 起显式 `context_id` 不再关闭直播**——`pre_tool_call` 一律按同一条件拦截
 > （`a2a_call` + `collector.enabled` + dsh 目标 + `message` 非空），origin 取调用方
 > 显式给出的 `context_id` **优先**、否则取当前消息面 origin；显式值**原样采用、不被
@@ -149,7 +150,7 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
   `_stream_dsh_call`（只发**一条** `SendStreamingMessage`，边消费 SSE 事件边把中间
   进度渲染推回飞书 / QQ；`collector.enabled` 门控、默认关），并当即以
   `{"action": "block", "message": 受理回执}` 阻止原 `a2a_call` 执行。任务结束时把
-  最终结果以**代码框**主动送达消息面（见「受理回执与结果送达」）。hook 回调秒回——
+  最终结果以**普通 markdown**主动送达消息面（见「受理回执与结果送达」）。hook 回调秒回——
   框架 hook 回调有 30 秒上限，同步等待长任务会触发超时 fail-closed 并连锁跳过其它
   工具调用，异步化即为此修复。
 - **非 dsh 目标**（如 `agent="ivan"`）：不 block，仅注入 origin，走原 `SendMessage`
@@ -166,37 +167,29 @@ handler），故弃用 override，改在 `pre_tool_call` hook 内做**单执行*
 走这条通道（同步回传在长任务下必然超时，见上方修复说明）。
 
 最终结果走独立通道：任务完成时 `_stream_dsh_call` 调 `_deliver_final_result`，把
-`📬 **dsh 任务完成，结果如下**（用时 …）` 头行 + 结果全文送达消息面。**v0.5.3 起
-结果正文以代码框渲染**（与直播过程框同形的**裸围栏**，`_format_result_message` 调
-`consumer._fence` 包框、`make_sender(code_blocks=True)` 做围栏感知分块）：
+`📬 **dsh 任务完成，结果如下**（用时 …）` 头行 + **结果原文**送达消息面。
+**v0.7.0 起正文是普通 markdown（纯文本，不包任何等宽块）**：
 
-````text
+```text
 📬 **dsh 任务完成，结果如下**（用时 1 分 30 秒）
 
+<结果原文：不截断；自带 markdown 照常渲染>
 ```
-<结果全文：不截断；内层三反引号被转义，保证外层围栏闭合>
-```
-````
 
-- **头行在框前**：与直播「`📖 输出完成` 行 + 框」的排布一致；状态 / 耗时是元信息，
-  不进等宽框。
-- **正文不截断**：只剥尾部换行；超长（>8000）沿用既有分块逻辑
-  （`_split_fenced_chunks`），分块间以 `⏩ 续` 衔接且**围栏保持闭合**。
-- **无文本输出时不发空框**：仍只有头行（`…——本次无文本输出。`）。
-- **超长时的分块形状**：`_split_fenced_chunks` 在进入围栏前会先把已累积的普通行
-  flush 成一块，故**头行会单独成为第一条消息**（不含 `⏩ 续`），随后各块都是首尾
-  成对围栏的框分段——这是既有分块逻辑（直播超长 final 同理），内容不丢。
+- **头行 + 空行 + 结果原文**：`_format_result_message` 拼 `{head}\n\n{final_text.rstrip()}`；
+  状态 / 耗时是元信息，放在头行里。
+- **正文不截断**：只剥尾部换行；超长（>8000）走**纯文本换行边界分块**
+  （`_split_plain_chunks`），分块间以 `⏩ 续` 衔接。
+- **无文本输出时不发空正文**：仍只有头行（`…——本次无文本输出。`）。
 - **送达时机、内容完整性、redact 流程不变**：仍是「任务完成即送」、失败重试一次后
   仅记 warning——「完成」之后不静默。
 
 ### 结果送达的样式开关？（结论：不加）
 
-`code_blocks` 自 v0.3.0 起就是**内部样式参数**、不由配置控制；v0.5.0 / v0.5.2 两次
-形态变更（代码框组、裸围栏）也未新增配置键。本次同理：**不新增 `collector.*` 键**，
-避免为一个渲染形态再引入热读开关、Dashboard 第四开关与写回校验面。宿主若要回退成
-v0.5.2 的纯文本结果消息，改一行即可：`_deliver_final_result` 的
-`make_sender(_CTX, code_blocks=True)` 改回 `code_blocks=False`，并让
-`_format_result_message` 直接返回 `final_text`（不调 `_box_result_body`）。
+配置键自 v0.3.0 起**不增不减**：`collector.enabled` / `events` / `content` /
+`live_detail` 与历史遗留别名 `collector.code_blocks`（**已废弃**，一律忽略）保持
+不变。v0.5.x / v0.7.0 多次形态变更都只改渲染，不新增 `collector.*` 键——避免为一个
+渲染形态再引入热读开关、Dashboard 第四开关与写回校验面。
 
 ### 排查：某会话为何没有直播消息？（v0.5.1）
 
@@ -276,177 +269,179 @@ plugins:
 > `normal` / `expanded` 一律读作 `detailed`。dsh 档位只影响其**客户端渲染**（事件流
 > 本身始终全量），桥按同一命名近似裁剪自己的直播行。
 
-四档 → 渲染形态（v0.5.0 起统一为**代码框组**，密度沿用各档既有定义；工具 / 思考
-事件在广播路径上不再单独成行，见下文「代码框组渲染」）：
+四档 → 渲染形态（v0.7.0 起统一为 **dsh 行形态**（纯文本行）；工具 / 思考事件在广播
+路径上不单独成行，见下文「dsh 行渲染」）：
 
 | 事件 | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
-| `turn_start` | 🚀 轮次标记 | 同左 | 同左 | 同左 |
-| `tool_call` | **进框缓冲**（不逐条；框内不出逐步行） | **进框缓冲**（不逐条；框内逐步行取「工具名 · dsh 活动描述」） | **进框缓冲**（不逐条；框内逐步行取「工具名 · 参数」并附结果行） | 同 `detailed`（参数 / 结果**不截断**） |
-| `tool_result` | **进框缓冲**（不逐条） | **进框缓冲**（dsh 活动描述） | **进框缓冲**（结果行 `↳ 结果首行`） | **进框缓冲**（结果行完整） |
-| `thinking` | **进同一框**（仅标签「思考」，无预览） | **进同一框**（`思考 · 首行预览`） | **进同一框**（`思考 · 首行预览`） | **进同一框**（`思考 · 预览 + 全文`） |
-| `text`（叙述 / 最终） | 发 | 发 | 发（非 final 截断 ≤120） | 发（非 final **不截断**） |
-| `status` 终态 / 错误 | **必发** | **必发** | **必发** | **必发** |
+| `turn_start` | **不产出**（无「第 N 轮」行） | 同左 | 同左 | 同左 |
+| `tool_call` / `tool_result` | **进组缓冲**（不逐条；组内不出步骤行） | **进组缓冲**；步骤行 `▸ <工具标题> · <摘要>` | = `standard`，另出结果体（缩进 2 空格） | **不出组头**；步骤行摘要不截断，另出结果全文 |
+| `thinking` | **进同一组**（仅 `✦ 思考`，无预览） | `✦ 思考 · <首行预览>` | 同 `standard` | `✦ 思考 · <全文>`（续行缩进 2 空格） |
+| `text`（叙述 / 最终） | 发（非 final 截断 ≤120） | 发（非 final 截断 ≤120） | 发（非 final 截断 ≤120） | 发（**不截断**） |
+| `status` 终态 / 错误 | **必发**（收束行） | **必发** | **必发** | **必发** |
 
-- **恒定不变（任何档位都不吞）**：任务终态（✅ / ❌ / ⚠️）、错误信息、
-  `final_text` 送达与 stats 完整性（`events_seen` / `states` 等）。
+- **恒定不变（任何档位都不吞）**：任务终态（收束行 `▸ 已完成` / `▸ 处理失败` /
+  `▸ 已停止`）、错误信息、`final_text` 送达与 stats 完整性（`events_seen` / `states` 等）。
 - **正交开关**：`collector.events: false`（安静模式）仍**优先于档位**——安静模式只推
   最终结果，与档位选择无关。
 - **兼容性锚点（密度，而非逐字）**：四档在**内容密度**上的既有定义不变——`detailed`
-  仍对应旧 `content: true` 的信息量（参数 / 结果全量进框）、`compact` 仍比旧
-  `content: false` 更严。但 **v0.5.0 改变了渲染形态**：四档统一为「每轮一个代码框
-  组」，故 `detailed` / `verbose` **不再**逐条发消息、**不再**与 v0.3.3 的
-  `content: true` 逐字节等价；差异只在**框内密度**，想要更细用更高档位。
-- **`standard` 档逐步行 = dsh 活动描述**（v0.6.0 起逐字对齐 dsh，不再由桥侧启发式
-  规则表生成）：`<dsh 活动短语>（<dsh 参数细节>）`，如 `执行命令（df -h）`、
-  `读取文件（config.yaml）`、`搜索代码（TODO）`。短语取自 dsh
-  `message.stepProcess.<kind>` 的 zh 词干，工具名 → 种类的映射沿用下方「活动种类
-  词表」（dsh `activity()` 原表）；短语与参数细节的完整算法见「步骤行活动描述
-  （v0.6.0）」。旧的桥侧启发式摘要规则表（固定短语匹配 + 命令首行截断兜底）**已整体
-  删除**，逐步行不再依赖命令原文。
+  仍对应旧 `content: true` 的信息量（步骤行 + 结果体 + 思考预览）、`compact` 仍比旧
+  `content: false` 更严。但 **v0.7.0 改变了渲染形态**：四档统一为「一条消息 = 一个
+  dsh 行形态过程组」，故 `detailed` / `verbose` **不再**逐条发消息、**不再**与 v0.3.3
+  的 `content: true` 逐字节等价；差异只在**组内密度**，想要更细用更高档位。
+- **步骤行 = dsh 工具行**（v0.7.0 起逐字对齐 dsh，不再由桥侧启发式规则表生成）：
+  `▸ <工具标题> · <摘要>`，标题取 dsh `tool.title.*`、摘要取 dsh `deriveSummary`
+  （见下文「dsh 工具行标题与摘要」）。旧桥侧启发式摘要规则表与 v0.6.0 的
+  `describe_tool_call`「活动短语（参数细节）」口径**均已整体删除**。
 - **生效时机**：与 `events` 同级——每个流式任务开始时热读一次（`follow-dsh` 同时解析
   dsh 文件）；任务中途改配置不影响进行中的任务，改后下一次任务即时生效（无需重启
   网关）。
 
-### 代码框组渲染（v0.5.0）
+### dsh 行渲染（v0.7.0）
 
-四档在**渲染形态**上统一（v0.5.0 起）：一轮内的工具步骤与思考**折叠渲染进一个
-代码框**，作为**一条消息的一个组**；密度沿用各档既有定义。飞书 / QQ 对长代码块
-提供折叠 / 展开，故「框」即「组」的可折叠载体，框内第一行是组头——用户折叠时也
-可见。
+v0.7.0 起直播过程与回复**一律为纯文本行**，逐行复刻 dsh 客户端「工作
+步骤展示」的行形态（图标以 Unicode 几何字符等效）。**一条消息 = 一个过程组**：
+
+```text
+组头行：  ⌄ <processTitle>            （dsh IconChevronDown 文本等效；verbose 档不出组头）
+步骤行：  ▸ <工具标题> · <摘要>        （dsh ToolRow：tool.title.* + deriveSummary）
+结果体：    <结果行，缩进 2 空格>       （detailed / verbose；挂在对应步骤行之后）
+思考行：  ✦ 思考 · <首行>              （compact 只出 ✦ 思考；verbose 续行缩进 2 空格）
+收束行：  ▸ 已完成 / ▸ 已完成，用时 <n>秒 / ▸ 处理失败 / ▸ 已停止   （独立一条消息，一轮一条）
+```
+
+- **组头行**：`⌄ <processTitle>`，`processTitle` 逐字对齐 dsh `processTitle`（见
+  「组头类别串算法」）。
+- **步骤行**：一行一步，**无编号、无分隔线**；标题 = dsh `tool.title.*`，摘要 =
+  dsh `deriveSummary`。非 `verbose` 档摘要按 **160 字符**截断补 `…`。
+- **结果体**：`detailed` 取结果首行（截断 160）缩进 2 空格挂在步骤行后；`verbose`
+  全文逐行缩进 2 空格。dsh 的结果只在工具行展开后出现，而聊天流无法折叠，故以缩进体
+  等效。
+- **思考行**：`compact` 只出 `✦ 思考`；`standard` / `detailed` 出首行预览（去 `**`、
+  截断 160）；`verbose` 出全文，续行缩进 2 空格。
+- **`turn_start` 不再有 `🚀 第 N 轮` 行**；轮次边界由收束行体现。
+- **`status` 终态不再有 `✅ 完成` / `❌ 失败` / `⚠️ 已取消` 行**——信息由收束行承载。
+- **收束行**（`render_turn_close`，一轮一条）：`▸ 已完成` / `▸ 已完成，用时 <n>秒` /
+  `▸ 处理失败` / `▸ 已停止`（dsh `TurnProcessNodeView` 文案）；时长下限 1 秒，文案对齐
+  dsh `formatRunDuration`（`12秒` / `1分5秒` / `1小时2分3秒`）。
+- **叙述 / final 文本 = 原样 markdown**（**无 `📖` 前缀**）；`verbose` 不截断，
+  其余档非 final 截断 120。
 
 #### 四档密度
 
-| 档位 | 组头 | 逐步行 | 结果行 | 思考段 | 空框处理 |
-| --- | --- | --- | --- | --- | --- |
-| `compact` | ✅（步数 + 类别串） | ❌ | ❌ | ✅ 仅标签「思考」 | 只有组头也无妨（**不发空框**：无工具且无思考才不发） |
-| `standard` | ✅ | ✅ `工具名 · dsh 活动描述` | ❌ | ✅ `思考 · 首行预览` | — |
-| `detailed` | ✅ | ✅ `工具名 · 参数（截断）` | ✅ `↳ 结果首行（截断）` | ✅ `思考 · 首行预览` | — |
-| `verbose` | ✅ | ✅ `工具名 · 完整参数` | ✅ `↳ 完整结果` | ✅ `思考 · 预览 + 全文` | — |
-
-#### 框内排版（冻结）
-
-```text
-第 1 行：组头   = 工作步骤 · <N> 步 · <类别串>      （N = 该轮工具步数；类别串用 dsh 逐字算法）
-围栏：          三个反引号、信息位留空（无语言标记，飞书语言位不显示标签）
-分隔线：        ──────────────────────────────  （固定 30 个 ─，仅当有逐步行时出现）
-逐步行：        <i>. <工具名> · <该档密度的参数 / 活动描述>
-结果行（detailed/verbose）：   ↳ <该档密度的结果>（缩进 3 空格）
-末段（有思考时）：思考 · <预览或全文>          （compact 仅「思考」，无预览）
-分隔线：        仅出现在「逐步行之后、思考之前」
-```
-
-- 组头行**不带轮次号**——其上方已有独立的 `🚀 第 N 轮` 标记，避免重复。
-- 类别串由该轮**工具步**的类别按 dsh `processTitle` 逐字算法合成；`thinking` 不进
-  入类别串（其存在由末段「思考」体现）。
-- 整轮只有思考、无工具步时**不出现组头**（`N = 0` 的组头无意义），框内只有末段
-  思考行。
-- 多行参数 / 结果在框内压成单行；`verbose` 的完整结果与思考全文按原样多行缩进。
-- 框**不带语言标记**（裸三个反引号围栏）：飞书代码块会把围栏信息位当语言名显示在
-  左上角，`text` 会露出无意义的「text」标签；不指定语言时客户端不显示语言名，且
-  与操作输出框（`📖` 走 `_fence` 的默认无语言围栏）形态一致。围栏信息位在飞书侧
-  是「编程语言解析」位，不承载自由文案（故不用「工作步骤」等自定义词）。
+| 档位 | 组头 | 步骤行 | 结果体 | 思考行 |
+| --- | --- | --- | --- | --- |
+| `compact` | ✅ | ❌ | ❌ | ✅ 仅 `✦ 思考` |
+| `standard` | ✅ | ✅ 摘要截断 160 | ❌ | ✅ 首行预览 |
+| `detailed` | ✅ | ✅ 摘要截断 160 | ✅ 首行（截断 160，缩进 2 空格） | ✅ 首行预览 |
+| `verbose` | ❌ 无组头 | ✅ 摘要不截断 | ✅ 全文（逐行缩进 2 空格） | ✅ 全文（续行缩进 2 空格） |
 
 #### 四档示例渲染
 
-> 示意同一段会话的一轮：`第 1 轮 = 思考 + bash + read + grep + bash + edit + bash +
-> write + bash`（8 步）。框内文案保持中文原样，以便与实现一致。
+> 同一段会话的一轮：`bash{description=查看提交}` + `read{file_path=/tmp/a}` +
+> `grep{pattern=foo}` + `bash{command=echo 2}` + `edit{file_path=/tmp/a}` +
+> `bash{command=echo 3}` + `write{file_path=/tmp/b}` + `bash{command=echo 4}`（8 步）
+> + 一段两行思考。以下四段均为 `consumer.render_process_group(members, <档位>)` 的
+> **实际输出**（成员带 `result` 字段），非手写。
 
-**`compact`（简洁）—— 仅组头 + 思考标签（无预览）**
+**`compact`（简洁）—— 组头 + `✦ 思考`（无预览）**
 
-````text
+```text
+⌄ 执行了命令，已读取文件，已搜索代码等
+✦ 思考
 ```
-工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
-思考
+
+**`standard`（标准）—— 组头 + 每步「工具标题 · dsh 摘要」+ 思考首行**
+
+```text
+⌄ 执行了命令，已读取文件，已搜索代码等
+▸ 运行命令 · 查看提交
+▸ 读取 · /tmp/a
+▸ 搜索文件内容 · foo
+▸ 运行命令 · echo 2
+▸ 编辑 · /tmp/a
+▸ 运行命令 · echo 3
+▸ 写入 · /tmp/b
+▸ 运行命令 · echo 4
+✦ 思考 · 我先把目录结构列出来确认范围，再决定改哪几个文件。
 ```
-````
 
-**`standard`（标准）—— 组头 + 每步「工具名 · dsh 活动描述」**
+**`detailed`（详细）—— standard + 结果体（首行，缩进 2 空格）**
 
-> 下框由 `consumer.render_process_box(steps, thinking, "standard")` **实际渲染**
-> （逐步行 = `describe_tool_call` 输出），非手写；该轮步骤参数为
-> 1 `bash{"command":"git log --oneline -3","description":"查看提交"}`、
-> 2 `read{"path":"/tmp/a"}`、3 `grep{"query":"foo"}`、
-> 4/6/8 `bash{"command":"echo 2|echo 3|echo 4"}`、5 `edit{"path":"/tmp/a"}`、
-> 7 `write{"path":"/tmp/b"}`。
-
-````text
+```text
+⌄ 执行了命令，已读取文件，已搜索代码等
+▸ 运行命令 · 查看提交
+  abc1234 feat: demo
+▸ 读取 · /tmp/a
+  alpha
+▸ 搜索文件内容 · foo
+  /tmp/a:2:foo here
+▸ 运行命令 · echo 2
+  2
+▸ 编辑 · /tmp/a
+  updated /tmp/a
+▸ 运行命令 · echo 3
+  3
+▸ 写入 · /tmp/b
+  wrote /tmp/b (12 bytes)
+▸ 运行命令 · echo 4
+  4
+✦ 思考 · 我先把目录结构列出来确认范围，再决定改哪几个文件。
 ```
-工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
-──────────────────────────────
-1. bash · 执行命令（查看提交）
-2. read · 读取文件（/tmp/a）
-3. grep · 搜索代码（foo）
-4. bash · 执行命令（echo 2）
-5. edit · 修改文件（/tmp/a）
-6. bash · 执行命令（echo 3）
-7. write · 写入文件（/tmp/b）
-8. bash · 执行命令（echo 4）
-──────────────────────────────
-思考 · 我先把目录结构列出来确认范围…
+
+**`verbose`（完全展开）—— 无组头 + 摘要不截断 + 结果全文 + 思考全文**
+
+```text
+▸ 运行命令 · 查看提交
+  abc1234 feat: demo
+  9f8e7d6 fix: boot
+▸ 读取 · /tmp/a
+  alpha
+  beta
+  gamma
+▸ 搜索文件内容 · foo
+  /tmp/a:2:foo here
+▸ 运行命令 · echo 2
+  2
+▸ 编辑 · /tmp/a
+  updated /tmp/a
+▸ 运行命令 · echo 3
+  3
+▸ 写入 · /tmp/b
+  wrote /tmp/b (12 bytes)
+▸ 运行命令 · echo 4
+  4
+✦ 思考 · 我先把目录结构列出来确认范围，再决定改哪几个文件。
+  第二行是 verbose 才出现的续行。
 ```
-````
 
-**`detailed`（详细）—— 组头 + 每步「工具名 · 参数」+ 结果首行**
+收束行（独立一条消息，一轮一条，四档相同）：
 
-````text
+```text
+▸ 已完成，用时 12秒
 ```
-工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
-──────────────────────────────
-1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
-   ↳ a1b2c3 feat: 四档
-2. read · {"path": "/tmp/a"}
-   ↳ file contents…
-3. grep · {"query": "foo"}
-   ↳ 12 hits
-…
-8. bash · {"command": "echo 4"}
-   ↳ 4
-──────────────────────────────
-思考 · 我先把目录结构列出来确认范围…
-```
-````
 
-（参数与结果各截断至既有上限；多行参数压成单行。）
+#### 发组规则
 
-**`verbose`（完全展开）—— 组头 + 每步完整参数 + 完整结果**
-
-````text
-```
-工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
-──────────────────────────────
-1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
-   ↳ a1b2c3 feat: 四档
-      b2c3d4 fix: 截断
-2. read · {"path": "/tmp/a"}
-   ↳ <完整文件内容，多行按原样缩进>
-…
-──────────────────────────────
-思考 · 我先把目录结构列出来确认范围…
-      <后续段落按原样缩进（完全展开）>
-```
-````
-
-（`verbose` 如实反映「完全展开」：参数与结果不截断；叙述文本亦不截断，沿用旧口径。）
-
-#### 发框规则
-
-- **一轮 = 一个框 = 一条消息**（`turn_start` 到该轮收口之间累积的工具步与思考）。
+- **一轮 = 一个过程组 = 一条消息**（`turn_start` 到该轮收口之间累积的工具步与思考）。
 - **收口时机**（沿用既有触发集）：`turn_end`、终态 `status`、final `text`、新
-  `turn_start`（若上一轮框未发出则先发）。
-- **发空规则**：该轮**既无工具步也无思考** → **不发框**（避免空框——这是「某档在该
-  形式下为空」的处理）；**有工具步 → 必发**；**只有思考、无工具步 → 发一个只含
-  「思考…」行的框**。
-- **顺序**：框永远**先于**触发它的那条叙述 `text` / 终态行发出。
-- **消息体量**：框按既有分块机制（`_split_fenced_chunks`，limit 8000）切分，
-  **保持围栏闭合**（分块后每段仍是合法代码块）。
+  `turn_start`（若上一轮组未发出则先发）。
+- **发空规则**：该轮**既无工具步也无思考** → **不发组**；**有工具步 → 必发**；
+  **只有思考、无工具步 → 发只含思考行的组**（`compact` 时为 `⌄ 已完成分析` +
+  `✦ 思考`）。
+- **顺序**：过程组永远**先于**触发它的那条叙述 `text` / 收束行发出。
+- **收束行独立**：`▸ …` 由 `Throttler` 生成，一轮最多一条（`turn_end` 优先、终态
+  `status` 兜底），与过程组各为一条消息。
+- **消息体量**：正文按**纯文本换行边界分块**（`_split_plain_chunks`，limit 8000），
+  块间以 `⏩ 续` 衔接（纯文本分块）。
 
 `follow-dsh` 与优先级链（显式档 > `follow-dsh` > 遗留 `content` > 默认）不变。
 
 #### 组头类别串算法
 
-组头类别串**逐字对齐 dsh `processTitle`**：取该轮**工具步**类别的 Top-3，
-`thinking` 不参与（其存在由末段「思考」体现）。
+组头类别串**逐字对齐 dsh `processTitle`**：种类按**去重后的出现次数降序**排（稳定
+排序，次数相同时保留首次出现顺序），取该轮**工具步**类别的 Top-3；`thinking` 不参与
+（其存在由思考行体现）。
 
 | 组内类别数 | 组头类别串 | 对照例 |
 | --- | --- | --- |
@@ -454,10 +449,13 @@ plugins:
 | 2 类 | `{第一类}并{第二类}`；两段都以「已」开头时第二段去掉「已」 | `已读取文件并搜索代码`（`read` + `search`） |
 | 3 类 | 三段用 **`，`** 连接 | `已读取文件，已搜索代码，已写入文件`（`read` + `search` + `write`） |
 | >3 类 | 取 Top-3 类按 3 类规则连接后追加 **`等`**（**不带计数**） | `已读取文件，已搜索代码，已写入文件等`（上述三类 + `commands` 等） |
+| 空（无工具步） | `已完成分析` | 只有思考的组 |
 
 #### 活动种类词表
 
-工具名按 dsh `activity()` **原表**映射到活动种类（含前缀匹配；未知工具归 `tools`）：
+工具名按 dsh `activity()` **原表**映射到活动种类（含前缀匹配；未知工具归 `tools`）。
+本表（经 `tool_activity_kind`）**只用于组头类别串**；步骤行的标题 / 摘要改由 dsh
+`tool.title.*` / `deriveSummary` 生成（见下节）：
 
 | 工具名（含前缀匹配） | kind | 类别文案（中文） | dsh 英文文案 |
 | --- | --- | --- | --- |
@@ -479,66 +477,41 @@ plugins:
 **桥侧扩展**：`spawn_teammate` / `send_message` / `wait_agent` / `list_agents` /
 `interrupt_agent` / `team_task_*` → `subagents`（dsh 无这些工具，归属桥侧扩展）。
 
-类别文案与 dsh 的步骤过程完成态文案（`message.stepProcess.done.*`）一致；
-本表（经 `tool_activity_kind`）同时用于**组头类别串**与 `standard` 档逐步行的
-**活动短语**（见「步骤行活动描述（v0.6.0）」）；`detailed` / `verbose` 的框内参数 /
-结果用原文，不受本表影响。
+#### dsh 工具行标题与摘要
+
+- **标题**（`dsh_tool_title`）：dsh `TOOL_TITLE_KEYS` 的中文文案优先——`pwsh` 运行命令、
+  `read_image` 读取图片、`grep` 搜索文件内容、`glob` 查找文件、`web_search` 网页搜索、
+  `web_fetch` 网页获取、`todo_write` 更新任务清单、`ask_user_question` 提问、
+  `create_goal` / `get_goal` / `update_goal` 创建 / 查看 / 更新目标、`subagent`
+  创建子智能体、`list_agents` 查看子智能体、`send_message` 发送消息、
+  `interrupt_agent` 中断智能体、`spawn_teammate` 创建队友、`wait_agent` 等待子智能体，
+  以及团队任务 / 后台任务 / 工作流 / 符号查询等工具（逐字见 `_DSH_TOOL_TITLES`）；未
+  命中时取**变体标题**（`search` 搜索 / `read` 读取 / `bash` 运行命令 / `write` 写入 /
+  `edit` 编辑 / `code` 代码 / `others` 工具调用）。
+- **摘要**（`dsh_tool_summary`）：`search` 变体的 `queries` 数组 → `SUMMARY_KEYS` 键序
+  （`bash`: `description`→`command`；`read`: `path`→`file_path`→`url`；`search`:
+  `query`→`pattern`→`url`；`write` / `edit`: `path`→`file_path`；`code`:
+  `description`）首个非空字符串值 → 参数对象里首个非空字符串值 → 原始参数文本首行。
+  标题回落到 `工具调用` 时，dsh 会在摘要前补工具名（`[toolName, base].join(" · ")`），
+  即 `▸ 工具调用 · shell_exec · ls`（`shell_exec` 不在 dsh 标题表中）。
+- 多行摘要压成单行；非 `verbose` 截断 160 补 `…`。
 
 #### 与 dsh 的分组语义对应（设计取舍）
 
 - dsh 侧 `standard` 在 GUI 里把**整轮过程折叠成一行组头**，且该组头在运行中会**原地
   更新**显示当前步骤；桥是**只追加、不可更新**的聊天流，无法原地改写已发出的消息，
-  故以**「每轮一个代码框组」**等价实现：框内第一行是组头（折叠时也可见），框体承载
-  逐步行与思考段。**这是只追加聊天流的必然取舍，不是缺陷**——过程信息不丢。
-- **思考与工具步同框**：dsh 语义里推理**是组的成员**（`groupPart: "reasoning"`），
-  与工具步同组；故落定的思考预览**并入同一个框**（不另起一框），用户一次折叠即可
-  查看全部过程。**这是明确取舍**：思考因而与工具步处于同一透视位置，代价是只看
-  思考时也要展开一个框。
+  故以**「一条消息 = 一个 dsh 行形态过程组」**等价实现：第一行是组头，其后是步骤行 /
+  结果体 / 思考行。**这是只追加聊天流的必然取舍，不是缺陷**——过程信息不丢。
+- **思考与工具步同组**：dsh 语义里推理**是组的成员**（`groupPart: "reasoning"`），
+  与工具步同组；故思考行**并入同一个过程组**（不另起一条），用户一眼即可看全。
 
 #### 不变式
 
-- **终态与错误在任何档位都不受影响**：任务终态（✅ / ❌ / ⚠️）、错误信息、
-  `final_text` 送达与 stats（`events_seen` / `messages_sent` 等）**在任何档位都不变**。
-- **框缓冲在终态强制收口**：`turn_end` / 终态 `status` 时必定把未发出的框发出，
+- **终态与错误在任何档位都不受影响**：任务终态由收束行承载，错误信息、`final_text`
+  送达与 stats（`events_seen` / `messages_sent` 等）**在任何档位都不变**。
+- **组缓冲在终态强制收口**：`turn_end` / 终态 `status` 时必定把未发出的组发出，
   **绝不允许丢掉已发生的步骤信息**。
 - **`collector.events: false`（安静模式）优先于档位**（不变）。
-
-#### 步骤行活动描述（v0.6.0）
-
-`standard` 档逐步行 = `describe_tool_call(name, arguments)` 的输出，即
-`<dsh 活动短语>（<dsh 参数细节>）`。两部分都逐字对齐 dsh（`message.stepProcess.<kind>`
-词干 + `liveToolDetail`），不再由桥侧启发式规则表生成：
-
-- **活动短语**：由工具名经 `tool_activity_kind` 映射到活动种类（沿用上文「活动种类
-  词表」，即 dsh `activity()` 原表），再取该种类的 dsh zh 词干（剥离「正在 / 已 /
-  准备 / 了」体标记）：`读取文件` / `读取图片` / `写入文件` / `搜索代码` / `修改文件` /
-  `执行命令` / `运行代码` / `搜索网页` / `访问网页` / `协调子智能体` / `更新计划` /
-  `提问` / `调用工具`。（多数种类取进行体 `message.stepProcess.<kind>`；`commands` /
-  `edit` 取完成体 `done.*`——「执行了命令」→`执行命令`、「修改了文件」→`修改文件`；
-  `questions` 取准备体 `prepare.questions`——「准备提问」→`提问`。）
-- **参数细节**：按 dsh `LIVE_TOOL_DETAIL_KEYS` 的**键序**取第一个非空值：
-  `title` → `description` → `objective` → `task` → `task_name` → `name` → `question` →
-  `questions`（取列表中首个非空 `question`）→ `prompt` → `message` → `command` →
-  `cmd` → `queries` → `query` → `pattern` → `url` → `uri` → `file_path` → `path` →
-  `target` → `action` → `status`。全字符串数组用 `, ` 连接；空白折叠成单空格并去首尾；
-  超过 **160 字符**截断并补 `…`（截断前先 trimEnd）。
-- **回落链**：`arguments` 不是参数对象（纯字符串命令、JSON 解析失败、`None`）或
-  键序里全取不到非空值时，沿用 dsh `liveToolDetail` 的兜底——**回落到工具名本身**，
-  故纯字符串参数渲染为 `执行命令（bash）` 而不是裸短语。`name` 为空且无细节时返回
-  空串（调用方退化为 `工具调用` 占位行）。
-
-| 事件 | `standard` 逐步行（`describe_tool_call` 实测） |
-| --- | --- |
-| `bash` + `"ls -la"`（纯字符串，不是参数对象） | `bash · 执行命令（bash）` |
-| `bash` + `{}` / 参数缺失 | `bash · 执行命令（bash）` |
-| `bash` + `{"command": "df -h"}` | `bash · 执行命令（df -h）` |
-| `read` + `{"path": "/a/b.txt"}` | `read · 读取文件（/a/b.txt）` |
-| `grep` + `{"query": "TODO"}` | `grep · 搜索代码（TODO）` |
-| `bash` + `{"command": "ls -la", "description": "List current directory contents"}` | `bash · 执行命令（List current directory contents）`（`description` 优先于 `command`） |
-| `job_output` + `{"job_id": "abc123"}`（未知工具 → `tools`） | `job_output · 调用工具（job_output）` |
-
-仅影响 `standard` 档逐步行；`detailed` / `verbose` 仍显示原始参数（`{"path": …}`）
-与 `↳` 结果行，`compact` 仍无逐步行。
 
 ### follow-dsh 解析规则
 
@@ -565,16 +538,16 @@ plugins:
 | --- | --- |
 | `live_detail` 显式设为四档之一 | 该档位（不读 dsh 文件） |
 | `live_detail: follow-dsh` | 解析 dsh 文件；失败回落 `detailed` |
-| `live_detail` 未设置，`content` 已显式设置 | 沿用 `content` 映射（档位选择不变；`standard` 档行为见下方 v0.5.0 说明） |
+| `live_detail` 未设置，`content` 已显式设置 | 沿用 `content` 映射（档位选择不变；`standard` 档行为见下方说明） |
 | 两者都未设置 | `follow-dsh`（v0.4.0 新默认） |
 
 遗留 `collector.content`（布尔）**继续生效**：`true` → `detailed`、`false` → `standard`
-（**映射不变**）。**v0.5.0 起四档统一改为「每轮一个代码框组」**，故 `content: true`
-（→ `detailed`）、`content: false`（→ `standard`）与两者都未设置的部署升级后都会变成
-**框组**形态：不再有 v0.4.1 的心跳行 / 收口行（`standard`），也不再逐条发工具行
-（`detailed` / `verbose`）。差异只在**框内密度**——框内要参数 + 结果首行用
+（**映射不变**）。**v0.7.0 起四档统一为「一条消息 = 一个 dsh 行形态过程组」**，故
+`content: true`（→ `detailed`）、`content: false`（→ `standard`）与两者都未设置的
+部署升级后都会变成 **dsh 行形态**：不再有 v0.4.1 的心跳行 / 收口行（`standard`），
+也不再逐条发工具行（`detailed` / `verbose`）。差异只在**组内密度**——组内要结果体用
 `detailed`，要完全展开用 `verbose`。**注意**：dsh 当前生效档位是 `standard`，故
-「两者都未设置」的部署直播为 `standard` 密度的框。
+「两者都未设置」的部署直播为 `standard` 密度。
 
 - **stats 完整性不变**：档位不改变统计口径，`final_text` / `events_seen` / `states`
   始终完整（`_stream_dsh_call` 依赖 `final_text` 做结果送达）。
@@ -584,17 +557,13 @@ plugins:
     `{"action": "block", "message": "[dsh · context …] ⏳ 已受理——…"}`——它**只由
     `collector.enabled` 门控**，档位取任何值回执均逐字节相同，受理速度不变。
   - **② 完成时的最终结果送达**：任务完成后 `_deliver_final_result` 仍主动推
-    「📬 完成消息 + 结果全文」到同一消息面，**任何档位都不省略正文**；v0.5.3 起正文
-    以裸围栏代码框渲染（形态与档位无关，见「受理回执与结果送达」）。
+    「📬 头行 + 结果原文」到同一消息面，**任何档位都不省略正文**；v0.7.0 起正文是
+    普通 markdown（形态与档位无关，见「受理回执与结果送达」）。
 - **旧键忽略**：`collector.code_blocks` 自 v0.3.0 起废弃并**一律忽略**——不读取、
   不报错、不迁移、不当 fallback。语义已变（旧 `false` = 纯文本行，若当 fallback
   会静默把「内容」全关掉，属错误迁移）；配置文件里残留该键无副作用、无异常。
-- **代码框渲染保留为内部样式**：操作内容（工具命令 / 执行结果 / 长最终文本）仍以
-  围栏代码块渲染（围栏感知分块），不再单独暴露开关；v0.5.0 起**每轮过程本身即一个
-  代码框组**——四档都有这个框，差异只在框内密度（`compact` 仅组头 + 「思考」标签、
-  `standard` 逐步 dsh 活动描述、`detailed` 参数 + 结果首行、`verbose` 参数 / 结果与思考
-  全文不截断）。**v0.5.3 起「结果送达」的正文也进同一个裸围栏代码框**（头行在
-  框前），与过程框形态统一。
+- **渲染形态不新增开关**：v0.7.0 的 dsh 行形态是**固定形态**，不再由
+  配置控制；配置键保持不增不减（`enabled` / `events` / `content` / `live_detail`）。
 
 未配置且未设置遗留 `content` 时使用 `follow-dsh`（v0.4.0 起的新默认）。
 
@@ -603,11 +572,11 @@ plugins:
 完整键路径：`plugins.entries.hermes-a2a-bridge.settings.collector.events`。
 
 是否推送「中间事件」可用该键单独开关（默认 `true`）。它与 `collector.live_detail`
-正交：`live_detail` 控制**过程行的展示粒度**（四档），`events` 控制**推送范围**
+正交：`live_detail` 控制**过程组的展示粒度**（四档），`events` 控制**推送范围**
 （中间事件 + 最终结果都推，还是只推最终结果）。两键独立组合：`events: false` 时
-**安静模式优先于档位**——无论档位为何都只推最终结果；`live_detail: compact` 时框内
-无逐步行（仅组头 + 「思考」标签）而 `text` / 终态照常；`live_detail: standard` 时工具
-步骤收进**每轮一个代码框组**（见「代码框组渲染」）而 `text` / 终态照常；
+**安静模式优先于档位**——无论档位为何都只推最终结果；`live_detail: compact` 时组内
+无步骤行（仅组头 + `✦ 思考`）而 `text` / 收束行照常；`live_detail: standard` 时工具
+步骤收进**一条 dsh 行形态过程组**（见「dsh 行渲染」）而 `text` / 收束行照常；
 两者叠加时同样只推最终结果（其过程行按档位渲染），📬 送达不受影响。
 
 ```yaml
@@ -621,11 +590,10 @@ plugins:
           events: true            # 默认 true：中间事件 + 最终结果都推
 ```
 
-- `true`（默认）：现状——中间事件（每轮一个过程代码框组（含思考段）/ 📖 中间文本 /
-  状态行）与最终结果（📖 输出完成 / ✅ 完成卡）都推送。
-- `false`（安静模式）：只推最终结果（📖 输出完成 + 终态状态行），中间事件不推
-  （不刷屏）。完成卡样式固定代码框（内部渲染方式，不再可配置；安静模式优先于
-  档位，见「直播档位」节）；📬 结果送达同样以代码框送达、不受本开关影响。
+- `true`（默认）：现状——中间事件（每轮一条过程组 / 叙述文本 / 收束行）与最终结果
+  （📬 结果送达）都推送。
+- `false`（安静模式）：只推最终结果（final 文本原样 markdown + 收束行），中间事件不推
+  （不刷屏）；📬 结果送达不受本开关影响。
 
 未配置时保持 `true`，向后兼容已部署副本的现有行为。
 
@@ -669,51 +637,47 @@ a2a_call（pre_tool_call hook）
                         │
               normalize_events（task/statusUpdate/artifactUpdate → 统一事件）
                         │
-              render_line（T0 emoji 行语言）
+              render_line（叙述 / final 文本原样 markdown）
                         │
-              Throttler（每轮框缓冲：累积步骤明细与思考 / text 聚合 / 全局限速）
+              Throttler（每轮过程组缓冲：累积步骤与思考 / 收束行 / text 聚合 / 全局限速）
                         │
               redact_sensitive_text(force=True)
                         │
               ┌─ sender（collector.enabled 时真发送飞书/QQ；否则 noop）
               │
-              └─ stats.final_text → 结果消息（📬 头行 + 裸围栏代码框正文，围栏感知分块）─► 主动送达消息面
+              └─ stats.final_text → 结果消息（📬 头行 + 结果原文，纯文本换行边界分块）─► 主动送达消息面
                         （「完成」之后不静默；block 回执仅含「已受理」）
 ```
 
-### T0 行语言映射
+### 事件 → 渲染行映射
 
 | 事件 | 渲染行 |
 | --- | --- |
-| `turn_start`（无 turn） | `🚀 开始执行` |
-| `turn_start`（含 turn N） | `🚀 第 N 轮` |
-| `thinking` | `🧠 思考中…` |
-| `tool_call` | `🔧 调用工具 \`{name}\``（带参数时命令进代码框） |
-| `tool_result` | `📋 \`{name}\` 完成`（result 非空时输出正文进代码框；空 result 仅标记） |
-| `text`（非 final） | `📖 {文本截断 ≤120}`（聚合到终态才 flush；`verbose` 不截断） |
-| `text`（final，lastChunk） | `📖 输出完成`（最终结果不整段刷屏） |
-| `status` completed | `✅ 完成` |
-| `status` failed | `❌ 失败` |
-| `status` canceled | `⚠️ 已取消` |
-| `status` working / submitted | （不单独发） |
+| `turn_start` | （不产出；无「第 N 轮」行） |
+| `thinking` | 进组缓冲（`✦ 思考…`，由 `render_process_group` 承载） |
+| `tool_call` | 进组缓冲（`▸ <工具标题> · <摘要>`） |
+| `tool_result` | 进组缓冲（结果体，`detailed` / `verbose` 才输出） |
+| `text`（非 final） | 原样 markdown（聚合到终态才 flush；非 `verbose` 截断 ≤120） |
+| `text`（final，lastChunk） | 原样 markdown（**不截断**） |
+| `status` completed | 收束行 `▸ 已完成` / `▸ 已完成，用时 <n>秒` |
+| `status` failed | 收束行 `▸ 处理失败` |
+| `status` canceled | 收束行 `▸ 已停止` |
+| `status` working / submitted | （不产出） |
 
-> v0.5.0 起 `thinking` / `tool_call` / `tool_result` 在广播路径上**不再单独成行**：
-> 四档都把它们收进**每轮一个代码框组**（见下与「代码框组渲染」）。
-
-档位对上述行的影响见「直播档位」节的四档渲染表：v0.5.0 起 `tool_call` /
-`tool_result` / `thinking` 四档都**不逐条成行**，而是收进**每轮一个过程代码框组**
-（`compact` 框内无逐步行、仅组头 + 「思考」标签；`standard` 逐步 dsh 活动描述；
-`detailed` 参数 + `↳ 结果首行`；`verbose` 参数 / 结果与思考全文不截断）；框先于
-触发它的 `text` / 终态行发出。**终态行（✅ / ❌ / ⚠️）与错误在任何档位
-都必发**，框缓冲在终态强制收口、不丢步骤信息。
+> v0.7.0 起 `thinking` / `tool_call` / `tool_result` 在广播路径上**不单独成行**：
+> 四档都把它们收进**一条 dsh 行形态过程组**（见「dsh 行渲染」）；收束行由 `Throttler`
+> 生成（`turn_end` 优先、终态 `status` 兜底），一轮最多一条；`turn_start` 与终态
+> status 都**不再产出独立的 🚀 / ✅ / ❌ / ⚠️ 行**。档位只影响组内密度与叙述截断，
+> 过程组先于触发它的 `text` / 收束行发出，组缓冲在终态强制收口、不丢步骤信息。
 
 ### 节流与软上限
 
-- `turn_start` 与 status 终态逐条放行；**四档都把 `tool_call` / `tool_result` /
-  `thinking` 收进框缓冲**（累积该轮步骤明细与思考），在该轮收口时以**一个代码框组**
-  发出（见「代码框组渲染」）。
+- `turn_start` 不产出；**四档都把 `tool_call` / `tool_result` / `thinking` 收进组
+  缓冲**（累积该轮步骤明细与思考），在该轮收口时以**一条 dsh 行形态过程组**发出
+  （见「dsh 行渲染」）。
 - 低信号 `text`（非 final）只累积、不逐条发；在 `turn_end` 或 status 终态时 flush
-  为一条 `📖` 行。
+  为一条原样 markdown 文本。
+- 收束行一轮最多一条：`turn_end` 优先（带时长），终态 `status` 仅在未发时兜底。
 - 全局限速：相邻两次 send 至少间隔 `min_interval` 秒（默认 2.0）。
 - 软上限（单任务最多 30 条消息）本阶段不做（TODO P2c）。
 
@@ -725,14 +689,14 @@ a2a_call（pre_tool_call hook）
    `plugins.entries.hermes-a2a-bridge.settings`。
 3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察 ①agent
    立即（秒级）收到「已受理」回执、不再长阻塞；②对话收到
-   `🚀 第 N 轮` → **每轮一个过程代码框组**（组头 `工作步骤 · N 步 · <类别串>` + 逐步行 +
-   末段 `思考 · …`；框内密度随直播档位：`compact` 无逐步行、`standard` 逐步
-   dsh 活动描述、
-   `detailed` 参数 + 结果首行、`verbose` 不截断）→ `📖 输出完成` → `✅ 完成`
+   **一条 dsh 行形态过程组**（组头 `⌄ <类别串>` + 步骤行 `▸ <工具标题> · <摘要>` +
+   思考行 `✦ 思考 · …`；组内密度随直播档位：`compact` 无步骤行、`standard` 摘要截断
+   160、`detailed` 另出结果体、`verbose` 无组头且不截断），随后收到收束行
+   `▸ 已完成`（或 `▸ 已完成，用时 <n>秒`）
    （默认 `follow-dsh` 跟随 dsh 当前档位），且
    **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
-   ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行在框前 + 正文进
-   裸围栏代码框，正文不截断）。
+   ③任务结束时对话收到「📬 dsh 任务完成，结果如下」结果消息（头行 + 空行 +
+   **结果原文**，普通 markdown、不截断）。
    另（v0.5.1）：让调用**显式携带 `context_id`** 的 `a2a_call` 同样触发上述回执与
    直播，且消息落在该 `context_id` 对应的同一会话。
 4. redact 确认：进度文本中的 token 不落明文。
@@ -746,20 +710,20 @@ a2a_call（pre_tool_call hook）
    同步变化（条目顶层 `allow_tool_override` 与其它键不丢）。首次部署面板需先重启
    一次 dashboard 进程（后端路由与插件发现是一次性的）。
 7. 直播档位确认：把 `collector.live_detail` 依次设为 `compact` / `standard` /
-   `detailed` / `verbose`，确认四档渲染与「代码框组渲染」节一致（四档**每轮都发
-   一个代码框组**，无 v0.4.1 的心跳行 / 收口行；框内密度：`compact` 仅组头 +
-   「思考」标签、`standard` 逐步 dsh 活动描述、`detailed` 逐步参数 + `↳ 结果首行`、
-   `verbose` 参数 / 结果与思考全文不截断）；确认**无工具且无思考的轮次不发框**、
-   **只有思考、无工具时发只含思考行的框**、框**先于**触发它的 `text` / 终态行、
-   超长框分块后**围栏闭合**，且**任务终态与错误在任何档位都照常送达**、
-   「📬 dsh 任务完成，结果如下」不受影响；另确认框缓冲在 `turn_end` / 终态强制
+   `detailed` / `verbose`，确认四档渲染与「dsh 行渲染」节一致（四档**每轮都发一条
+   过程组**，无 v0.4.1 的心跳行 / 收口行；组内密度：`compact` 仅组头 + `✦ 思考`、
+   `standard` 步骤行 + 思考首行、`detailed` 另出结果体、`verbose` 无组头且摘要 /
+   结果 / 思考全文不截断）；确认**无工具且无思考的轮次不发组**、
+   **只有思考、无工具时发只含思考行的组**、过程组**先于**触发它的 `text` / 收束行、
+   且**任务终态（收束行）与错误在任何档位都照常送达**、
+   「📬 dsh 任务完成，结果如下」不受影响；另确认组缓冲在 `turn_end` / 终态强制
    收口、不丢步骤信息。设回
    `follow-dsh` 后，确认档位跟随 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
    中 `ui-chat` 条目的 `config.transcriptView`（旧值 `normal` / `expanded` 读作
    `detailed`）；再制造缺文件 / 坏 YAML / 无 `ui-chat` 条目 / 无该键 / 非法值之一，
    确认**回落 `detailed`**、只记一次日志且任务不阻塞。若保留了遗留
    `collector.content` 且未设 `live_detail`，确认沿用 `content` 映射（`true` →
-   `detailed`、`false` → `standard`；两者升级后都是框组形态）。配置文件里残留的
+   `detailed`、`false` → `standard`；两者升级后都是 dsh 行形态）。配置文件里残留的
    `collector.code_blocks` 键无副作用（被忽略，不报错）。
 
 ## 单元测试
@@ -767,25 +731,29 @@ a2a_call（pre_tool_call hook）
 ```bash
 python3 tests/test_origin_injection.py
 python3 tests/test_consumer.py
+python3 tests/test_group_push.py
 python3 tests/test_override.py
 python3 tests/test_hot_read.py
 python3 tests/test_dashboard_api.py
+python3 tests/test_real_stream.py
+python3 tests/test_silence_fix.py
 ```
 
 `test_origin_injection.py` 覆盖 origin→contextId 注入（纯静态，通过 `sys.modules`
 注入假的 `gateway.session_context`）。`test_consumer.py` 用与 dsh-a2a-server 真实格式
 一致的合成 SSE `data:` 串驱动 `parse_sse_lines` + `normalize_events` + `render_line`
-+ `Throttler` + `make_sender`（mock sender 记录发送列表），覆盖归一化事件种类与顺序、
-渲染行 emoji 前缀、text 聚合只在终态 flush、redact 调用、sender 两级
-回退（无 gateway → `no_gateway`）、异常事件不崩，直播档位四档**代码框组**渲染
-（每轮一个框、组头 `工作步骤 · N 步 · <类别串>`、分隔线、逐步行、`↳` 结果行、思考段；
-四档框内密度差异——`compact` 无逐步行 / `standard` 无结果行 / `detailed` 有结果行 /
-`verbose` 不截断；发框规则——无工具且无思考不发框、只有思考无工具发只含思考行的
-框；框先于 `text` / `turn_end` / 终态行；框缓冲在终态必收口；超长框分块后围栏闭合；
-活动种类映射与组头类别串合成（1 / 2 / 3 / >3 类）、`standard` 逐步行活动描述
-（活动短语表 / 参数细节键序 / 160 字符截断 / 工具名兜底））、遗留
++ `Throttler` + `render_process_group` + `render_turn_close` + `make_sender`（mock
+sender 记录发送列表），覆盖归一化事件种类与顺序、叙述文本原样 markdown（无 `📖` 前缀）、
+text 聚合只在终态 flush、redact 调用、sender 两级回退（无 gateway →
+`no_gateway`）、异常事件不崩，dsh 行渲染四档（组头 `⌄ <类别串>`、步骤行
+`▸ <工具标题> · <摘要>`、结果体缩进 2 空格、思考行 `✦ 思考`、`verbose` 无组头且不
+截断；四档密度差异；发组规则——无工具无思考不发组、只有思考发只含思考行的组；过程组
+先于 `text` / `turn_end` / 收束行；组缓冲在终态必收口；纯文本分块 `⏩ 续`；组头类别串
+合成（1 / 2 / 3 / >3 类与空序列）、dsh 工具行标题 / 摘要（`SUMMARY_KEYS` 键序、
+`queries` 数组、160 字符截断、`工具调用` 前缀回落）、收束行四态与时长文案）、遗留
 `content` 映射（`true` → `detailed` / `false` → `standard`）、**终态与错误在任何档位
-都不丢**，并输出「事件序列 → 渲染消息样例」对照表。
+都不丢**，并输出「事件序列 → 渲染消息样例」对照表；另对 v0.7.0 已删除的旧渲染 /
+分块 API 做防回归断言（不复活）。
 
 `test_override.py` 覆盖 `_on_pre_tool_call` 的单执行 hook 分支与 `_stream_dsh_call`：
 dsh 目标（collector 开 + origin 非空 + message 非空）异步 spawn + 受理回执回传、
@@ -793,9 +761,8 @@ spawn 失败回退注入 origin、**显式 `context_id` 同样拦截**（origin 
 非空且 dsh + collector 开时返回 block 并 spawn worker；消息面为空、origin 仅来自
 显式值时仍拦截）、非 dsh / collector 关 /
 a2a_orchestrate / 非消息面仅注入 origin，以及 `_stream_dsh_call` 格式化结果、
-结果送达（`_format_result_message` 三态 + **裸围栏代码框**（无语言标记、内层围栏
-转义、正文不截断）/ worker 吞异常 / 送达重试一次 / 长结果围栏感知分块后每块闭合）
-与缺 dsh 配置抛错。
+结果送达（`_format_result_message` 三态 + **头行 + 空行 + 结果原文**（普通 markdown、
+不截断）/ worker 吞异常 / 送达重试一次 / 长结果纯文本分块）与缺 dsh 配置抛错。
 
 `test_hot_read.py` 覆盖三开关热读改造：`_read_switch` 改 FakeCtx 配置后再次调用
 拿到新值、`_CTX=None` 回退模块级全局、读取抛错回退 default、字符串布尔归一化，
@@ -804,6 +771,14 @@ events / live_detail）确实随配置变化切换行为、同一任务每键只
 register() 写全局不回归、`follow-dsh` 解析及其**全部回落分支**（缺文件 / 坏 YAML /
 无 `ui-chat` 条目 / 无 `transcriptView` 键 / 非法值 → `detailed`；旧值
 `normal` / `expanded` 归一为 `detailed`）、残留旧键 `collector.code_blocks` 被忽略。
+
+`test_group_push.py` 覆盖 dsh 行渲染的冻结契约（纯静态）：一轮内的工具步骤与思考
+收口为一条过程组消息、过程组先于触发行、发组规则与终态强制收口、组头类别串与
+`tool_activity_kind` 映射逐字不回归、dsh 工具行标题 / 摘要锚点、`_split_plain_chunks`
+纯文本分块。`test_real_stream.py` 用 `tests/fixtures/real-stream-2026-10-08.jsonl`
+（真机录得的 10 帧 turn 1）驱动 `consume_stream`，断言 standard 档的 3 条消息与内容
+（过程组 + 最终文本 + 收束行）。`test_silence_fix.py` 覆盖 v0.5.1 显式 `context_id`
+直播修复的 hook 级行为。
 
 `test_dashboard_api.py` 覆盖 Dashboard 后端（fake fastapi / hermes_cli）：
 POST body 严格校验（`enabled` / `events` 仅布尔、`live_detail` 仅 5 个枚举值，

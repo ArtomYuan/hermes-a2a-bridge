@@ -223,18 +223,17 @@ class HotReadTest(unittest.TestCase):
         call = consumer.consume_stream_calls[0]
         self.assertEqual(call["level"], "standard")
         self.assertIs(call["events"], False)
-        # v0.6.0：每次任务只建**一个** sender（唯一发送面 = 整任务单框），固定
-        # code_blocks=True（框内正文需围栏感知分块）。
-        self.assertEqual(len(consumer.make_sender_calls), 1)
+        # 直播 sender 与结果送达 sender 都固定 code_blocks=True（内部样式：
+        # 结果正文也是裸围栏代码框，需围栏感知分块）。
         self.assertIs(consumer.make_sender_calls[0][1], True)
+        self.assertIs(consumer.make_sender_calls[1][1], True)
         # 改配置 → 下一个任务拿新值。
         ctx.settings.update({"collector.events": True})
         _MODULE._stream_dsh_call("hi2", "feishu/oc_x")
         call = consumer.consume_stream_calls[1]
         self.assertEqual(call["level"], "detailed")
         self.assertIs(call["events"], True)
-        self.assertEqual(len(consumer.make_sender_calls), 2)
-        self.assertIs(consumer.make_sender_calls[1][1], True)
+        self.assertIs(consumer.make_sender_calls[2][1], True)
 
     # 7. 同一任务只各热读一次（任务中途改配置不影响进行中任务）。
     def test_stream_dsh_call_reads_each_switch_once_per_task(self):

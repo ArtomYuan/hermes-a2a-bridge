@@ -2,9 +2,8 @@
 
 向 dsh-a2a-server 发 ``SendStreamingMessage``，逐行解析 SSE ``data:`` 事件，
 把 ``result.{task|statusUpdate|artifactUpdate}`` 归一化为统一事件序列，经 T0
-emoji 行语言渲染后并入**全任务单框**累积（``TaskBox``），任务终结时把全部轮次的
-工具步骤 / 思考 / 叙述与最终结果拼进**同一个代码框**、一次性发送到飞书 / QQ
-消息面（v0.6.0：过程中不发任何消息）。
+emoji 行语言渲染、节流（高信号逐条放行 / 低信号 text 聚合）、逐组代码框收口
+（一轮的工具步骤与思考 = 一条框消息），再经 redact 后发送到飞书 / QQ 消息面。
 
 wire 格式（dsh-a2a-server, @a2a-js/sdk v1.1.0）
 ------------------------------------------------
@@ -543,9 +542,10 @@ def dsh_activity_detail(name: Any, arguments: Any) -> str:
     @param arguments - tool_call 事件的原始 ``arguments``（字符串或对象）。
     @returns 单行细节文本（可能为空串）。
     """
+    fallback = _normalize_activity_detail(name)
     data = _arguments_object(arguments)
     if data is None:
-        return _normalize_activity_detail(name)
+        return fallback
     for key in _DSH_ACTIVITY_DETAIL_KEYS:
         if key not in data:
             continue
@@ -553,7 +553,7 @@ def dsh_activity_detail(name: Any, arguments: Any) -> str:
         detail = _question_detail(value) if key == "questions" else _normalize_activity_detail(value)
         if detail:
             return detail
-    return _normalize_activity_detail(name)
+    return fallback
 
 
 def dsh_activity_phrase(name: Any) -> str:
@@ -569,19 +569,18 @@ def describe_tool_call(name: Any, arguments: Any) -> str:
     ``liveToolDetail``），是 standard 档逐步行与「内容开关关」路径的唯一摘要来源
     ——不再回落到命令原文截断（v0.6.0 起）。
 
+    细节逐字沿用 dsh 的回落链：参数里按 ``_DSH_ACTIVITY_DETAIL_KEYS`` 取不到可用值时，
+    ``liveToolDetail`` 回落到**工具名本身**（如纯命令字符串 ``"ls -la"`` → ``bash``），
+    故逐步行是 ``执行命令（bash）`` 而非裸短语——这是与 dsh 逐字对齐的一部分。
+
     @param name - tool_call / tool_result 事件的 ``name``。
     @param arguments - tool_call 事件的原始 ``arguments``。
     @returns 单行活动描述（``name`` 为空且无细节时为空串）。
     """
-    phrase = dsh_activity_phrase(name)
     detail = dsh_activity_detail(name, arguments)
     if not str(name or "").strip() and not detail:
         return ""
-    # dsh 的兜底是「回落到工具名」；步骤行已有活动短语，同义回落不再重复展示
-    # （否则会出现「读取文件（read）」）。
-    if detail and detail != _normalize_activity_detail(name):
-        return f"{phrase}（{detail}）"
-    return phrase
+    return f"{dsh_activity_phrase(name)}（{detail}）" if detail else dsh_activity_phrase(name)
 
 
 def tool_activity_kind(name: Any) -> str:
@@ -875,14 +874,14 @@ def render_line(
     """把归一化事件渲染为一行飞书 / QQ markdown 文本（无法识别返回 None）。
 
     v0.5.0 起 ``tool_call`` / ``tool_result`` / ``thinking`` 在**四档均不再产出单独行**
-    ——工具步骤与思考统一由 ``render_process_box`` 排版、由 ``TaskBox`` 并入整任务单框
-    （v0.6.0）。``render_line`` 只负责渲染轮次标记（turn_start）、叙述 / 最终文本
-    （text）与终态（status）：
+    ——一轮内的工具步骤与思考统一由 ``Throttler`` 收口为一条「代码框组」消息
+    （见 ``render_process_box``）。``render_line`` 只负责渲染起止标记（turn_start）、
+    叙述 / 最终文本（text）与终态（status）：
 
     | 事件 | 四档行为 |
     |---|---|
-    | turn_start | 🚀 轮次标记（四档同；由 TaskBox 放进框内段首） |
-    | tool_call / tool_result / thinking | 一律返回 None（由过程框承载） |
+    | turn_start | 🚀 轮次标记（四档同） |
+    | tool_call / tool_result / thinking | 一律返回 None（由代码框组承载） |
     | text（叙述/final） | 发；verbose 不截断，其余档非 final 截断 120 |
     | status 终态/错误 | 必发（四档同） |
 
@@ -894,7 +893,7 @@ def render_line(
     """
     mode = resolve_live_detail(content, level)
     etype = event.get("type")
-    # tool_call / tool_result / thinking：四档统一由过程框承载，不再单独成行。
+    # tool_call / tool_result / thinking：四档统一由「代码框组」承载，不再单独成行。
     if etype in ("thinking", "tool_call", "tool_result"):
         return None
     if etype == "turn_start":
@@ -937,106 +936,49 @@ def render_line(
 
 
 # --------------------------------------------------------------------------
-# 4. 全任务单框累积（v0.6.0）
+# 4. 节流（简化版）
 # --------------------------------------------------------------------------
 
-# 终态 → 中文（结果段头行用）。
-_STATE_ZH = {
-    "completed": "完成",
-    "failed": "失败",
-    "canceled": "已取消",
-}
+class Throttler:
+    """聚合低信号 text、四档统一把一轮内的工具步骤与思考收口为一条「代码框组」消息，并做限速。
 
-
-def format_task_message(
-    body: str, final_text: str, state: str, elapsed_secs: float
-) -> str:
-    """把「全任务过程正文 + 结果段」渲染为**一条**裸围栏代码框消息（v0.6.0 单框形态）。
-
-    框内结构::
-
-        <各轮标记 + 该轮步骤/思考/叙述（过程正文）>
-        ──────────────────────────────
-        📬 <状态 · 用时>，结果如下：
-        <final_text>
-
-    ``🚀``（轮次标记）与 ``📬``（结果头）都**并入框内**——整任务只有一条消息，
-    且 dsh 的内容全在一个框内（无框外文字）。过程正文为空（安静模式 / 无过程）时
-    只发结果段；``final_text`` 为空时仍发头行（「完成之后不静默」）。内层三反引号
-    由 ``_fence`` 转义，超长由 sender 按围栏感知分块，保证外层围栏闭合。
-    """
-    minutes, seconds = divmod(max(0, int(elapsed_secs)), 60)
-    cost = f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
-    state_zh = _STATE_ZH.get(state, state)
-    text = str(final_text or "")
-    if not text:
-        head = f"📬 dsh 任务已结束（{state_zh or '完成'} · 用时 {cost}）——本次无文本输出。"
-    elif state and state not in ("completed", ""):
-        head = f"📬 dsh 任务已结束（{state_zh} · 用时 {cost}），输出如下："
-    else:
-        head = f"📬 dsh 任务完成（用时 {cost}），结果如下："
-    segments: list = []
-    if body.strip():
-        segments.append(body.rstrip("\n"))
-        segments.append(_BOX_SEP)
-    segments.append(head)
-    if text:
-        segments.append(text.rstrip("\n"))
-    return _fence("\n".join(segments))
-
-
-class TaskBox:
-    """整个任务一个框：跨轮累积全过程，任务终结时一次性发出**唯一一条**代码框消息。
-
-    v0.6.0 形态（管理员要求「过程中不发任何消息 + 全任务单框」）：
-
-    - ``feed(event, line)`` 只累积、**恒不发消息**：工具步骤 / 思考 / 叙述行 / 轮次
-      标记全部留在缓冲里，过程中零推送（无心跳、无逐轮框、无框外 ``🚀`` 行）。
-    - ``body()`` 渲染全部轮次的过程正文；``finish()`` 再由
-      ``format_task_message`` 拼上结果段包成一个框。
-    - 轮次分段：``turn_start`` 开新段并把该轮标记行（``render_line`` 的 ``🚀 …``）
-      放在段首；段内工具步骤交给 ``render_process_box``（排版与四档密度沿用
-      DESIGN-BOX.md §3.2 冻结规格），思考与叙述按到达顺序排在其后。
-    - 空段（既无步骤也无思考/叙述）不产出正文；``collector.events=false``（安静
-      模式）下 consume_stream 只喂终态事件，过程正文自然为空、框内只剩结果段。
+    - ``tool_call`` / ``tool_result`` / ``thinking`` 在**四档**都进组缓冲，不逐条发出；
+      收口时由 ``render_process_box`` 渲染为一条无语言标记的代码框消息（一条消息 = 一个框）。
+    - 低信号 ``text``（非 final）只累积，不逐条发；在 ``turn_end`` 或 status 终态时
+      flush 为一条 ``📖`` 行。
+    - 收口时机（沿用）：``turn_end``、终态 status、final text、新 ``turn_start``（上一轮
+      未发则先发）；框**先于**触发它的叙述 / 终态行发出。终态强制收口（组缓冲不丢信息）。
+    - 发空规则：该轮既无工具步也无思考 → 不发框；只有思考无工具 → 发只含「思考…」行的框。
+    - 全局限速：相邻两次 send 至少间隔 ``min_interval`` 秒（默认 2.0）；不足则等待。
+    - TODO(P2c): 软上限（单任务最多 30 条消息）本阶段不做。
     """
 
-    def __init__(self, level: Optional[str] = None) -> None:
+    def __init__(self, min_interval: float = 2.0, level: Optional[str] = None) -> None:
+        self.min_interval = float(min_interval)
         # verbose 档：非 final text 聚合不截断（其余档截断 120）。
         self.level = level if level in LIVE_DETAIL_MODES else None
-        self._turns: list = []
-        self._current: Optional[Dict[str, Any]] = None
+        self._last_send = 0.0
+        self._text_buf: list = []
+        # 代码框组缓冲（四档统一）：累积一轮内的步骤明细与思考文本，收口为一条框消息。
+        self._steps: list = []          # 步骤明细：{"name", "arguments", "result"}（一个 tool_call = 一步）
+        self._thinking_parts: list = []  # 思考文本片段（可多条，收口时以换行连接）
 
-    def _section(self) -> Dict[str, Any]:
-        """当前轮段落（事件早于任何 ``turn_start`` 时惰性补一个无标记段）。"""
-        if self._current is None:
-            self._current = {
-                "marker": None,
-                "steps": [],
-                "thinking": [],
-                "narratives": [],
-            }
-            self._turns.append(self._current)
-        return self._current
+    def _flush_text(self) -> Optional[str]:
+        if not self._text_buf:
+            return None
+        joined = " ".join(self._text_buf).strip()
+        self._text_buf = []
+        if not joined:
+            return None
+        if self.level == "verbose":
+            return "📖 " + joined
+        return "📖 " + _truncate(joined, 120)
 
-    def feed(self, event: Dict[str, Any], line: Optional[str] = None) -> None:
-        """把一个归一化事件并入全任务缓冲（不返回任何待发消息）。"""
-        if not isinstance(event, dict):
-            return
+    def _buffer_process_event(self, event: Dict[str, Any]) -> None:
+        """把 tool_call / tool_result / thinking 收进代码框组缓冲（四档统一，不逐条发出）。"""
         etype = event.get("type")
-        if etype == "turn_start":
-            # 新轮次开新段，轮次标记行并入框内（不再单独推送）。
-            self._current = {
-                "marker": line or None,
-                "steps": [],
-                "thinking": [],
-                "narratives": [],
-            }
-            self._turns.append(self._current)
-            return
-        section = self._section()
         if etype == "tool_call":
-            section["steps"].append(
+            self._steps.append(
                 {
                     "name": event.get("name") or "",
                     "arguments": event.get("arguments"),
@@ -1045,40 +987,98 @@ class TaskBox:
             )
         elif etype == "tool_result":
             result = str(event.get("text") or "")
-            if section["steps"]:
-                section["steps"][-1]["result"] = result
+            if self._steps:
+                self._steps[-1]["result"] = result
             else:
                 # 异常流：无前导 tool_call 的 tool_result，补一步只含结果。
-                section["steps"].append(
+                self._steps.append(
                     {"name": event.get("name") or "", "arguments": "", "result": result}
                 )
         elif etype == "thinking":
-            section["thinking"].append(str(event.get("text") or ""))
-        elif etype == "text" and not event.get("final"):
-            if line:
-                section["narratives"].append(line)
-        # turn_end / status / final text：不进过程正文（结果段由 finish 渲染）。
+            self._thinking_parts.append(str(event.get("text") or ""))
 
-    def body(self) -> str:
-        """全部轮次的过程正文（不含结果段与外层围栏）；无过程时为空串。"""
-        blocks: list = []
-        for section in self._turns:
-            if not (section["steps"] or section["thinking"] or section["narratives"]):
-                continue
-            part: list = []
-            if section["marker"]:
-                part.append(section["marker"])
-            thinking = "\n".join(section["thinking"]) if section["thinking"] else None
-            box = render_process_box(section["steps"], thinking, self.level)
+    def _flush_process_box(self) -> Optional[str]:
+        """收口当前代码框组为一条无语言标记的代码框消息；空组（无工具且无思考）返回 None。"""
+        if not self._steps and not self._thinking_parts:
+            return None
+        thinking = "\n".join(self._thinking_parts) if self._thinking_parts else None
+        body = render_process_box(self._steps, thinking, self.level)
+        self._steps = []
+        self._thinking_parts = []
+        if not body.strip():
+            return None
+        return _fence(body)
+
+    def _wait_interval(self) -> None:
+        if self.min_interval <= 0:
+            return
+        remaining = self.min_interval - (time.monotonic() - self._last_send)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def feed(self, event: Dict[str, Any], line: Optional[str]) -> list:
+        """返回此刻应当发送的行列表（已做聚合与限速）。
+
+        ``event`` 用于判断事件类型与终态；``line`` 是该事件的 ``render_line`` 结果。
+        tool_call / tool_result / thinking 的 ``line`` 恒为 None（四档统一由框承载），
+        这些事件在此进组缓冲。
+        """
+        if not isinstance(event, dict):
+            return []
+        etype = event.get("type")
+        candidates: list = []
+
+        if etype in ("tool_call", "tool_result", "thinking"):
+            # 进组缓冲（四档统一），不逐条发出。
+            self._buffer_process_event(event)
+        elif etype == "turn_start":
+            # 轮次切换：新 turn 到达时，若上一轮组未收口则先收口（框先于轮次标记行）。
+            box = self._flush_process_box()
             if box:
-                part.append(box)
-            part.extend(section["narratives"])
-            blocks.append("\n".join(part))
-        return "\n".join(blocks)
+                candidates.append(box)
+            if line:
+                candidates.append(line)
+        elif etype == "text":
+            if event.get("final"):
+                # 防御性收口：final 文本到达时残存组先收口，再发最终文本。
+                box = self._flush_process_box()
+                if box:
+                    candidates.append(box)
+                if line:
+                    candidates.append(line)
+            else:
+                text = str(event.get("text") or "")
+                if text:
+                    self._text_buf.append(text)
+        elif etype == "turn_end":
+            # turn_end 触发收口：框先于 turn_end flush 出的叙述 text 行。
+            box = self._flush_process_box()
+            if box:
+                candidates.append(box)
+            flushed = self._flush_text()
+            if flushed:
+                candidates.append(flushed)
+            # turn_end 自身渲染为 None，不产生行
+        elif etype == "status":
+            state = event.get("state")
+            if state in _TERMINAL_STATES:
+                # 终态强制收口：框先于终态行；绝不丢步骤信息。
+                box = self._flush_process_box()
+                if box:
+                    candidates.append(box)
+                flushed = self._flush_text()
+                if flushed:
+                    candidates.append(flushed)
+                if line:
+                    candidates.append(line)
+            # working / submitted：line 为 None，不产生行
 
-    def finish(self, final_text: str, state: str, elapsed_secs: float) -> str:
-        """渲染整任务单框消息（含结果段）；恒返回一条消息（绝不静默）。"""
-        return format_task_message(self.body(), final_text, state, elapsed_secs)
+        out: list = []
+        for c in candidates:
+            self._wait_interval()
+            out.append(c)
+            self._last_send = time.monotonic()
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -1216,49 +1216,44 @@ def consume_stream(
     chat_id: str,
     thread_id: str,
     sender: Callable[..., Any],
+    min_interval: float = 2.0,
     timeout: int = _DEFAULT_TIMEOUT,
     code_blocks: bool = DEFAULT_CODE_BLOCKS,
     events: bool = DEFAULT_EVENTS,
     content: bool = DEFAULT_CONTENT,
     level: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → **全任务单框**发送，返回统计。
+    """发 SendStreamingMessage → 解析 → 归一化 → 渲染 → 节流 → 发送，返回统计。
 
-    v0.6.0 形态：**过程中不发任何消息**。全部轮次的工具步骤 / 思考 / 叙述 / 轮次
-    标记都并进 ``TaskBox`` 缓冲，任务终结时拼上结果段、以**唯一一条**裸围栏代码框
-    消息发出（``format_task_message``，超长由 ``sender`` 按围栏感知分块）。发送失败
-    重试一次；仍失败只记日志（结果不因样式 / 网络失败而丢）。
-
-    ``code_blocks`` 透传给 ``render_line``，控制叙述行是否以代码框渲染（内部样式，
-    生产路径固定 True）。
-    ``events`` 控制「中间事件」是否进过程正文：``False``（安静模式）时只有最终结果
-    （final 文本 / 终态 status）参与，过程正文为空、框内只剩结果段，但 stats 仍完整
-    （final_text / states / events_seen 不丢）。
+    ``code_blocks`` 透传给 ``render_line``，控制操作内容是否以代码框渲染
+    （内部样式，直播路径固定 True）。
+    ``events`` 控制「中间事件」是否推送：``False`` 时只推最终结果（final 文本 /
+    终态 status），中间事件（工具调用 / 中间文本 / thinking / 状态行）跳过渲染与
+    发送，但仍完整记录 stats（final_text / states / events_seen 不丢）。
     ``content``（遗留布尔）与 ``level``（四档，优先）经 ``resolve_live_detail`` 解析为
     渲染档位：``content=False`` ≡ ``standard``、``content=True`` ≡ ``detailed``；显式
-    ``level``（compact/standard/detailed/verbose）优先于 ``content``。四档的**框内密度**
-    沿用各档既有定义（``render_process_box``）。
+    ``level``（compact/standard/detailed/verbose）优先于 ``content``。v0.5.0 起四档统一
+    把一轮内的工具步骤与思考收口为一条「代码框组」消息（``render_process_box``），
+    ``render_line`` 不再为 tool_call / tool_result / thinking 产出单独行。text（含 final）
+    与 turn_start / status 终态等起止标记照常渲染推送；stats 完整性不受档位影响
+    （final_text / events_seen / states 仍完整统计，供上层「📬 最终结果送达」使用）。
 
     返回 ``{"final_text": str, "events_seen": int, "messages_sent": int,
-    "states": [...], "box_body": str}``。全程 try/except 兜底，单个事件解析失败不影响
-    整体。
+    "states": [...]}``。全程 try/except 兜底，单个事件解析失败不影响整体。
     """
-    started_at = time.monotonic()
     mode = resolve_live_detail(content, level)
     stats: Dict[str, Any] = {
         "final_text": "",
         "events_seen": 0,
         "messages_sent": 0,
         "states": [],
-        "box_body": "",
     }
 
     headers: Dict[str, str] = {"A2A-Version": A2A_PROTOCOL_VERSION}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    task_box = TaskBox(level=mode)
-    final_state = ""
+    throttler = Throttler(min_interval=min_interval, level=mode)
     try:
         results = iter_sse_data(
             url, _streaming_message_body(message, context_id), headers, timeout
@@ -1267,57 +1262,30 @@ def consume_stream(
             try:
                 stats["events_seen"] += 1
                 if event.get("type") == "status":
-                    state = event.get("state")
-                    stats["states"].append(state)
-                    if state in _TERMINAL_STATES:
-                        final_state = state
+                    stats["states"].append(event.get("state"))
                 if event.get("type") == "text" and event.get("final"):
                     stats["final_text"] = event.get("text") or ""
-                # 安静模式（events=false）：跳过中间事件，只留最终结果（final 文本 / 终态）。
+                # 安静模式（events=false）：跳过中间事件，只推最终结果（final 文本 / 终态 status）。
                 if not events and not _is_final_event(event):
                     continue
                 # 内容/档位（content / level）只决定框内密度与 text 截断口径，由
-                # render_line / render_process_box 在各自分支处理；过程事件一律
-                # 并入全任务缓冲，过程中不发任何消息。
+                # render_line / render_process_box 在各自分支处理；操作流（text）
+                # 与其起止标记照常走 feed，因此这里不再跳过任何事件类型。
                 line = render_line(
                     event, code_blocks=code_blocks, level=mode
                 )
-                task_box.feed(event, line)
+                for text in throttler.feed(event, line):
+                    res = sender(platform, chat_id, thread_id, text)
+                    if isinstance(res, dict) and not res.get("ok"):
+                        logger.warning(
+                            "hermes-a2a-bridge: send not delivered: %s", res.get("error")
+                        )
+                    else:
+                        stats["messages_sent"] += 1
             except Exception as exc:  # 单事件失败不影响整体
                 logger.warning(
                     "hermes-a2a-bridge: event %r failed: %s", event, exc
                 )
     except Exception as exc:  # 打开 / 迭代流失败（网络等）
         logger.warning("hermes-a2a-bridge: stream aborted: %s", exc)
-
-    # 任务终结：全部轮次的过程 + 结果拼进**同一个代码框**，一次性发出（唯一一条
-    # 消息）；失败重试一次，仍失败只记日志——但绝不因样式 / 网络失败丢结果。
-    stats["box_body"] = task_box.body()
-    message_text = task_box.finish(
-        stats["final_text"], final_state, time.monotonic() - started_at
-    )
-    for attempt in (1, 2):
-        try:
-            res = sender(platform, chat_id, thread_id, message_text)
-        except Exception as exc:
-            logger.warning(
-                "hermes-a2a-bridge: task box delivery raised (attempt %d): %s",
-                attempt,
-                exc,
-            )
-            continue
-        if isinstance(res, dict) and not res.get("ok"):
-            logger.warning(
-                "hermes-a2a-bridge: task box not delivered (attempt %d): %s",
-                attempt,
-                res.get("error"),
-            )
-            continue
-        stats["messages_sent"] += 1
-        logger.info(
-            "hermes-a2a-bridge: task box delivered (%d chars, body %d chars)",
-            len(message_text),
-            len(stats["box_body"]),
-        )
-        break
     return stats

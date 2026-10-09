@@ -1,26 +1,25 @@
-"""「代码框组」渲染（v0.6.0 起为「全任务单框」）单元测试（纯静态，不接 gateway / 不接 dsh）.
+"""「代码框组」渲染（v0.5.0）单元测试（纯静态，不接 gateway / 不接 dsh）.
 
 运行方式
 --------
     python3 tests/test_group_push.py
 
-覆盖：
-- v0.6.0 全任务单框（TaskBox）：整个过程零推送，任务终结时把**全部轮次**的工具步骤 /
-  思考 / 叙述与最终结果拼进**同一个**代码框，一次性发出一条消息；
-- 框内排版（`render_process_box`）：轮次标记 + 组头 + 分隔线 + 逐步行 + 结果行 +
-  思考段，四档密度差异（compact 无逐步行 / standard 无结果行 / detailed 有结果行 /
-  verbose 不截断）；
-- 逐步行的活动描述（`describe_tool_call`）逐字对齐 dsh 活动短语 + `liveToolDetail`；
-- 类别映射表（`tool_activity_kind`）与组头类别串（`group_title`）逐字不变；
-- 终态不丢信息；超长框分块后围栏闭合。
+覆盖 DESIGN-BOX.md §三 冻结契约（v0.5.0 四档统一「代码框组」）：
+- 一轮内的工具步骤与思考收口为一条无语言标记的代码框消息（组头 + 分隔线 + 逐步行 +
+  结果行 + 思考段）；
+- 四档密度差异（compact 无逐步行 / standard 无结果行 / detailed 有结果行 / verbose 不截断）；
+- 收口时机（turn_end / 终态 / final / 新 turn_start），框先于触发行；
+- 发框规则（无工具无思考 → 不发框；只有思考 → 发只含思考行的框）；
+- 种类映射表（tool_activity_kind）与组头类别串（group_title）逐字不变；
+- 终态强制收口；超长框分块后围栏闭合；
+- 摘要（summarize_tool_call）锚点不回归 → v0.6.0 起改为逐步行活动描述
+  （describe_tool_call，dsh 活动短语 + liveToolDetail 参数细节）。
 
 仅用标准库 ``unittest``，沿用 test_consumer.py 的 spec 加载方式。
 """
 
 import importlib.util
-import json
 import os
-import re
 import unittest
 
 _WORKTREE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,59 +30,29 @@ consumer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(consumer)
 
 
-_ELAPSED_RE = re.compile(r"用时 \d+(?: 分 \d+)? 秒")
-
-
-def _normalize_elapsed(text):
-    """把「用时 12 秒 / 用时 1 分 2 秒」归一成 ``用时 <t>``（时长非断言对象）。"""
-    return _ELAPSED_RE.sub("用时 <t>", text)
-
-
-def _run(events, level="standard", final_text="", state="completed"):
-    """以指定档位跑事件序列，返回**整任务单框**消息（唯一一条；用时已归一）。"""
-    box = consumer.TaskBox(level=level)
+def _std_run(events, min_interval=0.0):
+    """以 standard 档跑事件序列，返回发送行列表（min_interval=0 不等待）。"""
+    throttler = consumer.Throttler(min_interval=min_interval, level="standard")
+    sent = []
     for event in events:
-        box.feed(event, consumer.render_line(event, level=level))
-    return _normalize_elapsed(box.finish(final_text, state, 0.0))
+        line = consumer.render_line(event, level="standard")
+        sent.extend(throttler.feed(event, line))
+    return sent
 
 
-def _std_run(events, final_text="", state="completed"):
-    """standard 档便捷入口。"""
-    return _run(events, "standard", final_text, state)
-
-
-def _level_run(events, level, final_text="", state="completed"):
-    """指定档位便捷入口。"""
-    return _run(events, level, final_text, state)
+def _level_run(events, level):
+    """以指定档位跑事件序列，返回发送行列表。"""
+    throttler = consumer.Throttler(min_interval=0.0, level=level)
+    sent = []
+    for event in events:
+        line = consumer.render_line(event, level=level)
+        sent.extend(throttler.feed(event, line))
+    return sent
 
 
 def _box(*lines):
-    """把框内行序列包成无语言标记的代码框消息（唯一一条消息的期望形态）。"""
+    """把框内行序列包成无语言标记的代码框消息（收口消息的期望形态）。"""
     return "```\n" + "\n".join(lines) + "\n```"
-
-
-_STATE_ZH = {"completed": "完成", "failed": "失败", "canceled": "已取消"}
-
-
-def _no_text_tail(state="completed"):
-    """无文本输出时的结果头（框内结果段）。"""
-    return f"📬 dsh 任务已结束（{_STATE_ZH.get(state, state)} · 用时 <t>）——本次无文本输出。"
-
-
-def _result_tail(final_text, state="completed"):
-    """有文本输出时的结果段行（框内结果头 + 正文）。"""
-    if state and state != "completed":
-        return [f"📬 dsh 任务已结束（{_STATE_ZH.get(state, state)} · 用时 <t>），输出如下：", final_text]
-    return [f"📬 dsh 任务完成（用时 <t>），结果如下：", final_text]
-
-
-def _call(name, arguments, result="x"):
-    """造一对 tool_call / tool_result（``arguments`` 传 dict 会自动 JSON 化）。"""
-    raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
-    return [
-        {"type": "tool_call", "name": name, "arguments": raw},
-        {"type": "tool_result", "name": name, "text": result},
-    ]
 
 
 # 三工具步 + 思考，供密度对比（bash→commands、read→read、grep→search）。
@@ -96,152 +65,128 @@ _THREE_HEADER = "工作步骤 · 3 步 · 执行了命令，已读取文件，�
 
 
 class BoxGroupTest(unittest.TestCase):
-    """standard 档：整个任务的过程收进**一条**消息（过程中零推送、无心跳、无逐轮框）。"""
+    """standard 档：一轮收口为一条代码框组消息，不再有心跳 + 收口行两条路径。"""
 
     def test_eight_steps_single_box(self):
         events = [{"type": "turn_start", "turn": 1}]
         for i in range(1, 9):
-            events += _call("bash", {"command": f"echo step{i}"}, result=f"out{i}")
+            events.append({"type": "tool_call", "name": "bash", "arguments": f"echo step{i}"})
+            events.append({"type": "tool_result", "name": "bash", "text": f"out{i}"})
         events.append({"type": "turn_end", "turn": 1, "reason": "stop"})
         events.append({"type": "status", "state": "completed"})
 
-        message = _std_run(events)
-        step_lines = [f"{i}. bash · 执行命令（echo step{i}）" for i in range(1, 9)]
-        self.assertEqual(
-            message,
-            _box(
-                "🚀 第 1 轮",
-                "工作步骤 · 8 步 · 执行了命令",
-                consumer._BOX_SEP,
-                *step_lines,
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
-        )
-        # 一条消息、一个框：不再有心跳行，也没有逐条 🔧 / 📋 行。
-        for marker in ("正在执行", "🔧", "📋"):
-            self.assertNotIn(marker, message)
+        sent = _std_run(events)
+        # 纯命令字符串无参数细节 → standard 逐步行只显示 dsh 活动短语。
+        step_lines = [f"{i}. bash · 执行命令（bash）" for i in range(1, 9)]
+        box = _box("工作步骤 · 8 步 · 执行了命令", consumer._BOX_SEP, *step_lines)
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "✅ 完成"])
+        # 不再有心跳行，也没有逐条 🔧 / 📋 行。
+        self.assertFalse(any("正在执行" in line for line in sent))
+        self.assertFalse(any("🔧" in line for line in sent))
+        self.assertFalse(any("📋" in line for line in sent))
 
     def test_box_fence_has_no_language_tag(self):
-        # 围栏信息位留空：飞书代码块语言位不再露出无意义的「text」标签。
-        events = _call("bash", {"command": "echo step1"})
-        events.append({"type": "status", "state": "completed"})
-        message = _std_run(events)
-        lines = message.splitlines()
-        self.assertEqual(lines[0], "```")
-        self.assertEqual(lines[1], "工作步骤 · 1 步 · 执行了命令")
-        self.assertEqual(message.count("```"), 2)
-        self.assertNotIn("```text", message)
+        # 围栏信息位留空：飞书代码块语言位不再露出无意义的「text」标签，
+        # 与操作输出框（``_fence`` 默认无语言围栏）形态一致。
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "echo step1"},
+            {"type": "status", "state": "completed"},
+        ]
+        sent = _std_run(events)
+        box = sent[0]
+        self.assertEqual(box.splitlines()[0], "```")
+        self.assertEqual(box.splitlines()[1], "工作步骤 · 1 步 · 执行了命令")
+        self.assertEqual(box.count("```"), 2)
+        self.assertNotIn("```text", box)
 
     def test_more_than_twelve_steps_no_heartbeat(self):
-        # 13 步：全部进同一条框，无第 6/12 步心跳。
+        # 13 步：全部收口进一条框，无第 6/12 步心跳。
         events = []
         for i in range(1, 14):
-            events += _call("bash", {"command": f"echo step{i}"}, result="x")
+            events.append({"type": "tool_call", "name": "bash", "arguments": f"echo step{i}"})
+            events.append({"type": "tool_result", "name": "bash", "text": "x"})
         events.append({"type": "status", "state": "completed"})
 
-        message = _std_run(events)
-        self.assertIn("工作步骤 · 13 步 · 执行了命令", message)
-        self.assertEqual(message.count("\n1. "), 1)
-        self.assertIn("\n13. bash · 执行命令（echo step13）\n", message)
-        self.assertNotIn("正在执行", message)
-        # 整条消息恰好一对围栏（开 + 闭）。
-        self.assertEqual(message.count("```"), 2)
+        sent = _std_run(events)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[1], "✅ 完成")
+        body = sent[0]
+        self.assertTrue(body.startswith("```\n工作步骤 · 13 步 · 执行了命令\n"))
+        # 13 条逐步行，无心跳。
+        self.assertEqual(body.count("\n1. "), 1)
+        self.assertIn("\n13. bash · 执行命令（bash）\n", body)
+        self.assertNotIn("正在执行", body)
 
 
-class SingleBoxOrderTest(unittest.TestCase):
-    """v0.6.0：没有「收口时机」了——全部轮次与结果按到达顺序排进**同一个**框。"""
+class CloseTimingTest(unittest.TestCase):
+    """收口时机：turn_end / 终态 / final text / 新 turn_start，且框先于触发行。"""
 
-    def test_narrative_and_process_share_one_box(self):
-        events = _call("read", {"path": "/a.txt"})
-        events += [
+    def test_close_on_turn_end_before_narrative(self):
+        events = [
+            {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
+            {"type": "tool_result", "name": "read", "text": "x"},
             {"type": "text", "text": "叙述正文", "final": False},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 1 步 · 已读取文件",
-                consumer._BOX_SEP,
-                "1. read · 读取文件（/a.txt）",
-                "📖 叙述正文",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
-        )
+        sent = _std_run(events)
+        # 框先于 turn_end flush 出的叙述 text 行。
+        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（read）")
+        self.assertEqual(sent, [box, "📖 叙述正文"])
 
-    def test_terminal_state_is_result_head_inside_box(self):
-        events = _call("bash", {"command": "ls"})
-        events.append({"type": "status", "state": "completed"})
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 1 步 · 执行了命令",
-                consumer._BOX_SEP,
-                "1. bash · 执行命令（ls）",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
-        )
+    def test_close_on_terminal_status_before_status_line(self):
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "status", "state": "completed"},
+        ]
+        sent = _std_run(events)
+        # 框先于终态行。
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
+        self.assertEqual(sent, [box, "✅ 完成"])
 
     def test_thinking_does_not_split_group(self):
-        # 思考夹在两个工具步之间：不断组、不单独成行、不计步骤；整任务 1 条框。
-        events = _call("read", {"path": "/a.txt"})
-        events.append({"type": "thinking", "text": "想想"})
-        events += _call("bash", {"command": "ls"})
-        events.append({"type": "turn_end", "turn": 1, "reason": "stop"})
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 2 步 · 已读取文件并执行了命令",
-                consumer._BOX_SEP,
-                "1. read · 读取文件（/a.txt）",
-                "2. bash · 执行命令（ls）",
-                consumer._BOX_SEP,
-                "思考 · 想想",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
+        # 思考夹在两个工具步之间：不断组、不单独发一行、不计步骤；整轮 1 条框。
+        events = [
+            {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
+            {"type": "tool_result", "name": "read", "text": "x"},
+            {"type": "thinking", "text": "想想"},
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "y"},
+            {"type": "turn_end", "turn": 1, "reason": "stop"},
+        ]
+        sent = _std_run(events)
+        box = _box(
+            "工作步骤 · 2 步 · 已读取文件并执行了命令",
+            consumer._BOX_SEP,
+            "1. read · 读取文件（read）",
+            "2. bash · 执行命令（bash）",
+            consumer._BOX_SEP,
+            "思考 · 想想",
         )
+        self.assertEqual(sent, [box])
 
-    def test_final_text_lands_in_result_section(self):
-        events = _call("bash", {"command": "ls"})
-        events += [
+    def test_close_before_final_text(self):
+        # 防御性收口：final 文本到达时残存组先收口，再发最终文本。
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
             {"type": "text", "text": "最终", "final": True},
             {"type": "status", "state": "completed"},
         ]
-        # 最终文本不再单独成行（旧「📖 输出完成」行已取消），而是进结果段。
-        self.assertNotIn("📖 输出完成", _std_run(events, final_text="最终"))
-        self.assertEqual(
-            _std_run(events, final_text="最终"),
-            _box(
-                "工作步骤 · 1 步 · 执行了命令",
-                consumer._BOX_SEP,
-                "1. bash · 执行命令（ls）",
-                consumer._BOX_SEP,
-                *_result_tail("最终"),
-            ),
-        )
+        sent = _std_run(events)
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
+        self.assertEqual(sent, [box, "📖 输出完成", "✅ 完成"])
 
-    def test_two_turns_share_one_box(self):
-        # 无 turn_end 的轮次切换同样只产生一条消息：两轮都在这一个框里。
-        events = _call("read", {"path": "/a.txt"})
-        events.append({"type": "turn_start", "turn": 2})
-        events += _call("bash", {"command": "ls"})
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 1 步 · 已读取文件",
-                consumer._BOX_SEP,
-                "1. read · 读取文件（/a.txt）",
-                "🚀 第 2 轮",
-                "工作步骤 · 1 步 · 执行了命令",
-                consumer._BOX_SEP,
-                "1. bash · 执行命令（ls）",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
-        )
+    def test_turn_start_flushes_previous_group(self):
+        # 新 turn_start 到达时，若上一轮组未收口（无 turn_end）则先收口，框先于轮次标记行。
+        events = [
+            {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
+            {"type": "tool_result", "name": "read", "text": "x"},
+            {"type": "turn_start", "turn": 2},
+        ]
+        sent = _std_run(events)
+        box = _box("工作步骤 · 1 步 · 已读取文件", consumer._BOX_SEP, "1. read · 读取文件（read）")
+        self.assertEqual(sent, [box, "🚀 第 2 轮"])
 
 
 class ToolActivityKindTest(unittest.TestCase):
@@ -333,126 +278,121 @@ class GroupTitleTest(unittest.TestCase):
         self.assertEqual(consumer.group_title(["bogus"]), "已调用工具")
 
 
-class TerminalStateTest(unittest.TestCase):
-    """终态不丢信息：缓冲里的步骤一律进框；失败 / 取消只改结果头措辞。"""
+class TerminalForceFlushTest(unittest.TestCase):
+    """终态强制收口：组内还有缓冲时终态到达，信息不丢（框先于终态行）。"""
 
-    def test_terminal_keeps_buffered_steps(self):
-        events = _call("bash", {"command": "ls"}) + _call("read", {"path": "/b.txt"})
-        events.append({"type": "status", "state": "completed"})  # 无 turn_end，直接终态
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 2 步 · 执行了命令并已读取文件",
-                consumer._BOX_SEP,
-                "1. bash · 执行命令（ls）",
-                "2. read · 读取文件（/b.txt）",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
+    def test_terminal_flushes_buffered_group(self):
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "tool_call", "name": "read", "arguments": "cat /b.txt"},
+            {"type": "tool_result", "name": "read", "text": "y"},
+            # 无 turn_end，直接终态。
+            {"type": "status", "state": "completed"},
+        ]
+        sent = _std_run(events)
+        box = _box(
+            "工作步骤 · 2 步 · 执行了命令并已读取文件",
+            consumer._BOX_SEP,
+            "1. bash · 执行命令（bash）",
+            "2. read · 读取文件（read）",
         )
+        self.assertEqual(sent, [box, "✅ 完成"])
 
-    def test_failed_status_head(self):
-        events = _call("bash", {"command": "ls"})
-        events.append({"type": "status", "state": "failed"})
-        message = _std_run(events, state="failed")
-        self.assertEqual(
-            message,
-            _box(
-                "工作步骤 · 1 步 · 执行了命令",
-                consumer._BOX_SEP,
-                "1. bash · 执行命令（ls）",
-                consumer._BOX_SEP,
-                _no_text_tail("failed"),
-            ),
-        )
-        self.assertIn("失败", message)
-
-    def test_failed_with_text_uses_output_head(self):
-        events = _call("bash", {"command": "ls"})
-        events.append({"type": "text", "text": "出错了", "final": True})
-        events.append({"type": "status", "state": "failed"})
-        message = _std_run(events, final_text="出错了", state="failed")
-        self.assertIn("📬 dsh 任务已结束（失败 · 用时 <t>），输出如下：", message)
-        self.assertTrue(message.endswith("出错了\n```"))
+    def test_failed_status_also_flushes(self):
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "status", "state": "failed"},
+        ]
+        sent = _std_run(events)
+        box = _box("工作步骤 · 1 步 · 执行了命令", consumer._BOX_SEP, "1. bash · 执行命令（bash）")
+        self.assertEqual(sent, [box, "❌ 失败"])
 
 
 class ThinkingGroupTest(unittest.TestCase):
-    """思考并入框：不单独发一行、不计步骤；只有思考时框内只有思考行 + 结果段。"""
+    """思考并入框：不单独发一行、不计步骤；只有思考时发只含思考行的框。"""
 
-    def test_thinking_only_round_sends_thinking_line(self):
+    def test_thinking_only_turn_sends_thinking_box(self):
+        # 整轮只有思考、没有工具步 → 发只含「思考…」行的框（无组头）。
         events = [
             {"type": "turn_start", "turn": 1},
             {"type": "thinking", "text": "让我先规划一下"},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
-        message = _std_run(events)
-        self.assertEqual(
-            message,
-            _box("🚀 第 1 轮", "思考 · 让我先规划一下", consumer._BOX_SEP, _no_text_tail()),
-        )
+        sent = _std_run(events)
+        self.assertEqual(sent, ["🚀 第 1 轮", _box("思考 · 让我先规划一下")])
         # 没有「🧠 思考中…」单独行。
-        self.assertNotIn("🧠", message)
+        self.assertFalse(any("🧠" in line for line in sent))
 
     def test_thinking_with_tools_not_in_header(self):
         # 有工具步时，思考不计入组头类别（对齐 dsh processTitle：counts 只含工具）。
-        events = _call("read", {"path": "/a.txt"})
-        events += [
+        events = [
+            {"type": "tool_call", "name": "read", "arguments": "cat /a.txt"},
+            {"type": "tool_result", "name": "read", "text": "x"},
             {"type": "thinking", "text": "想想"},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
-        self.assertEqual(
-            _std_run(events),
-            _box(
-                "工作步骤 · 1 步 · 已读取文件",
-                consumer._BOX_SEP,
-                "1. read · 读取文件（/a.txt）",
-                consumer._BOX_SEP,
-                "思考 · 想想",
-                consumer._BOX_SEP,
-                _no_text_tail(),
-            ),
+        sent = _std_run(events)
+        box = _box(
+            "工作步骤 · 1 步 · 已读取文件",
+            consumer._BOX_SEP,
+            "1. read · 读取文件（read）",
+            consumer._BOX_SEP,
+            "思考 · 想想",
         )
+        self.assertEqual(sent, [box])
 
     def test_thinking_not_counted_in_step_lines(self):
         # 思考不计入工具步数：仅 3 个工具步 + 若干思考，组头仍为 3 步。
-        events = []
-        for _ in range(3):
-            events += _call("bash", {"command": "ls"})
-            events.append({"type": "thinking", "text": "想想"})
-        events.append({"type": "turn_end", "turn": 1, "reason": "stop"})
-        message = _std_run(events)
-        self.assertIn("工作步骤 · 3 步 · 执行了命令", message)
-        self.assertEqual(message.count("\n3. "), 1)
-        self.assertIn("思考 · 想想", message)
+        events = [
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "thinking", "text": "想想"},
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "thinking", "text": "再想想"},
+            {"type": "tool_call", "name": "bash", "arguments": "ls"},
+            {"type": "tool_result", "name": "bash", "text": "x"},
+            {"type": "turn_end", "turn": 1, "reason": "stop"},
+        ]
+        sent = _std_run(events)
+        box = _box(
+            "工作步骤 · 3 步 · 执行了命令",
+            consumer._BOX_SEP,
+            "1. bash · 执行命令（bash）",
+            "2. bash · 执行命令（bash）",
+            "3. bash · 执行命令（bash）",
+            consumer._BOX_SEP,
+            "思考 · 想想",
+        )
+        self.assertEqual(sent, [box])
 
 
 class BoxRuleTest(unittest.TestCase):
-    """发内容规则：整任务无过程（无工具 / 无思考 / 无叙述）→ 框内只有结果段；
-    只有思考 → 框内有思考行；四档统一为**一条**消息。"""
+    """发框规则：无工具无思考 → 不发框；只有思考 → 发；四档统一收口为一条框。"""
 
-    def test_no_process_only_result_section(self):
+    def test_no_tool_no_thinking_no_box(self):
+        # 整轮既无工具步也无思考 → 不发框（只留起止标记）。
         events = [
             {"type": "turn_start", "turn": 1},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
             {"type": "status", "state": "completed"},
         ]
-        message = _std_run(events)
-        self.assertEqual(message, _box(_no_text_tail()))
-        # 无过程的轮次不产生轮次标记行，也不产生组头。
-        for marker in ("🚀", "工作步骤"):
-            self.assertNotIn(marker, message)
+        sent = _std_run(events)
+        self.assertEqual(sent, ["🚀 第 1 轮", "✅ 完成"])
+        self.assertFalse(any(line.startswith("```") for line in sent))
 
-    def test_only_thinking_keeps_thinking_line(self):
+    def test_only_thinking_sends_box(self):
+        # 只有思考、无工具 → 发只含思考行的框（无组头、无分隔线）。
         for level in ("standard", "detailed", "verbose"):
             with self.subTest(level=level):
                 events = [
                     {"type": "thinking", "text": "让我想想"},
                     {"type": "turn_end", "turn": 1, "reason": "stop"},
                 ]
-                self.assertEqual(
-                    _level_run(events, level),
-                    _box("思考 · 让我想想", consumer._BOX_SEP, _no_text_tail()),
-                )
+                sent = _level_run(events, level)
+                self.assertEqual(sent, [_box("思考 · 让我想想")])
 
     def test_compact_only_thinking_label(self):
         # compact 档只有思考 → 框内仅「思考」标签，无预览。
@@ -460,10 +400,8 @@ class BoxRuleTest(unittest.TestCase):
             {"type": "thinking", "text": "让我想想"},
             {"type": "turn_end", "turn": 1, "reason": "stop"},
         ]
-        self.assertEqual(
-            _level_run(events, "compact"),
-            _box("思考", consumer._BOX_SEP, _no_text_tail()),
-        )
+        sent = _level_run(events, "compact")
+        self.assertEqual(sent, [_box("思考")])
 
 
 class RenderProcessBoxTest(unittest.TestCase):
@@ -485,11 +423,32 @@ class RenderProcessBoxTest(unittest.TestCase):
             [
                 _THREE_HEADER,
                 consumer._BOX_SEP,
-                "1. bash · 执行命令",
-                "2. read · 读取文件",
-                "3. grep · 搜索代码",
+                # 纯命令字符串无参数细节 → 只显示 dsh 活动短语。
+                "1. bash · 执行命令（bash）",
+                "2. read · 读取文件（read）",
+                "3. grep · 搜索代码（grep）",
                 consumer._BOX_SEP,
                 "思考 · 让我先想想",
+            ],
+        )
+
+    def test_standard_step_line_uses_dsh_detail(self):
+        # 参数为 JSON 对象时，standard 逐步行按 dsh liveToolDetail 取参数细节
+        # （键序 description > command > queries > query ... > path）。
+        steps = [
+            {"name": "bash", "arguments": {"command": "df -h", "description": "看磁盘"}, "result": "x"},
+            {"name": "read", "arguments": '{"path": "/tmp/config.yaml"}', "result": "y"},
+            {"name": "grep", "arguments": {"query": "TODO"}, "result": "z"},
+        ]
+        body = consumer.render_process_box(steps, None, "standard")
+        self.assertEqual(
+            body.splitlines(),
+            [
+                "工作步骤 · 3 步 · 执行了命令，已读取文件，已搜索代码",
+                consumer._BOX_SEP,
+                "1. bash · 执行命令（看磁盘）",
+                "2. read · 读取文件（/tmp/config.yaml）",
+                "3. grep · 搜索代码（TODO）",
             ],
         )
 
@@ -567,7 +526,7 @@ class RenderProcessBoxTest(unittest.TestCase):
 
 
 class NoRegressionTest(unittest.TestCase):
-    """单框形态下，轮次标记 / 叙述 / 最终文本 / 终态仍逐字进入框内（四档一致）。"""
+    """四档统一代码框组后，非过程事件（起止标记 / 叙述 / 终态）逐字不回归。"""
 
     _EVENTS = [
         {"type": "turn_start", "turn": 1},
@@ -579,80 +538,100 @@ class NoRegressionTest(unittest.TestCase):
     ]
 
     def test_detailed_single_box(self):
-        self.assertEqual(
-            _level_run(self._EVENTS, "detailed", final_text="最终"),
-            _box(
-                "🚀 第 1 轮",
-                "工作步骤 · 1 步 · 执行了命令",
-                consumer._BOX_SEP,
-                "1. bash · git log",
-                "   ↳ a1b2c3",
-                "📖 叙述",
-                consumer._BOX_SEP,
-                *_result_tail("最终"),
-            ),
+        sent = _level_run(self._EVENTS, "detailed")
+        box = _box(
+            "工作步骤 · 1 步 · 执行了命令",
+            consumer._BOX_SEP,
+            "1. bash · git log",
+            "   ↳ a1b2c3",
         )
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "📖 输出完成", "📖 叙述", "✅ 完成"])
 
     def test_verbose_equals_detailed_short(self):
-        # 短文本下 verbose 与 detailed 逐字一致（结果 / 参数均不截断时）。
-        self.assertEqual(
-            _level_run(self._EVENTS, "verbose", final_text="最终"),
-            _level_run(self._EVENTS, "detailed", final_text="最终"),
-        )
+        # 短文本下 verbose 与 detailed 逐字一致（结果/参数均不截断时）。
+        self.assertEqual(_level_run(self._EVENTS, "verbose"), _level_run(self._EVENTS, "detailed"))
 
     def test_compact_header_only_box(self):
-        message = _level_run(self._EVENTS, "compact", final_text="最终")
-        self.assertEqual(
-            message,
-            _box(
-                "🚀 第 1 轮",
-                "工作步骤 · 1 步 · 执行了命令",
-                "📖 叙述",
-                consumer._BOX_SEP,
-                *_result_tail("最终"),
-            ),
-        )
-        for marker in ("🔧", "📋"):
-            self.assertNotIn(marker, message)
+        sent = _level_run(self._EVENTS, "compact")
+        box = _box("工作步骤 · 1 步 · 执行了命令")
+        self.assertEqual(sent, ["🚀 第 1 轮", box, "📖 输出完成", "📖 叙述", "✅ 完成"])
+        self.assertFalse(any("🔧" in line or "📋" in line for line in sent))
 
 
-class ActivityDescriptionAnchorTest(unittest.TestCase):
-    """步骤行活动描述的锚点（完整覆盖见 test_consumer.py 的 ToolActivityDescriptionTest）：
-    dsh 键序、非 JSON 参数回落、桥侧扩展工具归类。"""
+class DescribeToolCallAnchorTest(unittest.TestCase):
+    """逐步行活动描述锚点：短语表逐项 + dsh 参数细节键序（取代旧摘要规则表用例）。"""
 
-    def test_detail_key_priority(self):
-        # dsh LIVE_TOOL_DETAIL_KEYS：title > description > command。
-        self.assertEqual(
-            consumer.describe_tool_call("bash", {"command": "df -h", "description": "查看磁盘"}),
-            "执行命令（查看磁盘）",
-        )
-        self.assertEqual(
-            consumer.describe_tool_call("bash", {"command": "df -h", "title": "磁盘"}),
-            "执行命令（磁盘）",
-        )
-
-    def test_non_json_arguments_fall_back_to_phrase(self):
-        # 非 JSON 参数字符串：dsh liveToolDetail 回落到工具名，步骤行只留活动短语。
-        self.assertEqual(consumer.describe_tool_call("bash", "df -h"), "执行命令")
-        self.assertEqual(consumer.describe_tool_call("grep", "-rn TODO"), "搜索代码")
-
-    def test_identifier_and_path_keys(self):
-        # query / pattern / path 都是 dsh 键表成员，直接给出取值。
-        self.assertEqual(consumer.describe_tool_call("grep", {"query": "search term"}),
-                         "搜索代码（search term）")
-        self.assertEqual(consumer.describe_tool_call("glob", {"pattern": "**/*.py"}),
-                         "搜索代码（**/*.py）")
-        self.assertEqual(consumer.describe_tool_call("read", {"path": "/a/b.txt"}),
-                         "读取文件（/a/b.txt）")
-
-    def test_bridge_extension_tools(self):
-        # 桥侧扩展（dsh 无这些工具）就近归入 subagents → 「协调子智能体」。
-        for name in ("spawn_teammate", "send_message", "wait_agent", "list_agents",
-                     "interrupt_agent", "team_task_list"):
+    def test_phrase_table(self):
+        cases = {
+            "bash": "执行命令",
+            "read": "读取文件",
+            "write": "写入文件",
+            "edit": "修改文件",
+            "grep": "搜索代码",
+            "run_code": "运行代码",
+            "web_search": "搜索网页",
+            "web_fetch": "访问网页",
+            "subagent": "协调子智能体",
+            "todo_write": "更新计划",
+            "ask_user_question": "提问",
+            "job_output": "调用工具",
+        }
+        for name, expected in cases.items():
             with self.subTest(name=name):
-                self.assertTrue(
-                    consumer.describe_tool_call(name, {"name": "x"}).startswith("协调子智能体（")
-                )
+                self.assertEqual(consumer.dsh_activity_phrase(name), expected)
+
+    def test_detail_key_order(self):
+        # description 优先于 command（dsh LIVE_TOOL_DETAIL_KEYS 原序）。
+        self.assertEqual(
+            consumer.describe_tool_call(
+                "bash", {"command": "wc -l file", "description": "统计行数"}
+            ),
+            "执行命令（统计行数）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("bash", {"command": "wc -l file"}),
+            "执行命令（wc -l file）",
+        )
+        self.assertEqual(
+            consumer.describe_tool_call("read", {"path": "/a/b.txt"}),
+            "读取文件（/a/b.txt）",
+        )
+        # 字符串形式的 JSON 对象同样命中。
+        self.assertEqual(
+            consumer.describe_tool_call("bash", '{"command": "git status --short"}'),
+            "执行命令（git status --short）",
+        )
+
+    def test_empty_and_unknown(self):
+        # 无名也无细节 → 空串；未知工具归 tools 且细节回落到工具名。
+        self.assertEqual(consumer.describe_tool_call("", ""), "")
+        self.assertEqual(consumer.describe_tool_call("foo_inspect", ""), "搜索代码（foo_inspect）")
+
+    def test_phrase_table_has_every_dsh_kind(self):
+        # 短语表覆盖 dsh message.stepProcess 的全部 kind（源码枚举，缺项会在这里暴露）。
+        kinds = {
+            "thinking",
+            "read",
+            "readImage",
+            "write",
+            "search",
+            "edit",
+            "commands",
+            "code",
+            "webSearch",
+            "webFetch",
+            "subagents",
+            "plan",
+            "questions",
+            "tools",
+        }
+        self.assertEqual(set(consumer._DSH_ACTIVITY_PHRASE), kinds)
+        for kind, phrase in consumer._DSH_ACTIVITY_PHRASE.items():
+            with self.subTest(kind=kind):
+                self.assertTrue(phrase)
+                # 短语是 dsh 词干（不含体标记）。
+                for marker in ("正在", "准备", "已", "了"):
+                    self.assertNotIn(marker, phrase, f"{kind} 短语未剥离体标记: {phrase}")
 
 
 if __name__ == "__main__":

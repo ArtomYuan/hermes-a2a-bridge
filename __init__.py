@@ -48,17 +48,16 @@ hook 里对 dsh 目标做**单执行**：
   origin 非空（显式 context_id 或消息面 origin）+ message 非空。
 - origin 取值：``explicit or _build_origin()``。带显式 ``context_id`` 的调用**不再
   关闭直播**——显式值被原样采用为 origin（不覆盖调用方意图），因此消息仍落到同一
-  dsh 会话；该调用由同步变异步（后台执行 + 受理回执 + 单框结果自动送达）。
+  dsh 会话；该调用由同步变异步（后台直播 + 受理回执 + 结果自动送达）。
 - 单执行（异步，2026-09-15 改）：hook 立即 spawn 后台 daemon 线程跑
   ``_stream_dsh_call``（发 ``SendStreamingMessage``、消费 SSE 直播），并立刻以
   ``{"action": "block", "message": 受理回执}`` 阻止原 ``a2a_call`` 执行（消除双执行）。
   必须异步的原因：框架 hook 回调超时 30s，超时即 fail-closed 且其后一段时间内
   所有工具调用被连锁跳过（历史缺陷，2026-09-15 修复）。
-- 结果送达（v0.6.0 起并入「全任务单框」）：``_stream_dsh_call`` 在任务终结时把
-  **全部轮次**的工具步骤 / 思考 / 叙述与最终结果拼进**同一个**裸围栏代码框，一次性
-  主动送达消息面——``📬`` 头行与 ``🚀`` 轮次标记都并入框内，框外无文字；超长按围栏
-  感知分块、内层围栏转义。过程中**不发任何消息**（无受理之外的中间推送）。发送失败
-  重试一次后仅记日志——「完成」之后不静默。
+- 结果送达：``_stream_dsh_call`` 在任务完成时把最终结果以**代码框**主动送达消息面
+  ——``📬 **dsh 任务完成，结果如下**（用时 …）`` 头行在框**前**，正文进**裸围栏**
+  代码框（与直播过程框同形、不截断；内层围栏转义，超长按围栏感知分块），失败重试
+  一次后仅记日志——「完成」之后不静默。
 - 回退：spawn 失败时退化为注入 origin 让原 ``a2a_call`` 走同步 ``SendMessage``
   （功能不丢、无直播）。
 - 其余（``a2a_orchestrate`` / 非 dsh 目标 / collector 关 / 非消息面 / message 空）：
@@ -67,6 +66,7 @@ hook 里对 dsh 目标做**单执行**：
 
 import logging
 import threading
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -286,13 +286,14 @@ def _coerce_timeout(value: Any, default: float) -> float:
 
 
 def _stream_dsh_call(message: str, context_id: str) -> str:
-    """对 dsh 发一条 ``SendStreamingMessage``，消费 SSE 并累积全过程，返回格式化最终文本。
+    """对 dsh 发一条 ``SendStreamingMessage``，边消费 SSE 边直播，返回格式化最终文本。
 
     仅在 collector 门控 + dsh 目标 + 消息面 origin 非空 + message 非空时由
     ``_on_pre_tool_call`` 调用。缺 url 或 message 空时抛 ``RuntimeError``（调用方回退
     注入 origin 走同步 SendMessage）。返回 ``[dsh · context {context_id} · {state}]
     \\n{final_text}``。
     """
+    started_at = time.time()
     peer = _dsh_peer()
     if peer:
         url = str(peer.get("url") or "").strip()
@@ -320,9 +321,10 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
     # live_detail 经 _read_live_detail 解析为四档之一（含 follow-dsh 读文件）。
     events = _read_switch("collector.events", True)
     level = _read_live_detail()
-    # 仅消息面（platform/chat_id 均非空）才真发送；否则 noop sender。
-    # sender 固定 code_blocks=True（内部样式：围栏感知分块）——整任务单框本身就是一个
-    # 裸围栏代码框，超长分块必须围栏感知，否则会把外层围栏切断。
+    # 仅消息面（platform/chat_id 均非空）才真发送直播；否则 noop sender。
+    # 直播 sender 与结果送达 sender 都固定 code_blocks=True（内部样式：围栏感知分块）。
+    # 结果送达的消息正文由 _format_result_message 包成裸围栏代码框（与直播过程框同形），
+    # 故必须走围栏感知分块，否则超长时分块会把外层围栏切断，见 _deliver_final_result。
     sender = (
         consumer.make_sender(_CTX, code_blocks=True)
         if (platform and chat_id)
@@ -337,8 +339,6 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         chat_id,
     )
     timeout = _coerce_timeout(timeout_raw, consumer._DEFAULT_TIMEOUT)
-    # 唯一的发送面：consume_stream 在任务终结时把「全部轮次 + 结果」拼成同一个
-    # 代码框、一次性发出（内部重试一次）。过程中无任何推送。
     stats = consumer.consume_stream(
         url=url,
         token=token,
@@ -348,17 +348,17 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         chat_id=chat_id,
         thread_id=thread_id,
         sender=sender,
+        min_interval=2.0,
         timeout=timeout,
         code_blocks=True,
         events=events,
         level=level,
     )
     logger.info(
-        "hermes-a2a-bridge: task box consumed events_seen=%s messages_sent=%s "
-        "box_body=%d chars final_text=%.80r",
+        "hermes-a2a-bridge: hook stream consumed events_seen=%s messages_sent=%s "
+        "final_text=%.80r",
         stats.get("events_seen"),
         stats.get("messages_sent"),
-        len(stats.get("box_body") or ""),
         stats.get("final_text") or "",
     )
 
@@ -370,7 +370,101 @@ def _stream_dsh_call(message: str, context_id: str) -> str:
         header += f" · {state}"
     header += "]"
 
+    # 结果主动送达：任务完成即把最终结果以**代码框**消息推回消息面（「完成」之后不静默）。
+    if platform and chat_id:
+        _deliver_final_result(
+            platform, chat_id, thread_id, final_text, state, started_at
+        )
+
     return f"{header}\n{final_text or '(no text reply)'}"
+
+
+_STATE_ZH = {
+    "completed": "完成",
+    "failed": "失败",
+    "canceled": "已取消",
+}
+
+
+def _box_result_body(text: str) -> str:
+    """把结果正文包成代码框（与直播过程框**同源**的裸围栏）。
+
+    复用 consumer 的 ``_fence``：裸三反引号（无语言标记）、正文内层三反引号转义为
+    不闭合外层围栏的形式、尾部换行剥除。同源而非重写，是为了让「结果送达」的围栏
+    形态与直播框永远一致。渲染不可用时退回未框化纯文本——送达优先于样式，绝不因
+    样式失败丢结果。
+    """
+    try:
+        return _import_consumer()._fence(text)
+    except Exception as exc:  # 渲染失败不阻断送达
+        logger.warning("hermes-a2a-bridge: result body fence unavailable: %s", exc)
+        return str(text)
+
+
+def _format_result_message(final_text: str, state: str, elapsed_secs: float) -> str:
+    """构造「任务结果」主动送达消息：📬 头行（状态 + 耗时）+ **代码框包裹的结果全文**。
+
+    v0.5.3 起结果正文以**裸围栏代码框**渲染（与直播过程框同形），头行留在框**前**
+    ——与直播「``📖 输出完成`` 行 + 框」的排布一致，且状态 / 耗时是元信息、不该进
+    等宽框。正文**不截断**（只剥尾部换行），内层围栏被转义以保证外层围栏闭合；
+    超长（>8000）由 sender 的围栏感知分块处理。无文本输出时只有头行、不发空框。
+    """
+    minutes, seconds = divmod(max(0, int(elapsed_secs)), 60)
+    cost = f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
+    state_zh = _STATE_ZH.get(state, state)
+    if not final_text:
+        return (
+            f"📬 **dsh 任务已结束**（{state_zh or '完成'} · 用时 {cost}）"
+            "——本次无文本输出。"
+        )
+    if state and state not in ("completed", ""):
+        head = f"📬 **dsh 任务已结束（{state_zh}），输出如下**（用时 {cost}）"
+    else:
+        head = f"📬 **dsh 任务完成，结果如下**（用时 {cost}）"
+    return f"{head}\n\n{_box_result_body(final_text)}"
+
+
+def _deliver_final_result(
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    final_text: str,
+    state: str,
+    started_at: float,
+) -> None:
+    """把任务最终结果以代码框消息主动送达消息面（失败重试一次，绝不抛出）。
+
+    sender 固定 ``code_blocks=True``：结果消息正文是裸围栏代码框（见
+    ``_format_result_message``），分块必须**围栏感知**，否则超长时分块会把外层围栏
+    切断、客户端渲染出断裂的框。
+    """
+    try:
+        consumer = _import_consumer()
+        sender = consumer.make_sender(_CTX, code_blocks=True)
+    except Exception as exc:
+        logger.warning("hermes-a2a-bridge: result sender unavailable: %s", exc)
+        return
+    text = _format_result_message(final_text, state, time.time() - started_at)
+    for attempt in (1, 2):
+        try:
+            res = sender(platform, chat_id, thread_id, text)
+        except Exception as exc:
+            logger.warning(
+                "hermes-a2a-bridge: result delivery raised (attempt %d): %s",
+                attempt,
+                exc,
+            )
+            continue
+        if isinstance(res, dict) and res.get("ok"):
+            logger.info(
+                "hermes-a2a-bridge: final result delivered (%d chars)", len(text)
+            )
+            return
+        logger.warning(
+            "hermes-a2a-bridge: result delivery failed (attempt %d): %s",
+            attempt,
+            res.get("error") if isinstance(res, dict) else res,
+        )
 
 
 def _stream_worker(message: str, origin: str) -> None:
@@ -400,7 +494,7 @@ def _on_pre_tool_call(
     """pre_tool_call 钩子：origin 注入 + dsh 单执行（block 原 a2a_call）。
 
     对 dsh 目标的 ``a2a_call``（collector 开 + origin 非空 + message 非空）走单执行：
-    ``_spawn_stream_worker`` 后台执行，随后 ``{"action": "block", "message": 受理回执}``
+    ``_spawn_stream_worker`` 后台直播，随后 ``{"action": "block", "message": 受理回执}``
     阻止原 a2a_call 执行（消除双执行）。origin 取 ``explicit or _build_origin()``：
     调用方显式传入的 context_id（或 contextId 别名）不再关闭直播，而是原样采用为
     origin（不覆盖调用方意图）。流式失败时回退为仅注入 origin。其余情况
@@ -418,7 +512,7 @@ def _on_pre_tool_call(
     # 消息面 origin（非消息面 / platform 或 chat_id 为空时返回 ""）。
     origin = _build_origin()
     # 有效 origin：显式优先，否则消息面。带显式 context_id 的调用由同步变异步
-    # （后台执行 + 受理回执 + 单框结果送达），且该 context 被原样采用。
+    # （后台直播 + 受理回执 + 结果自动送达），且该 context 被原样采用。
     eff_origin = explicit or origin
 
     # 单执行：a2a_call 目标 dsh + collector 开 + origin 非空。
@@ -437,14 +531,13 @@ def _on_pre_tool_call(
         if message:
             try:
                 _spawn_stream_worker(message, eff_origin)
-                # 异步单执行（2026-09-15）：回调秒回受理回执，任务在后台执行；
+                # 异步单执行（2026-09-15）：回调秒回受理回执，任务在后台直播 +
                 # 完成后结果自动送达；block 阻止原 a2a_call 执行（消除双执行）。
                 return {
                     "action": "block",
                     "message": (
-                        f"[dsh · context {eff_origin}] ⏳ 已受理——任务在后台执行"
-                        "（过程中不推送）；完成后全过程与结果会在同一个代码框里"
-                        "一次性送达本对话。"
+                        f"[dsh · context {eff_origin}] ⏳ 已受理——任务在后台执行，"
+                        "过程直播中；完成后结果会自动送达本对话。"
                     ),
                 }
             except Exception as exc:

@@ -7,48 +7,59 @@
 
 ## [0.6.0] - 2026-10-10
 
-> ⚠️ **形态变更（两次，均不新增配置键）**：①逐步行的摘要由「命令原文/人话摘要」改为
-> **dsh 式活动描述**（与 dsh「工作步骤展示」同源的文案算法）；②过程推送由「**每轮一个
-> 代码框**」改为「**整个任务一个代码框**」——**过程中不发任何消息**，任务终结时把全部
-> 轮次的工具步骤 / 思考 / 叙述与最终结果拼进**同一个**框、一次性发出。飞书 / QQ 里
-> 不再有实时过程直播，只有任务结束的一条框。
->
-> **行为变更提示**：长任务在完成前**完全静默**（受理回执仍是 `a2a_call` 的工具返回值，
-> 不受影响）。要回到「每轮一框」的实时形态，请回退到 v0.5.3。
+> ⚠️ **文案变更（形态不变）**：`standard` 档逐步行的摘要由桥侧「命令原文 / 人话
+> 短语」启发式规则表，改为**逐字对齐 dsh 的活动描述**——`<dsh 活动短语>（<dsh 参数
+> 细节>）`，如 `执行命令（df -h）`、`读取文件（config.yaml）`、`搜索代码（TODO）`。
+> **出框形态与 v0.5.x 完全一致**：仍是一轮内的工具步骤 + 思考收口为**一条**无语言
+> 标记代码框（逐组出框），叙述 / 最终文本 / 终态行照旧各自发送；**不新增配置键**。
 
 ### Changed
 
-- **步骤行对齐 dsh（A）**：`standard` 档逐步行从「`工具名 · 命令原文摘要`」改为
-  「`工具名 · <dsh 活动描述>`」。活动描述 = dsh 活动短语（`message.stepProcess.<kind>`
-  词干：读取文件 / 搜索代码 / 执行命令 / 修改文件 / 写入文件 / 运行代码 / 搜索网页 /
-  访问网页 / 协调子智能体 / 更新计划 / 提问 / 调用工具）+ dsh `liveToolDetail` 参数细节
-  （键序 `title > description > … > command > … > path … > status`，`questions` 取首问，
-  160 字符截断；无参数对象时只显示活动短语）。例：`读取文件（/a/b/config.yaml）`、
-  `执行命令（df -h）`、`搜索代码（TODO）`。**桥侧启发式规则表
-  （`summarize_tool_call` / `_SUMMARY_*`，含「检查磁盘使用」「列出目录」等固定短语与
-  命令首行截断兜底）整体删除**——摘要不再依赖命令原文。
-- **全任务单框（B）**：`Throttler` 被 `TaskBox` 取代——`feed` 只累积、**恒不发消息**；
-  任务终结时 `finish` 渲染**唯一一条**裸围栏代码框。`🚀 第 N 轮` 轮次标记与 `📬` 结果头
-  **并入框内**，框外无文字；过程正文与结果段之间以 30 个 `─` 分隔。结果送达一并从
-  `__init__.py` 移入 `consume_stream`（`_format_result_message` / `_deliver_final_result` /
-  `_box_result_body` 删除），失败重试一次后仅记 warning。
-- `consume_stream` 去掉 `min_interval` 参数（不再有过程中限速），返回值新增
-  `box_body`（过程正文，便于观测 / 测试）；`messages_sent` 现在是 **0 或 1**。
-- 超长框仍走既有 `_split_fenced_chunks`（围栏感知，块间 `⏩ 续`，每块围栏闭合）；
-  正文内层三反引号仍转义为 `\u200b`（零宽空格）。
-- `plugin.yaml` 与 `dashboard/manifest.json` 版本号同步 bump 到 `0.6.0`；四份文档
-  （README / CONFIGURATION）同步「步骤行活动描述」与「整任务单框」口径。
+- **步骤行对齐 dsh（A 项）**：`standard` 档逐步行从「`工具名 · <命令原文摘要>`」改为
+  「`工具名 · <dsh 活动描述>`」。活动描述 = dsh 活动短语 + dsh `liveToolDetail` 参数
+  细节：
+  - 活动短语取自 dsh `message.stepProcess.<kind>` 的 zh 词干（读取文件 / 读取图片 /
+    写入文件 / 搜索代码 / 修改文件 / 执行命令 / 运行代码 / 搜索网页 / 访问网页 /
+    协调子智能体 / 更新计划 / 提问 / 调用工具），工具名 → 种类映射沿用 dsh
+    `activity()` 原表（`tool_activity_kind` 不变）；
+  - 参数细节按 dsh `LIVE_TOOL_DETAIL_KEYS` 键序取第一个非空值
+    （`title > description > objective > task > … > command > … > query > path … >
+    status`；`questions` 取首问），空白折叠、160 字符截断补 `…`；
+  - 参数取不到细节时**回落到工具名本身**（dsh `normalizeLiveToolDetail(name)` 的
+    兜底），故纯字符串参数（如 `"ls -la"` 不是参数对象）渲染为 `执行命令（bash）`
+    而不是裸短语；
+  - 无工具名且无细节 → 空串（调用方退化为占位行）。
+  - **桥侧启发式规则表整体删除**：`summarize_tool_call` / `_tool_argument_text` /
+    `_first_command_word` / `_summary_positional` 与 `_SUMMARY_*` 常量
+    （「检查磁盘使用」「列出目录」「查看 git 提交记录」等固定短语、命令首行截断兜底）
+    全部移除，摘要不再依赖命令原文；新增纯函数 `dsh_activity_phrase` /
+    `dsh_activity_detail`（含 `_arguments_object` / `_normalize_activity_detail` /
+    `_question_detail`）与 `describe_tool_call`。
+- `detailed` / `verbose` 档逐步行仍显示原始参数（`{"path": …}`）与 `↳` 结果行，
+  只改 `standard` 档；`compact` 档仍只有组头 + 思考标签。
+- 文档（README / CONFIGURATION 中英）与样例同步「dsh 活动描述」口径；
+  `plugin.yaml` 与 `dashboard/manifest.json` 版本号 bump 到 `0.6.0`。
 
 ### Unchanged
 
+- **出框形态**：一轮内的工具步骤 / 思考收口为**一条**无语言标记代码框（逐组出框），
+  收口时机（`turn_end` / 终态 / final / 新 `turn_start`）、空框规则、思考并入框、
+  组头类别串（`工作步骤 · N 步 · <类别串>`）与 dsh `processTitle` 逐字算法、
+  `_split_fenced_chunks` 围栏感知分块、`redact` 流程均不变；
+- 叙述 / 最终文本 / 终态行照旧各自成消息（**不是**「整任务一个框」）；
 - 三个配置键（`collector.enabled` / `collector.events` / `collector.live_detail`）、
-  `follow-dsh` 与优先级链（显式档 > follow-dsh > 遗留 `content` > 默认）、Dashboard 三
-  开关与写回校验；四档**密度**定义（`compact` 无逐步行 / `standard` 无结果行 /
-  `detailed` 参数 + 结果首行 / `verbose` 全文不截断）；`detailed` / `verbose` 的逐步行
-  仍显示原始参数与 `↳` 结果行；
-- 组头类别串（`工作步骤 · N 步 · <类别串>`）与 dsh `processTitle` 逐字算法、工具名 →
-  活动种类映射表；`collector.events=false` 安静模式（现在表现为框内**只有结果段**）；
-  redact 流程；「完成之后不静默」（无文本输出时仍发头行）。
+  `follow-dsh` 与优先级链、Dashboard 三开关与写回校验均不变。
+
+### Tests
+
+- 实测 **227 passed, 119 subtests passed**。
+- 更新既有断言：`standard` 逐步行由「人话摘要」改为 dsh 活动描述
+  （`test_consumer` / `test_group_push` / `test_real_stream` 的框内逐步行逐字断言，
+  含真实帧 `description` 优先于 `command` 的用例）。
+- 新增：活动短语表逐项且覆盖 dsh `message.stepProcess` 全部 kind（并断言已剥离
+  「正在/准备/已/了」体标记）、键序 `description` 优先、`questions` 取首问、
+  全字符串数组合并、160 字符截断、非 JSON 参数回落到工具名（`执行命令（bash）`）、
+  空名空细节返回空串。
 
 ## [0.5.3] - 2026-10-10
 

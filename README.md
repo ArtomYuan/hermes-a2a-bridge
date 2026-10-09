@@ -19,14 +19,14 @@ Hermes 侧接入 dsh A2A server 的桥插件：把 dsh 任务的执行过程实�
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（查看提交）
+2. read · 读取文件（/tmp/a）
+3. grep · 搜索代码（foo）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
 ```
@@ -34,9 +34,16 @@ Hermes 侧接入 dsh A2A server 的桥插件：把 dsh 任务的执行过程实�
 ✅ 完成
 ````
 
+其中 `standard` 逐步行是**逐字对齐 dsh 的活动描述**：`<dsh 活动短语>（<dsh 参数
+细节>）`（如 `执行命令（df -h）`、`读取文件（config.yaml）`、`搜索代码（TODO）`；
+纯字符串参数取不到键值，按 dsh 的回落链显示**工具名本身**，如 `执行命令（bash）`），
+取代 v0.5.x 的桥侧启发式摘要规则表
+（v0.6.0）。上框即 `consumer.render_process_box` 的 `standard` 实际输出。
+
 四档（`compact` / `standard` / `detailed` / `verbose`）都发这一个框，差异只在
-**框内密度**：`compact` 仅组头 + 「思考」标签（无逐步行）、`standard` 逐步人话
-摘要、`detailed` 逐步参数 + `↳ 结果首行`、`verbose` 参数 / 结果与思考全文不截断。
+**框内密度**：`compact` 仅组头 + 「思考」标签（无逐步行）、`standard` 逐步 dsh
+活动描述、`detailed` 逐步参数 + `↳ 结果首行`、`verbose` 参数 / 结果与思考全文不
+截断。
 **既无工具步也无思考的轮次不发框**（避免空框）；只有思考、无工具时发一个只含
 思考行的框。组头**不带轮次号**——其上方已有独立的 `🚀 第 N 轮` 标记。
 
@@ -95,7 +102,7 @@ drwxrwxrwt  2 root root 40 Sep 11 14:00 ..
 （四档 `compact` / `standard` / `detailed` / `verbose`，与 dsh「工作步骤展示」
 一一对应；默认 `follow-dsh` 跟随 dsh 当前档位。四档统一为**每轮一个代码框组**——
 框内第一行是组头 `工作步骤 · N 步 · <类别串>`，差异只在框内密度：`compact` 仅组头 +
-「思考」标签、`standard` 逐步人话摘要、`detailed` 参数 + `↳ 结果首行`、`verbose`
+「思考」标签、`standard` 逐步 dsh 活动描述、`detailed` 参数 + `↳ 结果首行`、`verbose`
 参数 / 结果与思考全文不截断）；
 `collector.events` 控制事件流开关（关 = 安静模式，只推最终结果，**优先于档位**）；
 代码框渲染保留为档位内部的样式（**结果送达的框也是同一形态**），不再单独暴露

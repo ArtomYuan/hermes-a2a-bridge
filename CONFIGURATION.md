@@ -282,8 +282,8 @@ plugins:
 | 事件 | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
 | `turn_start` | 🚀 轮次标记 | 同左 | 同左 | 同左 |
-| `tool_call` | **进框缓冲**（不逐条；框内不出逐步行） | **进框缓冲**（不逐条；框内逐步行取「工具名 · 人话摘要」） | **进框缓冲**（不逐条；框内逐步行取「工具名 · 参数」并附结果行） | 同 `detailed`（参数 / 结果**不截断**） |
-| `tool_result` | **进框缓冲**（不逐条） | **进框缓冲**（人话摘要） | **进框缓冲**（结果行 `↳ 结果首行`） | **进框缓冲**（结果行完整） |
+| `tool_call` | **进框缓冲**（不逐条；框内不出逐步行） | **进框缓冲**（不逐条；框内逐步行取「工具名 · dsh 活动描述」） | **进框缓冲**（不逐条；框内逐步行取「工具名 · 参数」并附结果行） | 同 `detailed`（参数 / 结果**不截断**） |
+| `tool_result` | **进框缓冲**（不逐条） | **进框缓冲**（dsh 活动描述） | **进框缓冲**（结果行 `↳ 结果首行`） | **进框缓冲**（结果行完整） |
 | `thinking` | **进同一框**（仅标签「思考」，无预览） | **进同一框**（`思考 · 首行预览`） | **进同一框**（`思考 · 首行预览`） | **进同一框**（`思考 · 预览 + 全文`） |
 | `text`（叙述 / 最终） | 发 | 发 | 发（非 final 截断 ≤120） | 发（非 final **不截断**） |
 | `status` 终态 / 错误 | **必发** | **必发** | **必发** | **必发** |
@@ -297,25 +297,13 @@ plugins:
   `content: false` 更严。但 **v0.5.0 改变了渲染形态**：四档统一为「每轮一个代码框
   组」，故 `detailed` / `verbose` **不再**逐条发消息、**不再**与 v0.3.3 的
   `content: true` 逐字节等价；差异只在**框内密度**，想要更细用更高档位。
-- **`standard` 档的逐步摘要规则**（bridge 侧启发式生成，不依赖 dsh 提供额外
-  字段）：逐步行的 `<人话摘要>` 命中规则表用固定短语，未命中取命令首行截断到
-  约 50 字符；参数为对象且无命令键时优先取标识性键 `key=value`（见「摘要小改进」）。
-
-  | 命令 | 摘要 |
-  | --- | --- |
-  | `git … log …` | 查看 git 提交记录 |
-  | `sed` / `head` / `tail` / `cat` / `less` / `more` | 读取文件（文件名） |
-  | `grep` / `rg` / `ag` | 查找（关键词）；无关键词 → 搜索文件内容 |
-  | `df` | 检查磁盘使用 |
-  | `free` | 检查内存 |
-  | `du` | 统计目录占用 |
-  | `systemctl` | 检查服务状态 |
-  | `ls` | 列出目录 |
-  | `ps` | 查看进程 |
-  | 其它 | 命令首行截断（约 50 字符） |
-
-  命令前的 `sudo` / `env` / `VAR=x` 包装会被跳过；`arguments` 是 JSON 时优先取
-  `command` / `cmd` / `script` 键，只带 `path` / `file` 时按「读取文件」摘要。
+- **`standard` 档逐步行 = dsh 活动描述**（v0.6.0 起逐字对齐 dsh，不再由桥侧启发式
+  规则表生成）：`<dsh 活动短语>（<dsh 参数细节>）`，如 `执行命令（df -h）`、
+  `读取文件（config.yaml）`、`搜索代码（TODO）`。短语取自 dsh
+  `message.stepProcess.<kind>` 的 zh 词干，工具名 → 种类的映射沿用下方「活动种类
+  词表」（dsh `activity()` 原表）；短语与参数细节的完整算法见「步骤行活动描述
+  （v0.6.0）」。旧的桥侧启发式摘要规则表（固定短语匹配 + 命令首行截断兜底）**已整体
+  删除**，逐步行不再依赖命令原文。
 - **生效时机**：与 `events` 同级——每个流式任务开始时热读一次（`follow-dsh` 同时解析
   dsh 文件）；任务中途改配置不影响进行中的任务，改后下一次任务即时生效（无需重启
   网关）。
@@ -332,7 +320,7 @@ plugins:
 | 档位 | 组头 | 逐步行 | 结果行 | 思考段 | 空框处理 |
 | --- | --- | --- | --- | --- | --- |
 | `compact` | ✅（步数 + 类别串） | ❌ | ❌ | ✅ 仅标签「思考」 | 只有组头也无妨（**不发空框**：无工具且无思考才不发） |
-| `standard` | ✅ | ✅ `工具名 · 人话摘要` | ❌ | ✅ `思考 · 首行预览` | — |
+| `standard` | ✅ | ✅ `工具名 · dsh 活动描述` | ❌ | ✅ `思考 · 首行预览` | — |
 | `detailed` | ✅ | ✅ `工具名 · 参数（截断）` | ✅ `↳ 结果首行（截断）` | ✅ `思考 · 首行预览` | — |
 | `verbose` | ✅ | ✅ `工具名 · 完整参数` | ✅ `↳ 完整结果` | ✅ `思考 · 预览 + 全文` | — |
 
@@ -342,7 +330,7 @@ plugins:
 第 1 行：组头   = 工作步骤 · <N> 步 · <类别串>      （N = 该轮工具步数；类别串用 dsh 逐字算法）
 围栏：          三个反引号、信息位留空（无语言标记，飞书语言位不显示标签）
 分隔线：        ──────────────────────────────  （固定 30 个 ─，仅当有逐步行时出现）
-逐步行：        <i>. <工具名> · <该档密度的参数/摘要>
+逐步行：        <i>. <工具名> · <该档密度的参数 / 活动描述>
 结果行（detailed/verbose）：   ↳ <该档密度的结果>（缩进 3 空格）
 末段（有思考时）：思考 · <预览或全文>          （compact 仅「思考」，无预览）
 分隔线：        仅出现在「逐步行之后、思考之前」
@@ -373,20 +361,27 @@ plugins:
 ```
 ````
 
-**`standard`（标准）—— 组头 + 每步「工具名 · 人话摘要」**
+**`standard`（标准）—— 组头 + 每步「工具名 · dsh 活动描述」**
+
+> 下框由 `consumer.render_process_box(steps, thinking, "standard")` **实际渲染**
+> （逐步行 = `describe_tool_call` 输出），非手写；该轮步骤参数为
+> 1 `bash{"command":"git log --oneline -3","description":"查看提交"}`、
+> 2 `read{"path":"/tmp/a"}`、3 `grep{"query":"foo"}`、
+> 4/6/8 `bash{"command":"echo 2|echo 3|echo 4"}`、5 `edit{"path":"/tmp/a"}`、
+> 7 `write{"path":"/tmp/b"}`。
 
 ````text
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（查看提交）
+2. read · 读取文件（/tmp/a）
+3. grep · 搜索代码（foo）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
 ```
@@ -398,14 +393,14 @@ plugins:
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
+1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
-2. read  · {"path": "/tmp/a"}
+2. read · {"path": "/tmp/a"}
    ↳ file contents…
-3. grep  · {"query": "foo"}
+3. grep · {"query": "foo"}
    ↳ 12 hits
 …
-8. bash  · {"command": "echo 4"}
+8. bash · {"command": "echo 4"}
    ↳ 4
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
@@ -420,10 +415,10 @@ plugins:
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
+1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
       b2c3d4 fix: 截断
-2. read  · {"path": "/tmp/a"}
+2. read · {"path": "/tmp/a"}
    ↳ <完整文件内容，多行按原样缩进>
 …
 ──────────────────────────────
@@ -485,7 +480,9 @@ plugins:
 `interrupt_agent` / `team_task_*` → `subagents`（dsh 无这些工具，归属桥侧扩展）。
 
 类别文案与 dsh 的步骤过程完成态文案（`message.stepProcess.done.*`）一致；
-本表用于**组头类别串**；框内逐步行的参数 / 结果用原文，不受本表影响。
+本表（经 `tool_activity_kind`）同时用于**组头类别串**与 `standard` 档逐步行的
+**活动短语**（见「步骤行活动描述（v0.6.0）」）；`detailed` / `verbose` 的框内参数 /
+结果用原文，不受本表影响。
 
 #### 与 dsh 的分组语义对应（设计取舍）
 
@@ -506,12 +503,42 @@ plugins:
   **绝不允许丢掉已发生的步骤信息**。
 - **`collector.events: false`（安静模式）优先于档位**（不变）。
 
-#### 摘要小改进
+#### 步骤行活动描述（v0.6.0）
 
-当工具 `arguments` 是对象且**没有命令键**（`command` / `cmd` / `script`）时，`standard`
-档逐步行摘要优先取标识性键的 `key=value`，顺序为 `job_id` → `id` → `name` →
-`path` / `file_path` → `query` → `url`；仍无则退化为现有单行 JSON 截断。仅影响
-`standard` 档逐步行摘要，`detailed` / `verbose` 用原文，不受影响。
+`standard` 档逐步行 = `describe_tool_call(name, arguments)` 的输出，即
+`<dsh 活动短语>（<dsh 参数细节>）`。两部分都逐字对齐 dsh（`message.stepProcess.<kind>`
+词干 + `liveToolDetail`），不再由桥侧启发式规则表生成：
+
+- **活动短语**：由工具名经 `tool_activity_kind` 映射到活动种类（沿用上文「活动种类
+  词表」，即 dsh `activity()` 原表），再取该种类的 dsh zh 词干（剥离「正在 / 已 /
+  准备 / 了」体标记）：`读取文件` / `读取图片` / `写入文件` / `搜索代码` / `修改文件` /
+  `执行命令` / `运行代码` / `搜索网页` / `访问网页` / `协调子智能体` / `更新计划` /
+  `提问` / `调用工具`。（多数种类取进行体 `message.stepProcess.<kind>`；`commands` /
+  `edit` 取完成体 `done.*`——「执行了命令」→`执行命令`、「修改了文件」→`修改文件`；
+  `questions` 取准备体 `prepare.questions`——「准备提问」→`提问`。）
+- **参数细节**：按 dsh `LIVE_TOOL_DETAIL_KEYS` 的**键序**取第一个非空值：
+  `title` → `description` → `objective` → `task` → `task_name` → `name` → `question` →
+  `questions`（取列表中首个非空 `question`）→ `prompt` → `message` → `command` →
+  `cmd` → `queries` → `query` → `pattern` → `url` → `uri` → `file_path` → `path` →
+  `target` → `action` → `status`。全字符串数组用 `, ` 连接；空白折叠成单空格并去首尾；
+  超过 **160 字符**截断并补 `…`（截断前先 trimEnd）。
+- **回落链**：`arguments` 不是参数对象（纯字符串命令、JSON 解析失败、`None`）或
+  键序里全取不到非空值时，沿用 dsh `liveToolDetail` 的兜底——**回落到工具名本身**，
+  故纯字符串参数渲染为 `执行命令（bash）` 而不是裸短语。`name` 为空且无细节时返回
+  空串（调用方退化为 `工具调用` 占位行）。
+
+| 事件 | `standard` 逐步行（`describe_tool_call` 实测） |
+| --- | --- |
+| `bash` + `"ls -la"`（纯字符串，不是参数对象） | `bash · 执行命令（bash）` |
+| `bash` + `{}` / 参数缺失 | `bash · 执行命令（bash）` |
+| `bash` + `{"command": "df -h"}` | `bash · 执行命令（df -h）` |
+| `read` + `{"path": "/a/b.txt"}` | `read · 读取文件（/a/b.txt）` |
+| `grep` + `{"query": "TODO"}` | `grep · 搜索代码（TODO）` |
+| `bash` + `{"command": "ls -la", "description": "List current directory contents"}` | `bash · 执行命令（List current directory contents）`（`description` 优先于 `command`） |
+| `job_output` + `{"job_id": "abc123"}`（未知工具 → `tools`） | `job_output · 调用工具（job_output）` |
+
+仅影响 `standard` 档逐步行；`detailed` / `verbose` 仍显示原始参数（`{"path": …}`）
+与 `↳` 结果行，`compact` 仍无逐步行。
 
 ### follow-dsh 解析规则
 
@@ -565,7 +592,7 @@ plugins:
 - **代码框渲染保留为内部样式**：操作内容（工具命令 / 执行结果 / 长最终文本）仍以
   围栏代码块渲染（围栏感知分块），不再单独暴露开关；v0.5.0 起**每轮过程本身即一个
   代码框组**——四档都有这个框，差异只在框内密度（`compact` 仅组头 + 「思考」标签、
-  `standard` 逐步人话摘要、`detailed` 参数 + 结果首行、`verbose` 参数 / 结果与思考
+  `standard` 逐步 dsh 活动描述、`detailed` 参数 + 结果首行、`verbose` 参数 / 结果与思考
   全文不截断）。**v0.5.3 起「结果送达」的正文也进同一个裸围栏代码框**（头行在
   框前），与过程框形态统一。
 
@@ -675,7 +702,7 @@ a2a_call（pre_tool_call hook）
 
 档位对上述行的影响见「直播档位」节的四档渲染表：v0.5.0 起 `tool_call` /
 `tool_result` / `thinking` 四档都**不逐条成行**，而是收进**每轮一个过程代码框组**
-（`compact` 框内无逐步行、仅组头 + 「思考」标签；`standard` 逐步人话摘要；
+（`compact` 框内无逐步行、仅组头 + 「思考」标签；`standard` 逐步 dsh 活动描述；
 `detailed` 参数 + `↳ 结果首行`；`verbose` 参数 / 结果与思考全文不截断）；框先于
 触发它的 `text` / 终态行发出。**终态行（✅ / ❌ / ⚠️）与错误在任何档位
 都必发**，框缓冲在终态强制收口、不丢步骤信息。
@@ -699,7 +726,8 @@ a2a_call（pre_tool_call hook）
 3. 行为确认：飞书 / QQ 对话让 agent 调 `a2a_call(agent="dsh", ...)`，观察 ①agent
    立即（秒级）收到「已受理」回执、不再长阻塞；②对话收到
    `🚀 第 N 轮` → **每轮一个过程代码框组**（组头 `工作步骤 · N 步 · <类别串>` + 逐步行 +
-   末段 `思考 · …`；框内密度随直播档位：`compact` 无逐步行、`standard` 人话摘要、
+   末段 `思考 · …`；框内密度随直播档位：`compact` 无逐步行、`standard` 逐步
+   dsh 活动描述、
    `detailed` 参数 + 结果首行、`verbose` 不截断）→ `📖 输出完成` → `✅ 完成`
    （默认 `follow-dsh` 跟随 dsh 当前档位），且
    **dsh 只执行一次**（dsh-a2a-server 日志只出现一次 task 提交）；
@@ -720,7 +748,7 @@ a2a_call（pre_tool_call hook）
 7. 直播档位确认：把 `collector.live_detail` 依次设为 `compact` / `standard` /
    `detailed` / `verbose`，确认四档渲染与「代码框组渲染」节一致（四档**每轮都发
    一个代码框组**，无 v0.4.1 的心跳行 / 收口行；框内密度：`compact` 仅组头 +
-   「思考」标签、`standard` 逐步人话摘要、`detailed` 逐步参数 + `↳ 结果首行`、
+   「思考」标签、`standard` 逐步 dsh 活动描述、`detailed` 逐步参数 + `↳ 结果首行`、
    `verbose` 参数 / 结果与思考全文不截断）；确认**无工具且无思考的轮次不发框**、
    **只有思考、无工具时发只含思考行的框**、框**先于**触发它的 `text` / 终态行、
    超长框分块后**围栏闭合**，且**任务终态与错误在任何档位都照常送达**、
@@ -754,7 +782,8 @@ python3 tests/test_dashboard_api.py
 四档框内密度差异——`compact` 无逐步行 / `standard` 无结果行 / `detailed` 有结果行 /
 `verbose` 不截断；发框规则——无工具且无思考不发框、只有思考无工具发只含思考行的
 框；框先于 `text` / `turn_end` / 终态行；框缓冲在终态必收口；超长框分块后围栏闭合；
-活动种类映射与组头类别串合成（1 / 2 / 3 / >3 类）、摘要小改进）、遗留
+活动种类映射与组头类别串合成（1 / 2 / 3 / >3 类）、`standard` 逐步行活动描述
+（活动短语表 / 参数细节键序 / 160 字符截断 / 工具名兜底））、遗留
 `content` 映射（`true` → `detailed` / `false` → `standard`）、**终态与错误在任何档位
 都不丢**，并输出「事件序列 → 渲染消息样例」对照表。
 

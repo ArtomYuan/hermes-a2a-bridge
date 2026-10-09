@@ -358,8 +358,8 @@ their own on the broadcast path — see "Code-box group rendering" below):
 | Event | `compact` | `standard` | `detailed` | `verbose` |
 | --- | --- | --- | --- | --- |
 | `turn_start` | 🚀 turn marker | same | same | same |
-| `tool_call` | **into the box buffer** (not per step; no step line in the box) | **into the box buffer** (not per step; the box step line takes "tool · plain-language summary") | **into the box buffer** (not per step; the step line takes "tool · arguments" plus a result line) | = `detailed` (arguments / results **not truncated**) |
-| `tool_result` | **into the box buffer** (not per step) | **into the box buffer** (plain-language summary) | **into the box buffer** (result line `↳ first result line`) | **into the box buffer** (full result line) |
+| `tool_call` | **into the box buffer** (not per step; no step line in the box) | **into the box buffer** (not per step; the box step line takes "tool · dsh activity description") | **into the box buffer** (not per step; the step line takes "tool · arguments" plus a result line) | = `detailed` (arguments / results **not truncated**) |
+| `tool_result` | **into the box buffer** (not per step) | **into the box buffer** (dsh activity description) | **into the box buffer** (result line `↳ first result line`) | **into the box buffer** (full result line) |
 | `thinking` | **into the same box** (label "思考" only, no preview) | **into the same box** (`思考 · first-line preview`) | **into the same box** (`思考 · first-line preview`) | **into the same box** (`思考 · preview + full text`) |
 | `text` (narrative / final) | sent | sent | sent (non-final truncated to ≤120) | sent (non-final **not truncated**) |
 | `status` terminal / errors | **always sent** | **always sent** | **always sent** | **always sent** |
@@ -377,29 +377,18 @@ their own on the broadcast path — see "Code-box group rendering" below):
   **no longer** send per-step messages and are **no longer** byte-equivalent to
   v0.3.3's `content: true`; the difference is now **in-box density**, so use a
   higher tier for finer detail.
-- **Step-summary rules for the `standard` tier** (generated heuristically in the
-  bridge; no extra field required from dsh): the step line's
-  `<plain-language summary>` yields a fixed phrase when a rule matches, otherwise the
-  command's first line is truncated to ~50 characters; when the arguments are an
-  object with no command key, identifying-key `key=value` wins (see "Summary
-  improvement").
-
-  | Command | Summary |
-  | --- | --- |
-  | `git … log …` | 查看 git 提交记录 (view git log) |
-  | `sed` / `head` / `tail` / `cat` / `less` / `more` | 读取文件（文件名） (read file (name)) |
-  | `grep` / `rg` / `ag` | 查找（关键词） (find (keyword)); without a keyword → 搜索文件内容 (search file contents) |
-  | `df` | 检查磁盘使用 (check disk usage) |
-  | `free` | 检查内存 (check memory) |
-  | `du` | 统计目录占用 (measure directory usage) |
-  | `systemctl` | 检查服务状态 (check service status) |
-  | `ls` | 列出目录 (list directory) |
-  | `ps` | 查看进程 (view processes) |
-  | anything else | first line of the command, truncated (~50 chars) |
-
-  Leading `sudo` / `env` / `VAR=x` wrappers are skipped; when `arguments` is JSON the
-  `command` / `cmd` / `script` key wins, and a path-only object summarises as a file
-  read. The summaries themselves are Chinese, matching the plugin's other chat copy.
+- **Step line for the `standard` tier = a dsh activity description** (byte-for-byte
+  aligned with dsh as of v0.6.0, no longer produced by a bridge-side heuristic rule
+  table): `<dsh activity phrase>（<dsh argument detail>）`, e.g.
+  `执行命令（df -h）`, `读取文件（config.yaml）`, `搜索代码（TODO）`. The phrase comes
+  from dsh's `message.stepProcess.<kind>` zh wording (with the 正在 / 已 / 准备 / 了
+  aspect markers stripped), and the tool-name → kind mapping follows the
+  "Activity-kind vocabulary" below (dsh's original `activity()` table); see
+  "Step-line activity description (v0.6.0)" for the full algorithm. The old
+  bridge-side heuristic summary rule table (fixed-phrase matching + first-line
+  truncation fallback) has been **removed entirely**; step lines no longer depend on
+  the raw command. The activity phrases themselves are Chinese, matching the plugin's
+  other chat copy.
 - **When it takes effect**: same level as `events` — hot-read once at the start of
   each stream task (with `follow-dsh`, the dsh file is resolved at the same time);
   changing it mid-task does not affect the running task, and the next task picks up
@@ -418,7 +407,7 @@ the first line inside it is the group header — visible even when collapsed.
 | Tier | Group header | Step line | Result line | Thinking segment | Empty-box handling |
 | --- | --- | --- | --- | --- | --- |
 | `compact` | ✅ (step count + kind string) | ❌ | ❌ | ✅ label "思考" only | a header alone is fine (**never an empty box**: suppressed only when there is no tool and no thinking) |
-| `standard` | ✅ | ✅ `tool · plain-language summary` | ❌ | ✅ `思考 · first-line preview` | — |
+| `standard` | ✅ | ✅ `tool · dsh activity description` | ❌ | ✅ `思考 · first-line preview` | — |
 | `detailed` | ✅ | ✅ `tool · arguments (truncated)` | ✅ `↳ first result line (truncated)` | ✅ `思考 · first-line preview` | — |
 | `verbose` | ✅ | ✅ `tool · full arguments` | ✅ `↳ full result` | ✅ `思考 · preview + full text` | — |
 
@@ -428,7 +417,7 @@ the first line inside it is the group header — visible even when collapsed.
 Line 1: group header = 工作步骤 · <N> 步 · <kind string>   (N = tool steps of the turn; kind string uses dsh's verbatim algorithm)
 Fence:                three backticks with an empty info string (no language label; Feishu shows no label)
 Separator:            ──────────────────────────────   (exactly 30 ─, only when there are step lines)
-Step line:            <i>. <tool name> · <that tier's arguments/summary>
+Step line:            <i>. <tool name> · <that tier's arguments / activity description>
 Result line (detailed/verbose):   ↳ <that tier's result>   (indented 3 spaces)
 Last segment (when thinking):     思考 · <preview or full text>   (compact: "思考" only, no preview)
 Separator:            appears only "after the step lines, before the thinking"
@@ -470,27 +459,37 @@ Separator:            appears only "after the step lines, before the thinking"
 > Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; last
 > line: "Thinking". There is no step line.
 
-**`standard` — group header + "tool · plain-language summary" per step**
+**`standard` — group header + "tool · dsh activity description" per step**
+
+> The box below is the **actual render** of
+> `consumer.render_process_box(steps, thinking, "standard")` (step lines =
+> `describe_tool_call` output), not hand-written; that turn's step arguments are
+> 1 `bash{"command":"git log --oneline -3","description":"查看提交"}`,
+> 2 `read{"path":"/tmp/a"}`, 3 `grep{"query":"foo"}`,
+> 4/6/8 `bash{"command":"echo 2|echo 3|echo 4"}`, 5 `edit{"path":"/tmp/a"}`,
+> 7 `write{"path":"/tmp/b"}`.
 
 ````text
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（查看提交）
+2. read · 读取文件（/tmp/a）
+3. grep · 搜索代码（foo）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
 ```
 ````
 
-> Step summaries: 1. "view git log"; 2. "read file (config.yaml)"; 3. "find
-> (TODO)"; 4–8. `echo 2` / `/tmp/a` / `echo 3` / `/tmp/b` / `echo 4`. The last
+> Step lines are dsh activity descriptions: 1. `执行命令（查看提交）` (the
+> `description` argument outranks `command`); 2. `读取文件（/tmp/a）`;
+> 3. `搜索代码（foo）`; 4–8. `执行命令（echo 2）` / `修改文件（/tmp/a）` /
+> `执行命令（echo 3）` / `写入文件（/tmp/b）` / `执行命令（echo 4）`. The last
 > segment is "Thinking · <first-line preview>". Two separators bracket the step
 > lines.
 
@@ -500,14 +499,14 @@ Separator:            appears only "after the step lines, before the thinking"
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
+1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
-2. read  · {"path": "/tmp/a"}
+2. read · {"path": "/tmp/a"}
    ↳ file contents…
-3. grep  · {"query": "foo"}
+3. grep · {"query": "foo"}
    ↳ 12 hits
 …
-8. bash  · {"command": "echo 4"}
+8. bash · {"command": "echo 4"}
    ↳ 4
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
@@ -524,10 +523,10 @@ Separator:            appears only "after the step lines, before the thinking"
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · {"command": "git log --oneline -3", "description": "查看提交"}
+1. bash · {"command": "git log --oneline -3", "description": "查看提交"}
    ↳ a1b2c3 feat: 四档
       b2c3d4 fix: 截断
-2. read  · {"path": "/tmp/a"}
+2. read · {"path": "/tmp/a"}
    ↳ <完整文件内容，多行按原样缩进>
 …
 ──────────────────────────────
@@ -602,9 +601,11 @@ English wording for the same kind:
 `list_agents` / `interrupt_agent` / `team_task_*` → `subagents` (dsh has no such
 tools; this mapping is a bridge-side extension).
 
-The kind copy matches dsh's `message.stepProcess.done.*`; this table feeds the
-**group-header kind string**; the argument / result text of in-box step lines uses
-the raw input and is unaffected by it.
+The kind copy matches dsh's `message.stepProcess.done.*`; this table (via
+`tool_activity_kind`) feeds both the **group-header kind string** and the
+`standard` step line's **activity phrase** (see "Step-line activity description
+(v0.6.0)"); the in-box argument / result text of `detailed` / `verbose` uses the raw
+input and is unaffected by it.
 
 #### Correspondence with dsh group semantics (a design trade-off)
 
@@ -633,13 +634,50 @@ the raw input and is unaffected by it.
   dropped**.
 - **`collector.events: false` (quiet mode) still outranks the tier** (unchanged).
 
-#### Summary improvement
+#### Step-line activity description (v0.6.0)
 
-When the tool `arguments` are an object with **no command key** (`command` / `cmd` /
-`script`), the `standard` step-line summary prefers the identifying key's `key=value`, in the
-order `job_id` → `id` → `name` → `path` / `file_path` → `query` → `url`; if none is
-present it degrades to the existing single-line JSON truncation. This affects only the
-`standard` step-line summary; `detailed` / `verbose` use the raw text and are unaffected.
+A `standard` step line is the output of `describe_tool_call(name, arguments)`, i.e.
+`<dsh activity phrase>（<dsh argument detail>）`. Both parts are byte-for-byte
+aligned with dsh (the `message.stepProcess.<kind>` wording plus `liveToolDetail`)
+and are no longer produced by a bridge-side heuristic rule table:
+
+- **Activity phrase**: the tool name is mapped to an activity kind by
+  `tool_activity_kind` (the "Activity-kind vocabulary" above, i.e. dsh's original
+  `activity()` table), then the kind's dsh zh wording is used with the aspect markers
+  (正在 / 已 / 准备 / 了) stripped: `读取文件` / `读取图片` / `写入文件` / `搜索代码` /
+  `修改文件` / `执行命令` / `运行代码` / `搜索网页` / `访问网页` / `协调子智能体` /
+  `更新计划` / `提问` / `调用工具`. (Most kinds use the progressive
+  `message.stepProcess.<kind>`; `commands` / `edit` use the perfective `done.*` —
+  「执行了命令」→`执行命令`, 「修改了文件」→`修改文件`; `questions` uses
+  `prepare.questions` — 「准备提问」→`提问`.)
+- **Argument detail**: the first non-empty value in dsh's `LIVE_TOOL_DETAIL_KEYS`
+  **key order**: `title` → `description` → `objective` → `task` → `task_name` →
+  `name` → `question` → `questions` (the first non-empty `question` in the list) →
+  `prompt` → `message` → `command` → `cmd` → `queries` → `query` → `pattern` →
+  `url` → `uri` → `file_path` → `path` → `target` → `action` → `status`. All-string
+  arrays are joined with `, `; whitespace is collapsed to single spaces and trimmed;
+  details longer than **160 characters** are truncated with a trailing `…` (after
+  trimming the tail).
+- **Fallback chain**: when `arguments` is not an argument object (a plain command
+  string, a JSON parse failure, `None`) or no key in the order yields a non-empty
+  value, dsh's own `liveToolDetail` fallback applies — it falls back to the **tool
+  name itself**, so a plain string argument renders as `执行命令（bash）` rather than a
+  bare phrase. An empty name with no detail returns an empty string (the caller
+  degrades to a `工具调用` placeholder line).
+
+| Event | `standard` step line (measured `describe_tool_call`) |
+| --- | --- |
+| `bash` + `"ls -la"` (a plain string, not an argument object) | `bash · 执行命令（bash）` |
+| `bash` + `{}` / missing arguments | `bash · 执行命令（bash）` |
+| `bash` + `{"command": "df -h"}` | `bash · 执行命令（df -h）` |
+| `read` + `{"path": "/a/b.txt"}` | `read · 读取文件（/a/b.txt）` |
+| `grep` + `{"query": "TODO"}` | `grep · 搜索代码（TODO）` |
+| `bash` + `{"command": "ls -la", "description": "List current directory contents"}` | `bash · 执行命令（List current directory contents）` (`description` outranks `command`) |
+| `job_output` + `{"job_id": "abc123"}` (unknown tool → `tools`) | `job_output · 调用工具（job_output）` |
+
+This affects the `standard` step line only; `detailed` / `verbose` still show the raw
+arguments (`{"path": …}`) plus the `↳` result line, and `compact` still has no step
+line.
 
 ### follow-dsh resolution rules
 
@@ -705,8 +743,8 @@ set" deployment gets `standard`-density boxes.
   execution results / long final text) is still rendered as fenced code blocks
   (fence-aware chunking) and is no longer a standalone switch; as of v0.5.0 **the turn's
   process itself is a code-box group** — all four tiers have that box, and only the
-  in-box density differs (`compact`: header + "思考" label; `standard`: plain-language
-  step summaries; `detailed`: arguments + first result line; `verbose`: arguments /
+  in-box density differs (`compact`: header + "思考" label; `standard`: dsh activity
+  step descriptions; `detailed`: arguments + first result line; `verbose`: arguments /
   results and full thinking text untruncated). **As of v0.5.3 the body of the result
   delivery goes into the same kind of bare-fence code block** (header before the box),
   matching the process boxes.
@@ -833,8 +871,8 @@ a2a_call (pre_tool_call hook)
 How a tier affects those lines is given by the four-tier table under "Live-detail
 tier": as of v0.5.0 `tool_call` / `tool_result` / `thinking` are **never sent as lines
 of their own under any tier** but are collected into **one process code-box group per
-turn** (`compact`: no step line, header + "思考" label only; `standard`: plain-language
-step summaries; `detailed`: arguments + `↳ first result line`; `verbose`: arguments /
+turn** (`compact`: no step line, header + "思考" label only; `standard`: dsh activity
+step descriptions; `detailed`: arguments + `↳ first result line`; `verbose`: arguments /
 results and full thinking text untruncated); the box precedes the `text` / terminal
 line that triggered it. **Terminal lines (✅ / ❌ / ⚠️) and errors are always sent,
 whatever the tier**, and the box buffer is force-closed at terminal state without
@@ -864,7 +902,7 @@ losing step information.
    `🚀 第 N 轮` → **one process code-box group per turn** (header
    `工作步骤 · N 步 · <类别串>` + step lines + a final `思考 · …` segment; the in-box
    density follows the live-detail tier: `compact` no step line, `standard`
-   plain-language summaries, `detailed` arguments + first result line, `verbose`
+   dsh activity step descriptions, `detailed` arguments + first result line, `verbose`
    untruncated) → `📖 输出完成` → `✅ 完成` (by default `follow-dsh` follows dsh's
    current tier), and that **dsh executes
    only once** (the dsh-a2a-server log shows only one task submission); ③ when the
@@ -891,7 +929,7 @@ losing step information.
    `standard` / `detailed` / `verbose` in turn and confirm the rendering matches the
    "Code-box group rendering" section (all four tiers send **one code-box group per
    turn**, with no v0.4.1 heartbeat / closing lines; in-box density: `compact`
-   header + "思考" label only, `standard` plain-language step summaries, `detailed`
+   header + "思考" label only, `standard` dsh activity step descriptions, `detailed`
    step arguments + `↳ first result line`, `verbose` arguments / results and full
    thinking text untruncated); confirm that **a turn with no tool and no thinking
    sends no box**, **thinking-only sends a box containing only the thinking line**,
@@ -935,8 +973,9 @@ untruncated; box emission rules — no box when there is neither a tool nor thin
 thinking-only sends a box with only the thinking line; the box preceding the
 `text` / `turn_end` / terminal line; forced close of the box buffer at terminal
 state; fence closure after chunking a long box; the activity-kind mapping and
-group-header kind-string composition (1 / 2 / 3 / >3 kinds), and the summary
-improvement), the
+group-header kind-string composition (1 / 2 / 3 / >3 kinds), and the `standard`
+step-line activity description (activity-phrase table / argument-detail key order /
+160-character truncation / tool-name fallback)), the
 legacy `content` mapping (`true` → `detailed` / `false` → `standard`), **terminal
 states and errors surviving every tier**, and outputs an "event sequence → rendered
 message sample" mapping table.

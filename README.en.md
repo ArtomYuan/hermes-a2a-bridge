@@ -22,14 +22,14 @@ roughly like this (`standard`, the default tier of the dsh in production today):
 ```
 工作步骤 · 8 步 · 执行了命令，已读取文件，已搜索代码等
 ──────────────────────────────
-1. bash  · 查看 git 提交记录
-2. read  · 读取文件（config.yaml）
-3. grep  · 查找（TODO）
-4. bash  · echo 2
-5. edit  · /tmp/a
-6. bash  · echo 3
-7. write · /tmp/b
-8. bash  · echo 4
+1. bash · 执行命令（查看提交）
+2. read · 读取文件（/tmp/a）
+3. grep · 搜索代码（foo）
+4. bash · 执行命令（echo 2）
+5. edit · 修改文件（/tmp/a）
+6. bash · 执行命令（echo 3）
+7. write · 写入文件（/tmp/b）
+8. bash · 执行命令（echo 4）
 ──────────────────────────────
 思考 · 我先把目录结构列出来确认范围…
 ```
@@ -37,14 +37,24 @@ roughly like this (`standard`, the default tier of the dsh in production today):
 ✅ 完成
 ````
 
+Each `standard` step line is **byte-for-byte aligned with dsh's activity
+description**: `<dsh activity phrase>（<dsh argument detail>）` (e.g.
+`执行命令（df -h）`, `读取文件（config.yaml）`, `搜索代码（TODO）`; when no key yields
+a value — e.g. a plain string argument — dsh's fallback chain shows the **tool name
+itself**, as in `执行命令（bash）`). This replaces
+v0.5.x's bridge-side heuristic summary rule table (v0.6.0). The box above is
+the actual `standard` output of `consumer.render_process_box`.
+
 > Header: "Tools · 8 steps · Ran commands, read files, searched code, etc."; the step
-> summaries are plain-language (1. "view git log"; 2. "read file (config.yaml)";
-> 3. "find (TODO)"; 4–8. `echo 2` / `/tmp/a` / `echo 3` / `/tmp/b` / `echo 4`); the
-> last segment is "Thinking · <first-line preview>".
+> lines are dsh activity descriptions (1. `执行命令（查看提交）`, where the
+> `description` argument outranks `command`; 2. `读取文件（/tmp/a）`;
+> 3. `搜索代码（foo）`; 4–8. `执行命令（echo 2）` / `修改文件（/tmp/a）` /
+> `执行命令（echo 3）` / `写入文件（/tmp/b）` / `执行命令（echo 4）`); the last segment
+> is "Thinking · <first-line preview>".
 
 All four tiers (`compact` / `standard` / `detailed` / `verbose`) send this one box;
 only the **in-box density** differs: `compact` is the header plus a "思考" label only
-(no step line), `standard` uses plain-language step summaries, `detailed` adds step
+(no step line), `standard` uses dsh activity descriptions, `detailed` adds step
 arguments + `↳ first result line`, and `verbose` leaves arguments / results and the
 full thinking text untruncated. A turn with **neither a tool step nor thinking sends
 no box** (never an empty box); thinking with no tool sends a box containing only the
@@ -118,8 +128,8 @@ Progress display and intermediate-event push are both configurable
 `standard` / `detailed` / `verbose`, mapping one-to-one onto dsh's "Work details",
 default `follow-dsh` to follow dsh's current tier; all four use **one code-box group
 per turn**, whose first line is the group header `工作步骤 · N 步 · <类别串>`, differing
-only in in-box density: `compact` header + "思考" label, `standard` plain-language
-step summaries, `detailed` arguments + `↳ first result line`, `verbose` arguments /
+only in in-box density: `compact` header + "思考" label, `standard` dsh activity
+descriptions, `detailed` arguments + `↳ first result line`, `verbose` arguments /
 results and full thinking text untruncated; `collector.events` for the event stream —
 off is quiet mode, pushing the final result only, and it **outranks the tier**;
 code-block rendering stays as the internal style for a tier (**result delivery

@@ -1,5 +1,11 @@
 # hermes-a2a-bridge
 
+> **Merged (2026-10-19)**: this repository is now part of
+> [`dsh-hermes-link`](https://github.com/ArtomYuan/dsh-hermes-link) — bridge and server ship as
+> one product (package name and install path unchanged, lock-step versions from 0.10.0). This
+> repository keeps the history up to 0.9.0 and the frozen tag `v0.9.0`.
+
+
 **English** | [简体中文](README.md)
 
 A bridge plugin on the Hermes side that connects to the dsh A2A server: it streams
